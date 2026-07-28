@@ -79,6 +79,30 @@
         "manage-visual-asset-library"
       ]
     },
+    "adxray-playlet-crawler": {
+      "category": "assets",
+      "summary": "从 AdXRay 抖音热播短剧榜筛选、抓取并下载短剧素材视频。",
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": [
+        "aivideoeditor-visual-moderation",
+        "manage-visual-asset-library"
+      ]
+    },
+    "aivideoeditor-visual-moderation": {
+      "category": "assets",
+      "summary": "对图片、视频帧、OCR、字幕和 ASR 证据执行视觉与对白风险审核。",
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": [
+        "edit-short-drama-packaging",
+        "aivideoeditor-video-fission"
+      ]
+    },
     "manage-visual-asset-library": {
       "category": "assets",
       "summary": "生成视觉素材 Manifest，完成 Read 理解、有效区域标注和语义候选输出。",

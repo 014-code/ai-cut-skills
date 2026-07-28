@@ -22,7 +22,7 @@ class CatalogTests(unittest.TestCase):
         catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
         sync_skills.validate_catalog(catalog, REPO_ROOT / "skills")
         self.assertEqual(len(catalog["categories"]), 6)
-        self.assertEqual(len(catalog["skills"]), 11)
+        self.assertEqual(len(catalog["skills"]), 13)
 
     def test_readme_names_every_catalogued_skill(self) -> None:
         catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")

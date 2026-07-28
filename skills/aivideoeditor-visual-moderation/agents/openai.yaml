@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIVideoEditor Visual Moderation"
+  short_description: "Visual safety moderation for military, ID, and NSFW"
+  default_prompt: "Use $aivideoeditor-visual-moderation to design, implement, or test visual content moderation for military, ID document, and NSFW risks."

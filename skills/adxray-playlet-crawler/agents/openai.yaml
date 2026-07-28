@@ -1,0 +1,4 @@
+interface:
+  display_name: "AdXRay Playlet Crawler"
+  short_description: "Batch download AdXRay hot playlet videos."
+  default_prompt: "Use $adxray-playlet-crawler to download Douyin hot playlet videos from AdXRay for visual moderation."
