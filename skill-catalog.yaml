@@ -7,7 +7,7 @@
     },
     "assets": {
       "label": "素材获取与治理",
-      "description": "获取、筛选、理解和管理可复用视觉素材。"
+      "description": "获取、筛选、审核、理解和管理可复用视觉素材。"
     },
     "render-components": {
       "label": "通用渲染组件",
@@ -29,6 +29,7 @@
   "sync": {
     "exclude_names": [
       ".DS_Store",
+      ".idea",
       ".cache",
       ".npm",
       ".ruff_cache",
@@ -47,6 +48,38 @@
     "setup-video-editing-environment": {
       "category": "runtime",
       "summary": "发现、安装并验证 Python、FFmpeg、Whisper 和可选 Remotion 环境。",
+      "capability_path": [
+        "Video",
+        "Runtime",
+        "EnvironmentSetup"
+      ],
+      "tags": [
+        "环境",
+        "依赖",
+        "安装",
+        "检查",
+        "Python",
+        "FFmpeg",
+        "Whisper",
+        "Remotion",
+        "Chrome"
+      ],
+      "when_to_use": [
+        "需要发现或安装视频生产运行环境",
+        "需要检查 Python FFmpeg Whisper Chrome 或 Remotion 是否可用"
+      ],
+      "when_not_use": [
+        "只需要同步 skill",
+        "只需要执行具体视频剪辑或渲染任务"
+      ],
+      "inputs": [
+        "machine_environment",
+        "dependency_requirements"
+      ],
+      "outputs": [
+        "environment_report",
+        "setup_commands"
+      ],
       "requires": [],
       "optional": [
         "manage-visual-asset-library",
@@ -61,6 +94,46 @@
     "douyin-video-toolkit": {
       "category": "assets",
       "summary": "提供统一抖音引用契约、页面捕获、URL/GID 解析、批量搜索和视频下载。",
+      "capability_path": [
+        "Video",
+        "Assets",
+        "Douyin",
+        "Download"
+      ],
+      "tags": [
+        "抖音",
+        "Douyin",
+        "下载",
+        "视频下载",
+        "短链",
+        "GID",
+        "URL",
+        "万邦",
+        "浏览器采集"
+      ],
+      "when_to_use": [
+        "需要下载一个或多个抖音视频",
+        "需要解析抖音短链 URL GID 或关键词并批量下载"
+      ],
+      "when_not_use": [
+        "需要魔工业务过滤或魔工能力查询",
+        "需要 AdXRay 短剧热榜采集或短剧榜单素材下载",
+        "AdXRay",
+        "短剧下载",
+        "短剧榜单",
+        "需要已下载素材的视觉审核"
+      ],
+      "inputs": [
+        "douyin_url",
+        "gid",
+        "keyword_list",
+        "url_list"
+      ],
+      "outputs": [
+        "downloaded_videos",
+        "capture_summary",
+        "diagnostics"
+      ],
       "requires": [],
       "optional": [],
       "next_stage": [
@@ -71,6 +144,41 @@
     "mogong-gid-retrieval": {
       "category": "assets",
       "summary": "消费通用抖音引用，执行魔工 GID 业务查询、过滤和结果导出。",
+      "capability_path": [
+        "Video",
+        "Assets",
+        "Douyin",
+        "MogongGid"
+      ],
+      "tags": [
+        "魔工",
+        "GID",
+        "gid查询",
+        "业务过滤",
+        "关键词",
+        "Excel",
+        "导出",
+        "万邦"
+      ],
+      "when_to_use": [
+        "需要查询魔工 GID 能力",
+        "需要从抖音 URL GID 或关键词导出魔工匹配和未匹配结果"
+      ],
+      "when_not_use": [
+        "只需要通用抖音视频下载且不需要魔工查询",
+        "只需要素材库 Manifest 管理"
+      ],
+      "inputs": [
+        "douyin_reference_file",
+        "gid_list",
+        "keyword_list",
+        "mogong_credentials"
+      ],
+      "outputs": [
+        "matched_excel",
+        "unmatched_excel",
+        "optional_downloads"
+      ],
       "requires": [
         "douyin-video-toolkit"
       ],
@@ -79,9 +187,162 @@
         "manage-visual-asset-library"
       ]
     },
+    "adxray-playlet-crawler": {
+      "category": "assets",
+      "summary": "从 AdXRay 抖音热播短剧榜筛选、抓取并下载短剧素材视频。",
+      "capability_path": [
+        "Video",
+        "Assets",
+        "ShortDrama",
+        "AdXRayCrawler"
+      ],
+      "tags": [
+        "AdXRay",
+        "ADX Ray",
+        "adxray",
+        "短剧",
+        "短剧下载",
+        "抖音热播榜",
+        "热播榜",
+        "素材下载",
+        "真人AI",
+        "沙雕漫",
+        "2D漫",
+        "3D漫",
+        "解说漫",
+        "游戏编辑器漫"
+      ],
+      "when_to_use": [
+        "需要从 AdXRay 抖音热播榜下载短剧素材",
+        "需要按短剧分类或剧名搜索下载榜单素材视频"
+      ],
+      "when_not_use": [
+        "只需要通用抖音视频下载",
+        "审核",
+        "视频审核",
+        "视觉审核",
+        "短剧审核",
+        "需要对已下载视频做视觉审核",
+        "需要短剧包装剪辑"
+      ],
+      "inputs": [
+        "adxray_account",
+        "adxray_password",
+        "drama_name",
+        "detail_url",
+        "category_filters"
+      ],
+      "outputs": [
+        "downloaded_playlet_videos",
+        "manifest_json",
+        "debug_artifacts"
+      ],
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": [
+        "aivideoeditor-visual-moderation",
+        "manage-visual-asset-library"
+      ]
+    },
+    "aivideoeditor-visual-moderation": {
+      "category": "assets",
+      "summary": "对图片、视频帧、OCR、字幕和 ASR 证据执行视觉与对白风险审核。",
+      "capability_path": [
+        "Video",
+        "Analyze",
+        "ContentSafety",
+        "VisualModeration"
+      ],
+      "tags": [
+        "审核",
+        "视觉审核",
+        "短剧审核",
+        "视频审核",
+        "图片审核",
+        "OCR",
+        "ASR",
+        "字幕",
+        "证件",
+        "身份证",
+        "NSFW",
+        "裸露",
+        "军事敏感",
+        "遮罩",
+        "马赛克",
+        "LangGraph"
+      ],
+      "when_to_use": [
+        "需要审核图片 视频帧 OCR 字幕或 ASR 风险",
+        "需要识别或遮罩证件 军事敏感 NSFW 裸露 低俗等视觉对白风险"
+      ],
+      "when_not_use": [
+        "短剧下载",
+        "短剧包装",
+        "只需要下载短剧素材",
+        "只需要生成或包装视频且不需要内容审核",
+        "只需要素材 Manifest 管理"
+      ],
+      "inputs": [
+        "image_files",
+        "video_files",
+        "frame_samples",
+        "ocr_text",
+        "subtitle_file",
+        "asr_transcript",
+        "policy_config"
+      ],
+      "outputs": [
+        "moderation_report",
+        "decision_schema",
+        "redaction_targets",
+        "masked_preview"
+      ],
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": [
+        "edit-short-drama-packaging",
+        "aivideoeditor-video-fission"
+      ]
+    },
     "manage-visual-asset-library": {
       "category": "assets",
       "summary": "生成视觉素材 Manifest，完成 Read 理解、有效区域标注和语义候选输出。",
+      "capability_path": [
+        "Video",
+        "Assets",
+        "Manifest",
+        "SemanticRetrieval"
+      ],
+      "tags": [
+        "素材库",
+        "Manifest",
+        "素材理解",
+        "Read",
+        "有效区域",
+        "语义候选",
+        "资产同步"
+      ],
+      "when_to_use": [
+        "需要建立或校验图片视频素材 Manifest",
+        "需要为视觉素材补充内容理解 有效区域 或语义候选"
+      ],
+      "when_not_use": [
+        "只需要下载素材",
+        "只需要渲染或剪辑最终视频"
+      ],
+      "inputs": [
+        "asset_directory",
+        "existing_manifest"
+      ],
+      "outputs": [
+        "asset_manifest",
+        "semantic_candidates",
+        "understanding_queue"
+      ],
       "requires": [],
       "optional": [],
       "next_stage": [
@@ -92,6 +353,41 @@
     "subtitle-motion-effects": {
       "category": "render-components",
       "summary": "渲染可复用的透明字幕动效层或合成预览。",
+      "capability_path": [
+        "Video",
+        "Edit",
+        "Subtitle",
+        "MotionRenderer"
+      ],
+      "tags": [
+        "字幕",
+        "字幕动效",
+        "剪映",
+        "卡拉OK",
+        "逐字",
+        "落字",
+        "透明字幕",
+        "Remotion"
+      ],
+      "when_to_use": [
+        "需要生成类似剪映或抖音风的动态字幕",
+        "需要输出透明字幕层或带字幕动效的预览视频"
+      ],
+      "when_not_use": [
+        "只需要字幕文本提取",
+        "只需要字幕翻译",
+        "只需要下载视频"
+      ],
+      "inputs": [
+        "subtitle_timeline_json",
+        "style_config",
+        "optional_base_video"
+      ],
+      "outputs": [
+        "subtitle_alpha_video",
+        "composite_preview",
+        "motion_report"
+      ],
       "requires": [],
       "optional": [],
       "next_stage": [
@@ -101,6 +397,40 @@
     "video-motion-effects": {
       "category": "render-components",
       "summary": "渲染可复用的图片入场动效层或合成视频。",
+      "capability_path": [
+        "Video",
+        "Edit",
+        "VisualMotion",
+        "ImageEntrance"
+      ],
+      "tags": [
+        "图片动效",
+        "入场动效",
+        "转场",
+        "透明动效",
+        "Remotion",
+        "缩小",
+        "翻转",
+        "卷页"
+      ],
+      "when_to_use": [
+        "需要为图片或素材生成入场动效",
+        "需要输出透明图片动效层或合成动效视频"
+      ],
+      "when_not_use": [
+        "只需要字幕动效",
+        "只需要下载或审核素材"
+      ],
+      "inputs": [
+        "image_assets",
+        "motion_timeline_json",
+        "optional_base_video"
+      ],
+      "outputs": [
+        "motion_alpha_video",
+        "composite_preview",
+        "render_report"
+      ],
       "requires": [],
       "optional": [],
       "next_stage": [
@@ -110,6 +440,40 @@
     "aivideoeditor-pre-roll": {
       "category": "production",
       "summary": "在本地独立渲染前贴视频、字幕、Logo 和免责声明。",
+      "capability_path": [
+        "Video",
+        "Production",
+        "PreRoll"
+      ],
+      "tags": [
+        "前贴",
+        "广告",
+        "免责声明",
+        "Logo",
+        "本地渲染",
+        "汽水",
+        "口播",
+        "字幕"
+      ],
+      "when_to_use": [
+        "需要生成 AIVideoEditor 前贴或 front-ad 视频",
+        "需要本地渲染带 Logo 字幕和免责声明的前贴视频"
+      ],
+      "when_not_use": [
+        "需要正文混剪",
+        "只需要单独字幕动效层",
+        "只需要视频裂变"
+      ],
+      "inputs": [
+        "script_text",
+        "visual_template",
+        "subtitle_config",
+        "logo_assets"
+      ],
+      "outputs": [
+        "pre_roll_video",
+        "render_report"
+      ],
       "requires": [],
       "optional": [
         "manage-visual-asset-library",
@@ -122,6 +486,43 @@
     "edit-soda-music-video": {
       "category": "production",
       "summary": "生成满足汽水音乐品牌、字幕、素材、合规和交付门禁的数字人口播混剪。",
+      "capability_path": [
+        "Video",
+        "Production",
+        "SodaMusic",
+        "MixedCut"
+      ],
+      "tags": [
+        "汽水音乐",
+        "混剪",
+        "数字人",
+        "去气口",
+        "Whisper",
+        "字幕",
+        "BGM",
+        "QA",
+        "品牌布局"
+      ],
+      "when_to_use": [
+        "需要制作汽水音乐正文混剪成片",
+        "需要处理数字人口播 字幕 素材 BGM 合规和交付 QA"
+      ],
+      "when_not_use": [
+        "只需要前贴视频",
+        "只需要通用短剧包装",
+        "只需要下载素材"
+      ],
+      "inputs": [
+        "talking_head_video",
+        "asset_manifest",
+        "whisper_transcript",
+        "delivery_requirements"
+      ],
+      "outputs": [
+        "final_video",
+        "qa_report",
+        "timeline_artifacts"
+      ],
       "requires": [
         "setup-video-editing-environment",
         "manage-visual-asset-library"
@@ -136,6 +537,47 @@
     "edit-short-drama-packaging": {
       "category": "production",
       "summary": "为短剧增加利益点、风险提示、AI 提示并替换匹配尾板。",
+      "capability_path": [
+        "Video",
+        "Production",
+        "ShortDrama",
+        "Packaging"
+      ],
+      "tags": [
+        "短剧",
+        "包装",
+        "尾板",
+        "利益点",
+        "风险提示",
+        "AI提示",
+        "横屏",
+        "竖屏"
+      ],
+      "when_to_use": [
+        "需要给短剧视频添加免费利益点 风险提示 AI 生成提示",
+        "需要替换短剧原尾板并拼接横屏或竖屏尾板"
+      ],
+      "when_not_use": [
+        "下载",
+        "短剧下载",
+        "素材下载",
+        "视频审核",
+        "视觉审核",
+        "短剧审核",
+        "NSFW",
+        "需要下载短剧素材",
+        "需要审核视频风险",
+        "需要汽水音乐混剪"
+      ],
+      "inputs": [
+        "short_drama_video",
+        "tail_board_assets",
+        "packaging_copy"
+      ],
+      "outputs": [
+        "packaged_short_drama_video",
+        "packaging_report"
+      ],
       "requires": [],
       "optional": [
         "setup-video-editing-environment"
@@ -147,6 +589,39 @@
     "aivideoeditor-video-fission": {
       "category": "repurpose",
       "summary": "执行视频裂变、抽帧变体、组合和音视频配对输出。",
+      "capability_path": [
+        "Video",
+        "Repurpose",
+        "Fission"
+      ],
+      "tags": [
+        "视频裂变",
+        "裂变",
+        "抽帧",
+        "素材重混",
+        "前贴排列组合",
+        "文件夹组合",
+        "音视频配对"
+      ],
+      "when_to_use": [
+        "需要从已有视频生成多个裂变变体",
+        "需要抽帧裂变 前贴排列组合 文件夹组合或音视频配对输出"
+      ],
+      "when_not_use": [
+        "需要上传或送审",
+        "需要下载素材",
+        "只需要字幕动效"
+      ],
+      "inputs": [
+        "source_videos",
+        "material_folders",
+        "audio_video_pairs"
+      ],
+      "outputs": [
+        "variant_videos",
+        "manifest",
+        "task_log"
+      ],
       "requires": [],
       "optional": [
         "setup-video-editing-environment"
@@ -158,6 +633,42 @@
     "aivideoeditor-usergrowth-automation": {
       "category": "distribution",
       "summary": "执行 UserGrowth 桌面上传、送审、标签和运营数据回填。",
+      "capability_path": [
+        "Video",
+        "Distribution",
+        "UserGrowthUpload"
+      ],
+      "tags": [
+        "上传",
+        "自动上传",
+        "UserGrowth",
+        "送审",
+        "CID",
+        "Excel",
+        "歌曲库",
+        "标签",
+        "回填"
+      ],
+      "when_to_use": [
+        "需要将视频上传到 UserGrowth 并送审",
+        "需要匹配歌曲库 回填 Excel CID 或处理素材标签"
+      ],
+      "when_not_use": [
+        "需要生成视频",
+        "需要下载素材",
+        "需要查询 GID"
+      ],
+      "inputs": [
+        "video_files",
+        "upload_manifest",
+        "song_library",
+        "usergrowth_credentials"
+      ],
+      "outputs": [
+        "upload_results",
+        "cid_backfill",
+        "task_logs"
+      ],
       "requires": [],
       "optional": [],
       "next_stage": []

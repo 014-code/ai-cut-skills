@@ -14,9 +14,13 @@
 
 - `douyin-video-toolkit`：抖音页面捕获、视频流采集、URL/GID/关键词批量下载和失败诊断。
 - `mogong-gid-retrieval`：消费通用抖音引用，执行魔工 GID 能力查询、业务过滤、结果导出和可选委托下载。
+- `adxray-playlet-crawler`：AdXRay/ADX Ray 抖音热播短剧素材采集与下载，支持短剧分类筛选、剧名搜索、详情页素材排序和 manifest/debug 产物。
+- `aivideoeditor-visual-moderation`：图片、视频帧、OCR、字幕、ASR 和遮罩产物审核，覆盖军事敏感、证件凭据和 NSFW 等视觉/对白风险。
 - `manage-visual-asset-library`：跨项目图片/视频入库、Read 内容理解、有效区域标注、Manifest 校验和语义候选报告。
 
 `douyin-video-toolkit` 负责通用素材解析与下载；`mogong-gid-retrieval` 只负责魔工业务查询、过滤和结果导出。魔工兼容入口通过统一引用契约调用 Toolkit，不再复制短链解析、GID 提取和万邦下载代码。
+
+`adxray-playlet-crawler` 面向短剧热榜素材下载，下载结果可直接进入 `aivideoeditor-visual-moderation` 做视觉和对白审核，再进入后续包装、裂变或上传链路。
 
 ### 3. 通用渲染组件
 
@@ -42,7 +46,7 @@
 ```text
 运行环境
    ↓
-素材获取 → 素材理解与 Manifest
+素材获取 → 内容审核 → 素材理解与 Manifest
    ↓
 通用渲染组件 → 业务成片
    ↓
@@ -58,10 +62,36 @@
 | `edit-soda-music-video` | `setup-video-editing-environment`、`manage-visual-asset-library` | `video-motion-effects` | `aivideoeditor-video-fission` |
 | `aivideoeditor-pre-roll` | 无 | `manage-visual-asset-library`、`subtitle-motion-effects` | `aivideoeditor-video-fission` |
 | `edit-short-drama-packaging` | 无 | `setup-video-editing-environment` | `aivideoeditor-video-fission` |
+| `adxray-playlet-crawler` | 无 | `setup-video-editing-environment` | `aivideoeditor-visual-moderation` |
+| `aivideoeditor-visual-moderation` | 无 | `setup-video-editing-environment` | `edit-short-drama-packaging` |
 | `aivideoeditor-video-fission` | 无 | `setup-video-editing-environment` | `aivideoeditor-usergrowth-automation` |
 | `mogong-gid-retrieval` | `douyin-video-toolkit` | 无 | `manage-visual-asset-library` |
 
 完整的机器可读关系见 [`skill-catalog.yaml`](skill-catalog.yaml)。
+
+## Skill Router
+
+当前采用最小侵入的 SkillOS 方案：不重排 `skills/<skill-name>` 目录，不修改 `SKILL.md` frontmatter，也不改变同步到 Codex/WorkBuddy 的运行副本。路由只读取根目录的 [`skill-catalog.yaml`](skill-catalog.yaml)，先把用户意图缩小到少量候选 Skill，再交给 Agent 做最终判断。
+
+每个 Skill 可以在 catalog 中补充以下可选路由元数据：
+
+- `capability_path`：能力树路径，例如 `Video > Edit > Subtitle > MotionRenderer`。
+- `tags`：短关键词，用于召回中文业务词、英文工具名和常见别名。
+- `when_to_use`：正向触发场景。
+- `when_not_use`：排除场景，用来降低相近 Skill 的误召回。
+- `inputs` / `outputs`：粗粒度输入输出契约，详细门禁仍以对应 `SKILL.md` 为准。
+- `quality`：仅在有真实观测数据时填写 `confidence` 或 `success_rate`，没有数据时保持缺省，不影响排序。
+
+本地查看候选：
+
+```bash
+python3 scripts/sync_skills.py --route "做一个类似剪映字幕" --top 3
+python3 scripts/sync_skills.py --route "查询魔工 gid 并导出 excel" --top 3
+python3 scripts/sync_skills.py --route "下载 AdXRay 抖音热播短剧素材" --top 3
+python3 scripts/sync_skills.py --route "审核短剧视频里的证件和 NSFW 风险" --top 3
+```
+
+输出会包含候选 Skill、能力路径、正向命中原因和 `when_not_use` 命中原因，方便定位 Skill Drift。
 
 ## 目录
 
@@ -74,6 +104,8 @@
     ├── setup-video-editing-environment/
     ├── douyin-video-toolkit/
     ├── mogong-gid-retrieval/
+    ├── adxray-playlet-crawler/
+    ├── aivideoeditor-visual-moderation/
     ├── manage-visual-asset-library/
     ├── subtitle-motion-effects/
     ├── video-motion-effects/

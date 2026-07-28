@@ -22,7 +22,35 @@ class CatalogTests(unittest.TestCase):
         catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
         sync_skills.validate_catalog(catalog, REPO_ROOT / "skills")
         self.assertEqual(len(catalog["categories"]), 6)
-        self.assertEqual(len(catalog["skills"]), 11)
+        self.assertEqual(len(catalog["skills"]), 13)
+
+    def test_optional_routing_metadata_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            skills_dir = Path(temporary_directory) / "skills"
+            (skills_dir / "example").mkdir(parents=True)
+            (skills_dir / "example" / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
+            catalog = {
+                "schema_version": 1,
+                "categories": {"test": {"label": "Test"}},
+                "sync": {"exclude_names": [], "exclude_suffixes": []},
+                "skills": {
+                    "example": {
+                        "category": "test",
+                        "summary": "Example",
+                        "capability_path": ["Video", "Edit"],
+                        "tags": ["字幕"],
+                        "when_to_use": ["需要生成字幕动效"],
+                        "when_not_use": ["只需要字幕文本"],
+                        "inputs": ["subtitle_json"],
+                        "outputs": ["mp4"],
+                        "quality": {"confidence": 0.9, "success_rate": 0.8},
+                        "requires": [],
+                        "optional": [],
+                        "next_stage": [],
+                    }
+                },
+            }
+            sync_skills.validate_catalog(catalog, skills_dir)
 
     def test_readme_names_every_catalogued_skill(self) -> None:
         catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
@@ -72,6 +100,61 @@ class CatalogTests(unittest.TestCase):
             }
             with self.assertRaises(sync_skills.CatalogError):
                 sync_skills.validate_catalog(catalog, skills_dir)
+
+    def test_route_prefers_subtitle_motion_for_effect_intent(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        candidates = sync_skills.route_skills(catalog, "做一个类似剪映字幕", top=3)
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].skill_name, "subtitle-motion-effects")
+
+    def test_route_prefers_mogong_for_gid_query(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        candidates = sync_skills.route_skills(catalog, "查询魔工 gid 并导出 excel", top=3)
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].skill_name, "mogong-gid-retrieval")
+
+    def test_route_avoids_generic_video_only_matches(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        candidates = sync_skills.route_skills(catalog, "抖音视频下载", top=3)
+        self.assertEqual([candidate.skill_name for candidate in candidates], ["douyin-video-toolkit"])
+
+    def test_route_prefers_adxray_for_hot_playlet_download(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        candidates = sync_skills.route_skills(catalog, "下载 AdXRay 抖音热播短剧素材", top=3)
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].skill_name, "adxray-playlet-crawler")
+
+    def test_route_prefers_visual_moderation_for_review_intent(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        candidates = sync_skills.route_skills(catalog, "审核短剧视频里的证件和 NSFW 风险", top=3)
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].skill_name, "aivideoeditor-visual-moderation")
+
+    def test_route_when_not_use_demotes_neighboring_skill(self) -> None:
+        catalog = {
+            "categories": {"render": {"label": "渲染", "description": "字幕能力"}},
+            "skills": {
+                "subtitle-motion": {
+                    "category": "render",
+                    "summary": "生成字幕动效",
+                    "capability_path": ["Video", "Edit", "Subtitle"],
+                    "tags": ["字幕", "字幕动效"],
+                    "when_to_use": ["需要生成字幕动效"],
+                    "when_not_use": ["只需要字幕文本提取"],
+                },
+                "subtitle-extract": {
+                    "category": "render",
+                    "summary": "提取字幕文本",
+                    "capability_path": ["Video", "Analyze", "SubtitleExtract"],
+                    "tags": ["字幕", "提取", "字幕文本"],
+                    "when_to_use": ["只需要字幕文本提取"],
+                    "when_not_use": ["需要生成字幕动效"],
+                },
+            },
+        }
+        candidates = sync_skills.route_skills(catalog, "只需要字幕文本提取", top=2)
+        self.assertEqual(candidates[0].skill_name, "subtitle-extract")
+        self.assertNotIn("subtitle-motion", [candidate.skill_name for candidate in candidates])
 
 
 class SyncTreeTests(unittest.TestCase):
