@@ -1,0 +1,4 @@
+interface:
+  display_name: "短剧包装剪辑"
+  short_description: "给短剧添加免费利益点、虚构与AI提示并自动替换横竖屏尾板"
+  default_prompt: "Use $edit-short-drama-packaging to package this short-drama video with free-viewing copy, fictional and AI notices, and the matching tail board."

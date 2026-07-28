@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "categories": {
+    "runtime": {
+      "label": "运行环境",
+      "description": "发现、安装并验证视频生产所需的跨平台运行环境。"
+    },
+    "assets": {
+      "label": "素材获取与治理",
+      "description": "获取、筛选、理解和管理可复用视觉素材。"
+    },
+    "render-components": {
+      "label": "通用渲染组件",
+      "description": "向上层工作流提供可复用的字幕和视觉动效渲染能力。"
+    },
+    "production": {
+      "label": "业务成片工作流",
+      "description": "根据具体业务、品牌和合规规则组织正式成片。"
+    },
+    "repurpose": {
+      "label": "衍生加工",
+      "description": "对已生成或已有视频执行裂变、组合与素材重混。"
+    },
+    "distribution": {
+      "label": "分发自动化",
+      "description": "将验收通过的视频上传、送审并回填运营数据。"
+    }
+  },
+  "sync": {
+    "exclude_names": [
+      ".DS_Store",
+      ".cache",
+      ".npm",
+      ".ruff_cache",
+      "__pycache__",
+      "build",
+      "coverage",
+      "dist",
+      "node_modules"
+    ],
+    "exclude_suffixes": [
+      ".pyc",
+      ".pyo"
+    ]
+  },
+  "skills": {
+    "setup-video-editing-environment": {
+      "category": "runtime",
+      "summary": "发现、安装并验证 Python、FFmpeg、Whisper 和可选 Remotion 环境。",
+      "requires": [],
+      "optional": [
+        "manage-visual-asset-library",
+        "video-motion-effects"
+      ],
+      "next_stage": [
+        "edit-soda-music-video",
+        "edit-short-drama-packaging",
+        "aivideoeditor-video-fission"
+      ]
+    },
+    "douyin-video-toolkit": {
+      "category": "assets",
+      "summary": "通用抖音页面捕获、URL/GID 解析、批量搜索和视频下载。",
+      "requires": [],
+      "optional": [],
+      "next_stage": [
+        "mogong-gid-retrieval",
+        "manage-visual-asset-library"
+      ]
+    },
+    "mogong-gid-retrieval": {
+      "category": "assets",
+      "summary": "执行魔工 GID 业务查询、过滤、结果导出和可选下载。",
+      "requires": [],
+      "optional": [
+        "douyin-video-toolkit"
+      ],
+      "next_stage": [
+        "manage-visual-asset-library"
+      ]
+    },
+    "manage-visual-asset-library": {
+      "category": "assets",
+      "summary": "生成视觉素材 Manifest，完成 Read 理解、有效区域标注和语义候选输出。",
+      "requires": [],
+      "optional": [],
+      "next_stage": [
+        "aivideoeditor-pre-roll",
+        "edit-soda-music-video"
+      ]
+    },
+    "subtitle-motion-effects": {
+      "category": "render-components",
+      "summary": "渲染可复用的透明字幕动效层或合成预览。",
+      "requires": [],
+      "optional": [],
+      "next_stage": [
+        "aivideoeditor-pre-roll"
+      ]
+    },
+    "video-motion-effects": {
+      "category": "render-components",
+      "summary": "渲染可复用的图片入场动效层或合成视频。",
+      "requires": [],
+      "optional": [],
+      "next_stage": [
+        "edit-soda-music-video"
+      ]
+    },
+    "aivideoeditor-pre-roll": {
+      "category": "production",
+      "summary": "在本地独立渲染前贴视频、字幕、Logo 和免责声明。",
+      "requires": [],
+      "optional": [
+        "manage-visual-asset-library",
+        "subtitle-motion-effects"
+      ],
+      "next_stage": [
+        "aivideoeditor-video-fission"
+      ]
+    },
+    "edit-soda-music-video": {
+      "category": "production",
+      "summary": "生成满足汽水音乐品牌、字幕、素材、合规和交付门禁的数字人口播混剪。",
+      "requires": [
+        "setup-video-editing-environment",
+        "manage-visual-asset-library"
+      ],
+      "optional": [
+        "video-motion-effects"
+      ],
+      "next_stage": [
+        "aivideoeditor-video-fission"
+      ]
+    },
+    "edit-short-drama-packaging": {
+      "category": "production",
+      "summary": "为短剧增加利益点、风险提示、AI 提示并替换匹配尾板。",
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": [
+        "aivideoeditor-video-fission"
+      ]
+    },
+    "aivideoeditor-video-fission": {
+      "category": "repurpose",
+      "summary": "执行视频裂变、抽帧变体、组合和音视频配对输出。",
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": [
+        "aivideoeditor-usergrowth-automation"
+      ]
+    },
+    "aivideoeditor-usergrowth-automation": {
+      "category": "distribution",
+      "summary": "执行 UserGrowth 桌面上传、送审、标签和运营数据回填。",
+      "requires": [],
+      "optional": [],
+      "next_stage": []
+    }
+  }
+}

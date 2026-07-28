@@ -11,7 +11,7 @@ description: Create, validate, render, or integrate animated subtitle effect lay
 
 - 输入统一用 JSON 时间线。ASS/SRT/VTT 可以作为上游来源，但进入本 skill 前建议转成 JSON。
 - 警示语、免责声明默认不加动效。把 cue 标成 `role: "disclaimer"` / `"warning"` / `"legal"` 即可。
-- 渲染出来的主字幕必须去掉标点符号。去标点只发生在最终显示层，不要提前改口播文本、时间戳、cue 顺序或分段。
+- 渲染出来的主字幕只去掉句子级标点，并保留承载数字语义的小数点、时间冒号、日期/区间连接符、负号和千位分隔符。去标点只发生在最终显示层，不要提前改口播文本、时间戳、cue 顺序或分段。
 - 主字幕只能出现一层。给前贴视频叠字幕动效前，必须先用 `aivideoeditor-pre-roll` 的 `--subtitle-render-mode motion` 生成不含普通主字幕的底片；不要把已经烧了普通主字幕的 `final.mp4` 当作 composite 输入。
 - 前贴里提到 `汽水音乐` 或 `汽水` 时必须走 `branding.words`，并设置 SodaFont、品牌绿、黑色描边和更大的字号。
 - Skill 已内置 Soda Font 和方正兰亭超细黑、细黑、常规、中黑、中粗黑、粗黑、大黑 7 个字重；默认主字幕使用中粗黑。完整文件名、真实 family 和适用场景见 [font-catalog.json](references/font-catalog.json)。

@@ -97,6 +97,42 @@ class FontCatalogTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_renderer_preserves_numeric_punctuation(self) -> None:
+        source_text = "满0.3元，15:30提现！2026-07-24余额1,000.50元。"
+        result = self.validate_timeline(
+            {
+                "defaultStyle": {"fontFamily": "Arial, sans-serif"},
+                "subtitles": [
+                    {
+                        "start": 0,
+                        "end": 2,
+                        "text": source_text,
+                        "tokens": [
+                            {"text": "满0.3元，", "start": 0, "end": 0.6},
+                            {"text": "15:30提现！", "start": 0.6, "end": 1.2},
+                            {
+                                "text": "2026-07-24余额1,000.50元。",
+                                "start": 1.2,
+                                "end": 2,
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        cue = report["subtitles"][0]
+        self.assertEqual(
+            cue["text"],
+            "满0.3元15:30提现2026-07-24余额1,000.50元",
+        )
+        self.assertEqual(cue["sourceText"], source_text)
+        self.assertEqual(
+            [token["text"] for token in cue["tokens"]],
+            ["满0.3元", "15:30提现", "2026-07-24余额1,000.50元"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

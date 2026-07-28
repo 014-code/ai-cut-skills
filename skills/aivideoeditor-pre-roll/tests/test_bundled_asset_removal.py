@@ -91,6 +91,20 @@ class BundledAssetRemovalTests(unittest.TestCase):
         )
         self.assertTrue(report["ok"])
 
+    def test_rendered_subtitles_preserve_numeric_punctuation(self) -> None:
+        cases = {
+            "满0.3元，15:30提现！": "满0.3元15:30提现",
+            "2026-07-24，余额1,000.50元。": "2026-07-24余额1,000.50元",
+            "变化-0.3元，区间1–3元。": "变化-0.3元区间1–3元",
+            "你好，世界！": "你好世界",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(
+                    runner.strip_rendered_subtitle_punctuation(source),
+                    expected,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

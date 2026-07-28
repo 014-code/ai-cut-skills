@@ -473,7 +473,31 @@ const parseStringList = (value) => {
     .filter((item) => item.length > 0);
 };
 
-const stripRenderedSubtitlePunctuation = (value) => String(value ?? '').replace(/\p{P}/gu, '');
+const NUMERIC_SUBTITLE_CONNECTORS = new Set(['.', '．', ':', '：', ',', '，', '/', '／', '-', '－', '–', '—']);
+const NUMERIC_SUBTITLE_DASHES = new Set(['-', '－', '–', '—']);
+const UNICODE_NUMBER = /^\p{N}$/u;
+const UNICODE_PUNCTUATION = /^\p{P}$/u;
+
+const preserveRenderedSubtitlePunctuation = (characters, index) => {
+  const character = characters[index];
+  if (!NUMERIC_SUBTITLE_CONNECTORS.has(character)) return false;
+  const previous = index > 0 ? characters[index - 1] : '';
+  const following = index + 1 < characters.length ? characters[index + 1] : '';
+  if (UNICODE_NUMBER.test(previous) && UNICODE_NUMBER.test(following)) return true;
+  return NUMERIC_SUBTITLE_DASHES.has(character)
+    && UNICODE_NUMBER.test(following)
+    && !UNICODE_NUMBER.test(previous);
+};
+
+const stripRenderedSubtitlePunctuation = (value) => {
+  const characters = Array.from(String(value ?? ''));
+  return characters
+    .filter((character, index) => (
+      !UNICODE_PUNCTUATION.test(character)
+      || preserveRenderedSubtitlePunctuation(characters, index)
+    ))
+    .join('');
+};
 
 const numberOrNull = (value, field) => {
   if (value == null) return null;
