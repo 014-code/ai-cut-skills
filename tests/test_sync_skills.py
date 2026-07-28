@@ -130,6 +130,18 @@ class CatalogTests(unittest.TestCase):
         self.assertGreaterEqual(len(candidates), 1)
         self.assertEqual(candidates[0].skill_name, "aivideoeditor-visual-moderation")
 
+    def test_route_includes_download_review_and_packaging_for_full_flow(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        candidates = sync_skills.route_skills(catalog, "跑一个短剧从下载审核到包装的全流程", top=5)
+        self.assertEqual(
+            {candidate.skill_name for candidate in candidates},
+            {
+                "adxray-playlet-crawler",
+                "aivideoeditor-visual-moderation",
+                "edit-short-drama-packaging",
+            },
+        )
+
     def test_route_when_not_use_demotes_neighboring_skill(self) -> None:
         catalog = {
             "categories": {"render": {"label": "渲染", "description": "字幕能力"}},

@@ -89,6 +89,7 @@ python3 scripts/sync_skills.py --route "做一个类似剪映字幕" --top 3
 python3 scripts/sync_skills.py --route "查询魔工 gid 并导出 excel" --top 3
 python3 scripts/sync_skills.py --route "下载 AdXRay 抖音热播短剧素材" --top 3
 python3 scripts/sync_skills.py --route "审核短剧视频里的证件和 NSFW 风险" --top 3
+python3 scripts/sync_skills.py --route "跑一个短剧从下载审核到包装的全流程" --top 5
 ```
 
 输出会包含候选 Skill、能力路径、正向命中原因和 `when_not_use` 命中原因，方便定位 Skill Drift。
