@@ -60,7 +60,7 @@
     },
     "douyin-video-toolkit": {
       "category": "assets",
-      "summary": "通用抖音页面捕获、URL/GID 解析、批量搜索和视频下载。",
+      "summary": "提供统一抖音引用契约、页面捕获、URL/GID 解析、批量搜索和视频下载。",
       "requires": [],
       "optional": [],
       "next_stage": [
@@ -70,11 +70,11 @@
     },
     "mogong-gid-retrieval": {
       "category": "assets",
-      "summary": "执行魔工 GID 业务查询、过滤、结果导出和可选下载。",
-      "requires": [],
-      "optional": [
+      "summary": "消费通用抖音引用，执行魔工 GID 业务查询、过滤和结果导出。",
+      "requires": [
         "douyin-video-toolkit"
       ],
+      "optional": [],
       "next_stage": [
         "manage-visual-asset-library"
       ]

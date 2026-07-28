@@ -1,6 +1,6 @@
 ---
 name: douyin-video-toolkit
-description: Standalone Douyin video toolkit for downloading, browser-capturing, batch-processing, and diagnosing Douyin videos. Use when Codex needs to download one or many Douyin URLs, modal_id/gid/v.douyin.com short links, capture browser video/mp4 streams with a Chrome/Edge MV3 extension, package the collector extension, call Wanbang item_get_video or item_search_video for GID/keyword batch downloads, process TXT/CSV/XLSX URL or keyword lists, inspect run.log/summary.json/_captures failure logs after failed or interrupted tasks, or troubleshoot Douyin CDN Referer, aweme ID mapping, stale stream, incomplete MP4, and capture diagnostics without depending on the AIVideoEditor backend.
+description: Standalone Douyin video toolkit and shared reference contract for resolving short links/GIDs, Wanbang search and download, browser capture, batch processing, and diagnostics. Use when Codex needs to normalize Douyin URL/GID/keyword inputs, provide references to another Skill such as mogong-gid-retrieval, download one or many videos, capture browser video streams, package the collector extension, inspect run.log/summary.json/references.json/_captures failures, or troubleshoot Douyin CDN Referer, aweme ID mapping, stale streams, and incomplete MP4 files.
 ---
 
 # Douyin Video Toolkit
@@ -12,6 +12,8 @@ Use this skill as a self-contained toolkit for three Douyin video workflows:
 - Page capture download: `scripts/download_douyin_share_videos.py`
 - Browser-side stream collection: `assets/aivideo-collector-extension` plus `scripts/package_extension.py`
 - Wanbang/GID batch download: `scripts/wanbang_douyin_batch_download.py`
+
+`scripts/douyin_reference_core.py` is the single source of truth for short-link resolution, GID extraction, canonical video URLs, Wanbang search, direct-URL lookup, atomic download validation, and the cross-Skill reference contract. Other Skills must call this module instead of copying those implementations.
 
 The scripts and extension do not import the AIVideoEditor backend. Backend recording is optional for the browser extension only.
 
@@ -106,6 +108,16 @@ python C:\Users\Donson\.codex\skills\douyin-video-toolkit\scripts\wanbang_douyin
   --out-dir ".\downloads\douyin-gid"
 ```
 
+Resolve a GID list without downloading:
+
+```powershell
+python C:\Users\Donson\.codex\skills\douyin-video-toolkit\scripts\wanbang_douyin_batch_download.py `
+  --gids-file ".\douyin_gids.xlsx" `
+  --gid-column "GID" `
+  --no-download `
+  --out-dir ".\downloads\douyin-references"
+```
+
 Search by keyword:
 
 ```powershell
@@ -115,7 +127,9 @@ python C:\Users\Donson\.codex\skills\douyin-video-toolkit\scripts\wanbang_douyin
   --out-dir ".\downloads\douyin-keyword"
 ```
 
-Use `--no-download` to resolve/query only, `--skip-existing` to reuse an existing `<gid>.mp4` only after MP4 validation, and `--sleep` to wait between videos. Downloads first write `<gid>.mp4.part`; only a validated complete file is atomically renamed to `<gid>.mp4`. Outputs are `<gid>.mp4`, `run.log`, `summary.json`, and `summary.csv`. Read `references/wanbang-contract.md` before changing API parsing.
+Use `--no-download` to resolve/query only, `--skip-existing` to reuse an existing `<gid>.mp4` only after MP4 validation, and `--sleep` to wait between videos. Downloads first write `<gid>.mp4.part`; only a validated complete file is atomically renamed to `<gid>.mp4`. Outputs are `<gid>.mp4`, `run.log`, legacy `summary.json`/`summary.csv`, and canonical `references.json`.
+
+`references.json` uses the stable fields `source_url`, `gid`, `video_url`, `keyword`, `status`, and `error`. Read [reference-contract.md](references/reference-contract.md) before integrating another Skill, and [wanbang-contract.md](references/wanbang-contract.md) before changing API parsing.
 
 ## Failure And Logs
 

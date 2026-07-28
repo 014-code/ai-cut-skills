@@ -9,8 +9,9 @@ For CLI runs, always start in the `--out-dir` directory:
 1. `run.log`: chronological run events, item starts, item failures, summary writes, and interruption markers.
 2. `summary.json`: structured result list. For interrupted batch runs, it contains completed items up to the most recent successful summary write.
 3. `summary.csv`: Wanbang/GID batch only; spreadsheet-friendly copy of `summary.json`.
-4. `_captures/*.json`: Playwright page capture only; per-video network responses, candidate counts, selected candidate, final page URL, and error.
-5. `_captures/*.png`: Playwright page screenshots created before selecting/downloading a candidate.
+4. `references.json`: canonical URL/GID/keyword normalization result for Wanbang/GID batch and cross-Skill consumers.
+5. `_captures/*.json`: Playwright page capture only; per-video network responses, candidate counts, selected candidate, final page URL, and error.
+6. `_captures/*.png`: Playwright page screenshots created before selecting/downloading a candidate.
 
 ## Playwright Page Capture
 
@@ -45,6 +46,7 @@ Expected files:
 - `<out-dir>/run.log`
 - `<out-dir>/summary.json`
 - `<out-dir>/summary.csv`
+- `<out-dir>/references.json`
 - `<out-dir>/<gid>.mp4` for `downloaded` or `reused` items
 
 Wanbang downloads use `<gid>.mp4.part` while bytes are still arriving. On success, the tool validates the MP4 and atomically replaces `<gid>.mp4`; on failure or interruption it removes the `.part` file. `--skip-existing` reuses only a file with an MP4 header and, when `ffprobe` is available, a positive readable duration. A nonempty but invalid final file is logged as `item_existing_invalid` and downloaded again.

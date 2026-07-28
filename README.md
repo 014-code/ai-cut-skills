@@ -13,10 +13,10 @@
 ### 2. 素材获取与治理
 
 - `douyin-video-toolkit`：抖音页面捕获、视频流采集、URL/GID/关键词批量下载和失败诊断。
-- `mogong-gid-retrieval`：抖音 URL/GID/关键词解析、万邦搜索、魔工 GID 能力查询、匹配结果导出和可选下载。
+- `mogong-gid-retrieval`：消费通用抖音引用，执行魔工 GID 能力查询、业务过滤、结果导出和可选委托下载。
 - `manage-visual-asset-library`：跨项目图片/视频入库、Read 内容理解、有效区域标注、Manifest 校验和语义候选报告。
 
-`douyin-video-toolkit` 负责通用素材解析与下载；`mogong-gid-retrieval` 负责魔工业务查询、过滤和结果导出。后续重构应优先让魔工流程复用通用下载能力，避免继续复制短链解析、GID 提取和万邦下载代码。
+`douyin-video-toolkit` 负责通用素材解析与下载；`mogong-gid-retrieval` 只负责魔工业务查询、过滤和结果导出。魔工兼容入口通过统一引用契约调用 Toolkit，不再复制短链解析、GID 提取和万邦下载代码。
 
 ### 3. 通用渲染组件
 
@@ -59,7 +59,7 @@
 | `aivideoeditor-pre-roll` | 无 | `manage-visual-asset-library`、`subtitle-motion-effects` | `aivideoeditor-video-fission` |
 | `edit-short-drama-packaging` | 无 | `setup-video-editing-environment` | `aivideoeditor-video-fission` |
 | `aivideoeditor-video-fission` | 无 | `setup-video-editing-environment` | `aivideoeditor-usergrowth-automation` |
-| `mogong-gid-retrieval` | 无 | `douyin-video-toolkit` | `manage-visual-asset-library` |
+| `mogong-gid-retrieval` | `douyin-video-toolkit` | 无 | `manage-visual-asset-library` |
 
 完整的机器可读关系见 [`skill-catalog.yaml`](skill-catalog.yaml)。
 
@@ -110,6 +110,8 @@ python3 scripts/sync_skills.py --runtime codex
 python3 scripts/sync_skills.py --runtime codex --category production
 python3 scripts/sync_skills.py --runtime workbuddy --skill edit-soda-music-video
 ```
+
+按单 Skill 或分类同步时，脚本默认根据 `skill-catalog.yaml` 递归带上全部 `requires` 依赖。例如同步 `mogong-gid-retrieval` 会自动同步 `douyin-video-toolkit`。只有在明确管理依赖时才使用 `--no-dependencies`。
 
 先预览操作：
 

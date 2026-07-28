@@ -1,6 +1,6 @@
 # Wanbang Contract
 
-Use this reference when modifying `scripts/wanbang_douyin_batch_download.py`.
+Use this reference when modifying `scripts/douyin_reference_core.py` or `scripts/wanbang_douyin_batch_download.py`.
 
 ## Environment
 
@@ -46,6 +46,8 @@ Use status values:
 - `reused`: existing `<gid>.mp4` passed validation and was reused.
 - `resolved`: `--no-download` was used.
 - `failed`: API or download failed.
+
+The legacy `summary.json` remains a list for compatibility. The canonical cross-Skill output is `references.json`, defined in [reference-contract.md](reference-contract.md).
 
 ## Download Integrity
 

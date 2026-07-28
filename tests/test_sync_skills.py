@@ -30,14 +30,26 @@ class CatalogTests(unittest.TestCase):
         missing = [skill_name for skill_name in catalog["skills"] if f"`{skill_name}`" not in readme]
         self.assertEqual(missing, [])
 
-    def test_selection_uses_category_and_skill_intersection(self) -> None:
+    def test_selection_uses_category_and_skill_intersection_with_required_dependencies(self) -> None:
         catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
         selected = sync_skills.choose_skills(
             catalog,
             ["edit-soda-music-video", "video-motion-effects"],
             ["production"],
         )
-        self.assertEqual(selected, ["edit-soda-music-video"])
+        self.assertEqual(
+            selected,
+            [
+                "setup-video-editing-environment",
+                "manage-visual-asset-library",
+                "edit-soda-music-video",
+            ],
+        )
+
+    def test_mogong_selection_includes_douyin_toolkit(self) -> None:
+        catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
+        selected = sync_skills.choose_skills(catalog, ["mogong-gid-retrieval"], [])
+        self.assertEqual(selected, ["douyin-video-toolkit", "mogong-gid-retrieval"])
 
     def test_unknown_catalog_dependency_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

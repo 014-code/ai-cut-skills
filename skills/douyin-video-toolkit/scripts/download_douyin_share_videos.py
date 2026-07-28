@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 import urllib.request
 
+from douyin_reference_core import build_douyin_video_url, extract_gid
+
 DEFAULT_OUT_DIR = Path("downloads/douyin")
 DEFAULT_USER_DATA_DIR = Path.home() / ".codex" / "skill-data" / "douyin-video-downloader-edge-profile"
 DEFAULT_URLS: list[str] = []
@@ -23,48 +25,21 @@ def append_log(log_path: Path, message: str) -> None:
         file.write(f"[{timestamp}] {message}\n")
 
 
-def resolve_redirect_url(url: str) -> str:
-    parsed = urlparse(url)
-    if not parsed.netloc.endswith("v.douyin.com"):
-        return url
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        },
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return response.geturl() or url
-
-
 def video_id_from_url(url: str) -> str:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    for key in ("modal_id", "gid", "video_id", "item_id", "aweme_id"):
-        value = (query.get(key) or [""])[0]
+    if is_chameleon_video_url(url):
+        value = (parse_qs(urlparse(url).query).get("video_id") or [""])[0]
         if value:
             return re.sub(r"[^A-Za-z0-9_-]+", "_", value)
-
-    match = re.search(r"/(?:share/)?video/(\d+)", parsed.path)
-    if match:
-        return match.group(1)
-
-    resolved = resolve_redirect_url(url)
-    if resolved != url:
-        return video_id_from_url(resolved)
-
+    gid = extract_gid(url)
+    if gid:
+        return gid
     raise ValueError(f"Cannot find video id in URL: {url}")
 
 
 def canonical_video_url(url: str) -> str:
     if is_chameleon_video_url(url):
         return url
-    return f"https://www.douyin.com/video/{video_id_from_url(url)}"
+    return build_douyin_video_url(video_id_from_url(url))
 
 
 def is_chameleon_video_url(url: str) -> bool:

@@ -1,13 +1,17 @@
 ---
 name: mogong-gid-retrieval
-description: Standalone Douyin GID retrieval and Mogong filtering workflow. Use when Codex needs to parse Douyin URLs or raw GIDs from Excel/CSV, resolve short Douyin links, search Douyin videos by keyword through Wanbang, query Mogong creative assistant GID ability, export matched/unmatched Excel results, or optionally download matched videos without depending on the AIVideoEditor backend repository.
+description: Query normalized Douyin GIDs through the Mogong creative assistant, apply Mogong-specific business filtering, and export matched/unmatched Excel and JSON results. Use for 魔工 GID 查询、业务过滤、结果导出，or compatibility URL/GID/keyword inputs whose generic resolution, Wanbang search, and optional downloads must be delegated to the required douyin-video-toolkit Skill.
 ---
 
 # Mogong GID Retrieval
 
 ## Purpose
 
-Use this skill as a self-contained implementation of the Mogong GID retrieval workflow. Prefer the bundled CLI script over re-creating logic from an application repository.
+Use this skill for Mogong querying, business classification, recovery logs, and result export.
+
+**REQUIRED SUB-SKILL:** Use `douyin-video-toolkit`.
+
+This Skill does not implement short-link resolution, GID extraction, Wanbang search, direct-URL lookup, or video download. Its compatibility URL/GID/keyword inputs call `douyin-video-toolkit/scripts/douyin_reference_core.py`, then keep Mogong state in separate result files.
 
 Main script: `scripts/mogong_gid_retrieval.py`
 
@@ -30,7 +34,7 @@ MOGONG_PASSWORD=...
 MOGONG_CUSTOMER_ID=...
 ```
 
-For keyword search or video download, also provide Wanbang credentials:
+For keyword search or delegated video download, also provide Wanbang credentials:
 
 ```bash
 WANBANG_API_KEY=...
@@ -81,16 +85,18 @@ python scripts/mogong_gid_retrieval.py run \
   --max-videos-per-keyword 12
 ```
 
-Add `--download` to download matched videos through Wanbang `item_get_video`. Use `--download-scope all` only when Mogong was skipped and the user explicitly wants unfiltered downloads.
+Add `--download` to send matched GIDs to `douyin-video-toolkit` for atomic download and validation. Use `--download-scope all` only when Mogong was skipped and the user explicitly wants unfiltered downloads.
 
 ## Workflow
 
-1. Decide input mode:
+1. Confirm `douyin-video-toolkit` is installed beside this Skill. Use `--douyin-toolkit-core <path>` only for a nonstandard location.
+2. Decide input mode:
    - `url`: Excel/CSV contains Douyin URLs, short links, or cells containing GIDs.
    - `gid`: Excel/CSV contains raw GID values.
-   - `keyword`: Excel/CSV contains search keywords; Wanbang is used to find Douyin video GIDs.
-2. Run the bundled script from this skill directory.
-3. Inspect outputs in `--output-dir`:
+   - `keyword`: Excel/CSV contains search keywords; the Douyin Toolkit calls Wanbang to find GIDs.
+3. The script delegates normalization/search to the Toolkit and converts its reference contract into `parsed_references.json`.
+4. Run the Mogong browser query, classify replies, and optionally delegate matched downloads back to the Toolkit.
+5. Inspect outputs in `--output-dir`:
    - `all_results.xlsx`: every parsed GID with query status, Mogong reply, and download status.
    - `matched_urls.xlsx`: only rows whose Mogong query status is `matched`.
    - `summary.json`: counts and output paths.
@@ -100,7 +106,7 @@ Add `--download` to download matched videos through Wanbang `item_get_video`. Us
    - `partial_results.json`: latest query/download results, useful when the final Excel files were not written.
    - `parse_errors.json`: only present when some inputs cannot be parsed.
    - `debug/`: Mogong browser snapshots and text dumps when querying Mogong.
-4. If a Mogong run fails, check `debug/*.txt` first. Failures usually come from login captcha, customer ID mismatch, page structure changes, or the GID ability not being selected.
+6. If a Mogong run fails, check `debug/*.txt` first. Failures usually come from missing Toolkit installation, login captcha, customer ID mismatch, page structure changes, or the GID ability not being selected.
 
 ## Failure Logs
 
@@ -124,15 +130,16 @@ The script classifies Mogong replies as:
 - `no_reply`: Mogong returns no final reply or stays processing until timeout.
 - `unchecked`: `--skip-mogong` was used.
 
-Short Douyin links are resolved with HTTP redirects. Keyword search and video download require Wanbang credentials. Mogong querying requires Playwright and may require `ddddocr` when the login page shows an image captcha.
+Short links and GIDs are resolved by the Douyin Toolkit. Keyword search and delegated download require Wanbang credentials. Mogong querying requires Playwright and may require `ddddocr` when the login page shows an image captcha.
 
 ## Integration Notes
 
-When asked to add this functionality to another codebase, copy or adapt `scripts/mogong_gid_retrieval.py` rather than depending on the original AIVideoEditor backend. Split it only after the target app has clear boundaries for API, job storage, artifact storage, and worker execution.
+When asked to add this functionality to another codebase, keep the Douyin reference contract and Mogong business results separate. Do not copy Toolkit parsing or download code back into the Mogong implementation.
 
-When combining with a repository-specific workflow, keep this skill as the source of truth for:
+Keep this Skill as the source of truth only for:
 
-- GID extraction rules.
 - Mogong navigation and reply classification.
 - Excel result shape.
-- Wanbang search/download request shape.
+- Mogong recovery logs and business statuses.
+
+Keep `douyin-video-toolkit` as the source of truth for URL/GID normalization, Wanbang request parsing, and video downloads.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import importlib.util
 import json
 import os
 import re
@@ -14,11 +15,6 @@ import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.parse import parse_qs, urlparse
-
-
-DOUYIN_VIDEO_URL = "https://www.douyin.com/video/{gid}"
-GID_PATTERN = re.compile(r"(?<!\d)(\d{16,22})(?!\d)")
 
 URL_HEADER_KEYWORDS = ("url", "link", "链接", "视频链接", "视频url", "地址")
 GID_HEADER_KEYWORDS = ("gid", "GID", "视频id", "视频ID", "抖音id", "抖音ID")
@@ -70,6 +66,7 @@ class VideoReference:
     gid: Optional[str] = None
     video_url: Optional[str] = None
     error_message: Optional[str] = None
+    keyword: Optional[str] = None
 
 
 @dataclass
@@ -114,31 +111,6 @@ def unique_preserve_order(values: Iterable[str]) -> list[str]:
     return result
 
 
-def build_douyin_video_url(gid: str) -> str:
-    return DOUYIN_VIDEO_URL.format(gid=gid)
-
-
-def extract_gid_from_text(value: str) -> Optional[str]:
-    parsed = urlparse(value)
-    query = parse_qs(parsed.query)
-    for key in ("modal_id", "gid", "video_id", "item_id"):
-        query_value = query.get(key, [""])[0]
-        if query_value and query_value.isdigit():
-            return query_value
-
-    path_match = re.search(r"/(?:video|note)/(\d{16,22})", parsed.path)
-    if path_match:
-        return path_match.group(1)
-
-    text_match = GID_PATTERN.search(value)
-    return text_match.group(1) if text_match else None
-
-
-def looks_like_douyin_url(value: str) -> bool:
-    lower = value.lower()
-    return lower.startswith("http") and ("douyin.com" in lower or "v.douyin.com" in lower)
-
-
 def normalized_header(value: str) -> str:
     return value.lower().replace(" ", "").replace("_", "")
 
@@ -176,264 +148,88 @@ def load_table_rows(path: Path) -> list[list[object]]:
     raise ValueError(f"Unsupported input file extension: {path.suffix}. Use .xlsx, .xlsm, or .csv")
 
 
-def read_column_or_scan(
-    rows: list[list[object]],
-    *,
+def read_input_values(
+    path: Path,
     requested_column: Optional[str],
     header_keywords: tuple[str, ...],
-    predicate,
 ) -> list[str]:
+    rows = load_table_rows(path)
     if not rows:
         return []
     headers = [cell_text(value) for value in rows[0]]
     column_index = resolve_requested_column(headers, requested_column, header_keywords)
-    values: list[str] = []
     data_rows = rows[1:] if column_index is not None else rows
-    if column_index is not None:
-        for row in data_rows:
-            if column_index >= len(row):
-                continue
-            value = cell_text(row[column_index])
-            if predicate(value):
-                values.append(value)
-    else:
-        for row in data_rows:
-            for value in row:
-                text = cell_text(value)
-                if predicate(text):
-                    values.append(text)
+    column_index = column_index if column_index is not None else 0
+    values = [
+        cell_text(row[column_index])
+        for row in data_rows
+        if column_index < len(row) and cell_text(row[column_index])
+    ]
     return unique_preserve_order(values)
 
 
-def read_url_values(path: Path, column: Optional[str]) -> list[str]:
-    rows = load_table_rows(path)
-    return read_column_or_scan(
-        rows,
-        requested_column=column,
-        header_keywords=URL_HEADER_KEYWORDS,
-        predicate=lambda value: looks_like_douyin_url(value) or bool(extract_gid_from_text(value)),
+def find_douyin_toolkit_core(explicit_path: Optional[str] = None) -> Path:
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+    environment_path = os.getenv("DOUYIN_VIDEO_TOOLKIT_CORE")
+    if environment_path:
+        candidates.append(Path(environment_path).expanduser())
+
+    skills_root = Path(__file__).resolve().parents[2]
+    candidates.append(skills_root / "douyin-video-toolkit" / "scripts" / "douyin_reference_core.py")
+    for home_variable, fallback in (("CODEX_HOME", ".codex"), ("WORKBUDDY_HOME", ".workbuddy")):
+        configured_home = os.getenv(home_variable)
+        home = Path(configured_home).expanduser() if configured_home else Path.home() / fallback
+        candidates.append(home / "skills" / "douyin-video-toolkit" / "scripts" / "douyin_reference_core.py")
+
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return resolved
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise RuntimeError(
+        "douyin-video-toolkit is required but douyin_reference_core.py was not found. "
+        f"Install/sync the skill or pass --douyin-toolkit-core. Searched: {searched}"
     )
 
 
-def read_gid_values(path: Path, column: Optional[str]) -> list[str]:
-    rows = load_table_rows(path)
-    raw_values = read_column_or_scan(
-        rows,
-        requested_column=column,
-        header_keywords=GID_HEADER_KEYWORDS,
-        predicate=lambda value: bool(extract_gid_from_text(value)),
+def load_douyin_toolkit_core(explicit_path: Optional[str] = None):
+    path = find_douyin_toolkit_core(explicit_path)
+    module_name = "_ai_cut_douyin_reference_core"
+    existing = sys.modules.get(module_name)
+    if existing is not None and Path(existing.__file__).resolve() == path:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load douyin-video-toolkit core: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def wanbang_client_from_args(args, toolkit):
+    return toolkit.WanbangClient(
+        args.wanbang_key or os.getenv("WANBANG_API_KEY", ""),
+        args.wanbang_secret or os.getenv("WANBANG_API_SECRET", ""),
+        args.wanbang_base_url or os.getenv("WANBANG_DOUYIN_BASE_URL", ""),
+        retry_count=args.wanbang_retry_count,
+        retry_delay_seconds=args.wanbang_retry_delay_seconds,
     )
-    gids = [extract_gid_from_text(value) or "" for value in raw_values]
-    return unique_preserve_order(gids)
 
 
-def read_keyword_values(path: Path, column: Optional[str]) -> list[str]:
-    rows = load_table_rows(path)
-    return read_column_or_scan(
-        rows,
-        requested_column=column,
-        header_keywords=KEYWORD_HEADER_KEYWORDS,
-        predicate=lambda value: bool(value.strip()),
-    )
-
-
-async def resolve_douyin_reference(value: str, timeout_sec: float = 12.0) -> VideoReference:
-    value = (value or "").strip()
-    if not value:
-        return VideoReference(source_url=value, error_message="empty input")
-
-    direct_gid = extract_gid_from_text(value)
-    if direct_gid:
-        return VideoReference(source_url=value, gid=direct_gid, video_url=build_douyin_video_url(direct_gid))
-
-    parsed = urlparse(value)
-    if parsed.netloc.endswith("v.douyin.com"):
-        httpx = require_import("httpx", "python -m pip install httpx")
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
-        try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_sec, headers=headers) as client:
-                response = await client.get(value)
-            final_url = str(response.url)
-            gid = extract_gid_from_text(final_url) or extract_gid_from_text(response.text)
-            if gid:
-                return VideoReference(source_url=value, gid=gid, video_url=build_douyin_video_url(gid))
-            return VideoReference(source_url=value, error_message=f"short url resolved but no gid found: {final_url}")
-        except Exception as exc:
-            return VideoReference(source_url=value, error_message=f"failed to resolve short url: {exc}")
-
-    return VideoReference(source_url=value, error_message="no douyin gid found")
-
-
-async def gather_limited(coros: Iterable, limit: int = 8) -> list:
-    semaphore = asyncio.Semaphore(max(1, limit))
-
-    async def run_one(coro):
-        async with semaphore:
-            return await coro
-
-    return await asyncio.gather(*(run_one(coro) for coro in coros))
-
-
-class WanbangDouyinClient:
-    def __init__(
-        self,
-        *,
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
-        base_url: Optional[str] = None,
-        retry_count: int = 2,
-        retry_delay_seconds: float = 1.0,
-    ) -> None:
-        self.api_key = api_key or os.getenv("WANBANG_API_KEY", "")
-        self.api_secret = api_secret or os.getenv("WANBANG_API_SECRET", "")
-        self.base_url = (base_url or os.getenv("WANBANG_DOUYIN_BASE_URL", "")).rstrip("/")
-        self.retry_count = max(retry_count, 0)
-        self.retry_delay_seconds = max(retry_delay_seconds, 0)
-
-    def require_configured(self) -> None:
-        if not self.api_key or not self.api_secret or not self.base_url:
-            raise RuntimeError(
-                "Wanbang API is not configured. Provide --wanbang-key, --wanbang-secret, "
-                "--wanbang-base-url or set WANBANG_API_KEY, WANBANG_API_SECRET, WANBANG_DOUYIN_BASE_URL."
-            )
-
-    async def search_videos(self, keyword: str, *, max_videos: int = 12, page: int = 1) -> list[VideoReference]:
-        self.require_configured()
-        httpx = require_import("httpx", "python -m pip install httpx")
-        async with httpx.AsyncClient(follow_redirects=True, timeout=90) as client:
-            payload = await self._fetch_search_payload(client, keyword=keyword, page=page)
-        return self._extract_search_references(payload, max_videos=max_videos)
-
-    async def _fetch_search_payload(self, client, *, keyword: str, page: int) -> dict:
-        last_error: Optional[Exception] = None
-        for attempt in range(self.retry_count + 1):
-            try:
-                response = await client.get(
-                    f"{self.base_url}/item_search_video/",
-                    params={
-                        "key": self.api_key,
-                        "secret": self.api_secret,
-                        "q": keyword,
-                        "page": page,
-                        "cache": "no",
-                        "result_type": "json",
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                error_code = str(payload.get("error_code") or "")
-                if error_code == "5000" and attempt < self.retry_count:
-                    reason = payload.get("reason") or payload.get("error") or "unknown error"
-                    last_error = RuntimeError(f"Wanbang item_search_video failed: {error_code} {reason}")
-                    await asyncio.sleep(self.retry_delay_seconds)
-                    continue
-                if error_code and error_code != "0000":
-                    reason = payload.get("reason") or payload.get("error") or "unknown error"
-                    raise RuntimeError(f"Wanbang item_search_video failed: {error_code} {reason}")
-                return payload
-            except Exception as exc:
-                last_error = exc
-                if attempt >= self.retry_count:
-                    break
-                await asyncio.sleep(self.retry_delay_seconds)
-        if last_error:
-            raise last_error
-        raise RuntimeError("Wanbang item_search_video failed: unknown error")
-
-    @staticmethod
-    def _extract_search_references(payload: dict, *, max_videos: int) -> list[VideoReference]:
-        items = payload.get("items") or {}
-        raw_results = items.get("item") if isinstance(items, dict) else None
-        if raw_results is None:
-            raw_results = payload.get("item") or []
-        if isinstance(raw_results, dict):
-            raw_results = [raw_results]
-
-        references: list[VideoReference] = []
-        for result in raw_results:
-            if not isinstance(result, dict):
-                continue
-            gid = str(result.get("num_iid") or result.get("item_id") or "").strip()
-            if not gid:
-                continue
-            video_url = build_douyin_video_url(gid)
-            references.append(
-                VideoReference(
-                    source_url=str(result.get("detail_url") or video_url),
-                    gid=gid,
-                    video_url=video_url,
-                )
-            )
-            if len(references) >= max(max_videos, 0):
-                break
-        return references
-
-    async def download_video(self, gid: str, output_dir: Path) -> tuple[str, int]:
-        self.require_configured()
-        httpx = require_import("httpx", "python -m pip install httpx")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        target_path = output_dir / f"{gid}.mp4"
-        async with httpx.AsyncClient(follow_redirects=True, timeout=90) as client:
-            detail = await self._fetch_video_detail(client, gid)
-            video_url = self._extract_video_download_url(detail)
-            size = await self._download_video_file(client, video_url, target_path)
-        return str(target_path), size
-
-    async def _fetch_video_detail(self, client, gid: str) -> dict:
-        response = await client.get(
-            f"{self.base_url}/item_get_video/",
-            params={
-                "key": self.api_key,
-                "secret": self.api_secret,
-                "item_id": gid,
-                "cache": "no",
-                "result_type": "json",
-            },
+def convert_toolkit_references(references) -> list[VideoReference]:
+    return [
+        VideoReference(
+            source_url=reference.source_url,
+            gid=reference.gid or None,
+            video_url=reference.video_url or None,
+            error_message=reference.error or None,
+            keyword=reference.keyword or None,
         )
-        response.raise_for_status()
-        payload = response.json()
-        error_code = str(payload.get("error_code") or "")
-        if error_code and error_code != "0000":
-            reason = payload.get("reason") or payload.get("error") or "unknown error"
-            raise RuntimeError(f"Wanbang item_get_video failed: {error_code} {reason}")
-        return payload
-
-    @staticmethod
-    def _extract_video_download_url(payload: dict) -> str:
-        item = payload.get("item") or payload
-        video = item.get("video") or {}
-        video_url = video.get("url") or video.get("video_url")
-        if not video_url:
-            raise RuntimeError("Wanbang item_get_video response missing item.video.url")
-        return str(video_url)
-
-    @staticmethod
-    async def _download_video_file(client, video_url: str, target_path: Path) -> int:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-            ),
-            "Referer": "https://www.douyin.com/",
-            "Accept": "*/*",
-        }
-        async with client.stream("GET", video_url, headers=headers, follow_redirects=True) as response:
-            response.raise_for_status()
-            size = 0
-            with target_path.open("wb") as file:
-                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    file.write(chunk)
-                    size += len(chunk)
-        if size <= 0:
-            raise RuntimeError("Downloaded video file is empty")
-        return size
+        for reference in references
+    ]
 
 
 class MogongCreativeAssistantClient:
@@ -882,7 +678,7 @@ def build_result_items(references: list[VideoReference], checks: list[MogongChec
         items.append(
             ResultItem(
                 gid=reference.gid,
-                video_url=build_douyin_video_url(reference.gid),
+                video_url=reference.video_url,
                 source_url=reference.source_url,
                 query_status=query_status,
                 query_error=query_error,
@@ -901,7 +697,7 @@ def build_unchecked_items(references: list[VideoReference]) -> list[ResultItem]:
         items.append(
             ResultItem(
                 gid=reference.gid,
-                video_url=build_douyin_video_url(reference.gid),
+                video_url=reference.video_url,
                 source_url=reference.source_url,
                 query_status="unchecked",
                 query_error="墨攻查询已跳过",
@@ -1027,44 +823,29 @@ def write_json_dataclasses(items: Iterable[object], output_path: Path) -> Path:
 
 async def build_references(args) -> tuple[list[VideoReference], int]:
     input_path = Path(args.input)
-    if args.mode == "keyword":
-        keywords = read_keyword_values(input_path, args.keyword_column)
-        if not keywords:
-            raise RuntimeError("No keywords found in input")
-        client = WanbangDouyinClient(
-            api_key=args.wanbang_key,
-            api_secret=args.wanbang_secret,
-            base_url=args.wanbang_base_url,
-        )
-        search_groups = await gather_limited(
-            (client.search_videos(keyword, max_videos=args.max_videos_per_keyword) for keyword in keywords),
-            limit=args.concurrency,
-        )
-        references = [reference for group in search_groups for reference in group]
-        return dedupe_references(references), len(keywords)
-
-    if args.mode == "gid":
-        gids = read_gid_values(input_path, args.gid_column)
-        references = [VideoReference(source_url=gid, gid=gid, video_url=build_douyin_video_url(gid)) for gid in gids]
-        return dedupe_references(references), len(gids)
-
-    values = read_url_values(input_path, args.url_column)
+    column_by_mode = {
+        "url": (args.url_column, URL_HEADER_KEYWORDS),
+        "gid": (args.gid_column, GID_HEADER_KEYWORDS),
+        "keyword": (args.keyword_column, KEYWORD_HEADER_KEYWORDS),
+    }
+    requested_column, header_keywords = column_by_mode[args.mode]
+    values = read_input_values(input_path, requested_column, header_keywords)
     if not values:
-        raise RuntimeError("No Douyin URLs or GIDs found in input")
-    references = await gather_limited((resolve_douyin_reference(value) for value in values), limit=args.concurrency)
-    return dedupe_references(references), len(values)
+        raise RuntimeError(f"No {args.mode} values found in input")
 
-
-def dedupe_references(references: list[VideoReference]) -> list[VideoReference]:
-    seen: set[str] = set()
-    result: list[VideoReference] = []
-    for reference in references:
-        key = reference.gid or reference.source_url
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(reference)
-    return result
+    toolkit = load_douyin_toolkit_core(args.douyin_toolkit_core)
+    client = wanbang_client_from_args(args, toolkit) if args.mode == "keyword" else None
+    resolve_kwargs = {
+        "urls": values if args.mode == "url" else (),
+        "gids": values if args.mode == "gid" else (),
+        "keywords": values if args.mode == "keyword" else (),
+        "client": client,
+        "page": args.wanbang_page,
+        "max_per_keyword": args.max_videos_per_keyword,
+        "short_url_timeout": args.short_url_timeout,
+    }
+    toolkit_references = await asyncio.to_thread(toolkit.resolve_references, **resolve_kwargs)
+    return convert_toolkit_references(toolkit_references), len(values)
 
 
 async def maybe_query_mogong(args, references: list[VideoReference]) -> list[ResultItem]:
@@ -1101,21 +882,24 @@ async def maybe_download(args, items: list[ResultItem]) -> None:
     if not args.download:
         return
     output_dir = Path(args.output_dir)
-    client = WanbangDouyinClient(
-        api_key=args.wanbang_key,
-        api_secret=args.wanbang_secret,
-        base_url=args.wanbang_base_url,
-    )
+    toolkit = load_douyin_toolkit_core(args.douyin_toolkit_core)
+    client = wanbang_client_from_args(args, toolkit)
     video_dir = Path(args.output_dir) / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
     targets = [item for item in items if item.query_status == "matched"]
     if args.download_scope == "all":
         targets = [item for item in items if item.query_status in {"matched", "unchecked"}]
     for index, item in enumerate(targets, start=1):
         item.download_status = "downloading"
         try:
-            path, _size = await client.download_video(item.gid, video_dir)
-            item.download_status = "downloaded"
-            item.download_path = path
+            target_path = video_dir / f"{item.gid}.mp4"
+            if args.skip_existing_downloads and toolkit.validate_mp4_file(target_path):
+                item.download_status = "reused"
+            else:
+                direct_url = await asyncio.to_thread(client.video_download_url, item.gid)
+                await asyncio.to_thread(toolkit.download_file, direct_url, target_path)
+                item.download_status = "downloaded"
+            item.download_path = str(target_path)
             item.download_error = None
         except Exception as exc:
             item.download_status = "failed"
@@ -1224,7 +1008,7 @@ def template_command(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Standalone Douyin GID extraction, Mogong GID querying, Excel export, and optional Wanbang download."
+        description="Mogong GID querying, business filtering, and export using douyin-video-toolkit references."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1233,7 +1017,7 @@ def build_parser() -> argparse.ArgumentParser:
     template.add_argument("--output", required=True)
     template.set_defaults(func=template_command)
 
-    run = subparsers.add_parser("run", help="Run GID parsing, Mogong filtering, and optional download")
+    run = subparsers.add_parser("run", help="Use Douyin Toolkit references, run Mogong filtering, and export results")
     run.add_argument("--input", required=True, help="Input .xlsx, .xlsm, or .csv file")
     run.add_argument("--output-dir", required=True, help="Directory for all_results.xlsx, matched_urls.xlsx, and debug logs")
     run.add_argument("--mode", choices=("url", "gid", "keyword"), default="url")
@@ -1241,7 +1025,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--gid-column", default=None, help="GID column header or 1-based column number")
     run.add_argument("--keyword-column", default=None, help="Keyword column header or 1-based column number")
     run.add_argument("--max-videos-per-keyword", type=int, default=12)
-    run.add_argument("--concurrency", type=int, default=8)
+    run.add_argument("--concurrency", type=int, default=8, help=argparse.SUPPRESS)
+    run.add_argument("--douyin-toolkit-core", default=None, help="Explicit path to douyin_reference_core.py")
+    run.add_argument("--short-url-timeout", type=int, default=20)
     run.add_argument("--skip-mogong", action="store_true", help="Parse/search only; mark rows as unchecked")
     run.add_argument("--mogong-account", default=None)
     run.add_argument("--mogong-password", default=None)
@@ -1253,8 +1039,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--wanbang-key", default=None)
     run.add_argument("--wanbang-secret", default=None)
     run.add_argument("--wanbang-base-url", default=None)
-    run.add_argument("--download", action="store_true", help="Download videos through Wanbang item_get_video")
+    run.add_argument("--wanbang-page", type=int, default=1)
+    run.add_argument("--wanbang-retry-count", type=int, default=2)
+    run.add_argument("--wanbang-retry-delay-seconds", type=float, default=1.0)
+    run.add_argument("--download", action="store_true", help="Delegate matched-video downloads to douyin-video-toolkit")
     run.add_argument("--download-scope", choices=("matched", "all"), default="matched")
+    run.add_argument("--skip-existing-downloads", action="store_true")
     run.set_defaults(func=lambda args: asyncio.run(run_command(args)))
     return parser
 

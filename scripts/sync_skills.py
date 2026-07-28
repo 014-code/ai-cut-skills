@@ -136,6 +136,8 @@ def choose_skills(
     catalog: dict[str, Any],
     requested_skills: Iterable[str],
     requested_categories: Iterable[str],
+    *,
+    include_dependencies: bool = True,
 ) -> list[str]:
     skills = catalog["skills"]
     categories = catalog["categories"]
@@ -149,16 +151,36 @@ def choose_skills(
     if unknown_categories:
         raise CatalogError(f"unknown categories: {', '.join(unknown_categories)}")
 
-    selected = []
+    initially_selected = []
     for skill_name, metadata in skills.items():
         if skill_filter and skill_name not in skill_filter:
             continue
         if category_filter and metadata["category"] not in category_filter:
             continue
-        selected.append(skill_name)
-    if not selected:
+        initially_selected.append(skill_name)
+    if not initially_selected:
         raise CatalogError("filters selected no skills")
-    return selected
+
+    selected = set(initially_selected)
+    if include_dependencies:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def add_dependencies(skill_name: str) -> None:
+            if skill_name in visited:
+                return
+            if skill_name in visiting:
+                raise CatalogError(f"cyclic required dependency involving: {skill_name}")
+            visiting.add(skill_name)
+            for dependency in skills[skill_name]["requires"]:
+                selected.add(dependency)
+                add_dependencies(dependency)
+            visiting.remove(skill_name)
+            visited.add(skill_name)
+
+        for skill_name in initially_selected:
+            add_dependencies(skill_name)
+    return [skill_name for skill_name in skills if skill_name in selected]
 
 
 def default_runtime_skills_dir(environment_name: str, fallback_directory: str) -> Path:
@@ -329,6 +351,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skill", action="append", default=[], help="Skill name; repeatable.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-delete", action="store_true")
+    parser.add_argument("--no-dependencies", action="store_true", help="Do not include required Skill dependencies.")
     parser.add_argument("--check", action="store_true", help="Validate the catalog and exit.")
     parser.add_argument("--list", action="store_true", help="List categories and skills, then exit.")
     return parser.parse_args()
@@ -360,7 +383,12 @@ def main() -> int:
         print_catalog(catalog)
         return 0
 
-    selected = choose_skills(catalog, args.skill, args.category)
+    selected = choose_skills(
+        catalog,
+        args.skill,
+        args.category,
+        include_dependencies=not args.no_dependencies,
+    )
     excluded_names, excluded_suffixes = exclusion_rules(catalog)
     codex_skills_dir = (
         args.codex_skills_dir.expanduser().resolve()
