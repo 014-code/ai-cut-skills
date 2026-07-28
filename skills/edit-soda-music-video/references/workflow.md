@@ -2,6 +2,8 @@
 
 ## 1. 开剪前确认
 
+先使用 `setup-video-editing-environment` 生成任务工作区 `video_environment.json`。提供台词时必须使用 `soda-scripted-render` profile；时间轴渲染使用 `soda-timeline-render`。报告 `ok` 不为 true、当前 Python 与报告不一致，或正式能力缺失时立即标记 `blocked`，不得新建临时 FFmpeg 脚本绕过。
+
 解析以下字段并写入计划或报告：
 
 - 主视频路径、渠道类型及其选择来源；实际时长由处理后的数字人口播决定；
@@ -15,7 +17,7 @@
 
 ## 2. 同步并预检素材
 
-使用 `manage-visual-asset-library` 同步素材目录、Read 查看图片与视频代表帧、写入 description/effective_region，并运行通用 validator。只有 `visual_assets_manifest.json` 的通用校验 `ok=true` 才能继续；特殊素材也必须先进入同一个 Manifest。汽水 `scripts/soda_pipeline.py sync-assets` 只保留为薄转发入口，不维护扫描或理解实现。生成视频前再次确认时间轴没有引用未入库视觉素材；任何一项不满足都返回通用 Skill 修复，禁止进入 render。
+使用 `manage-visual-asset-library` 同步素材目录，生成 `understanding_queue.json`，只 Read 队列中待处理图片与视频代表帧、写入 description/effective_region，并运行通用 validator。每批完成后重跑队列，直到 `summary.pending=0` 且 Manifest 校验 `ok=true`；特殊素材也必须先进入同一个 Manifest。汽水 `scripts/soda_pipeline.py sync-assets` 只保留为薄转发入口，不维护扫描或理解实现。Soda preflight 直接调用通用 validator，再检查时间轴引用；任何一项不满足都返回通用 Skill 修复，禁止进入 render。
 
 使用 `scripts/soda_pipeline.py preflight` 检查 FFmpeg、FFprobe、BGM、时间轴 JSON、字体、logo、尾帧、通用物料和字幕安全布局。预检报告必须列出每条字幕的显式换行结果、行数、每行估算宽度与可用宽度；任一行越界或超过三行都必须在渲染前失败。原始视频和原始物料保持不变，在副本路径输出中间文件。
 
@@ -35,7 +37,7 @@ Skill 不提供固定物料映射或样片时间码。使用 Whisper 时，必�
 
 先运行 `preflight --asset-manifest ...`。预检会阻止以下情况：Manifest 缺失、Manifest 与当前 `asset_root` 不一致、任意图片/视频 description/effective_region 为空或无效、时间轴视觉素材未被 Manifest 跟踪、普通素材没有明确绑定利益点，以及未知 `special_match_rule`。预检不使用 SHA-256 判断特殊素材；执行模型必须在生成前 Read 并确认画面符合对应规则。门禁失败时回到素材理解、利益点标注或特殊匹配步骤，不能用参数绕过。
 
-渲染使用 Skill 内置 `scripts/standalone_renderer.py`。它通过 Python 标准库和 FFmpeg/FFprobe 独立完成 ASS 字幕、媒体信息读取、调用方素材叠加、封面提取、BGM 混音和 JSON 报告，默认输出 1080×1920、30fps、H.264/AAC。BGM 先归一化到默认 `-28 LUFS`，再使用默认 `1.0` 的后置微调倍率；禁止把旧的 `0.22` 原始衰减值继续用于新流程。
+渲染只能使用 `scripts/soda_pipeline.py render` 进入 Skill 内置 `scripts/standalone_renderer.py`。禁止新建 `build_mix.py`、自写 renderer 或直接用 FFmpeg 生成可被称为正式成片的文件。内置 renderer 通过 Python 标准库和 FFmpeg/FFprobe 完成 ASS 字幕、媒体信息读取、调用方素材叠加、封面提取、BGM 混音和 JSON 报告，默认输出 1080×1920、30fps、H.264/AAC。BGM 先归一化到默认 `-28 LUFS`，再使用默认 `1.0` 的后置微调倍率；禁止把旧的 `0.22` 原始衰减值继续用于新流程。
 
 时间线 `motion_effects.mode` 默认为 `auto`。已安装的 `video-motion-effects` 可用时，为合格图片随机选择 Remotion 入场效果，生成短透明 ProRes 4444 片段；FFmpeg 延长稳定帧，在素材上方绘制字幕与 CTA，再叠加 logo，最后绘制警示语。随机选择必须记录种子，具体配置见 [motion-effects.md](motion-effects.md)。
 
@@ -55,7 +57,9 @@ Skill 不提供固定物料映射或样片时间码。使用 Whisper 时，必�
 
 ## 5. 验收
 
-使用 `qa` 检查分辨率、帧率、编码、时长、完整解码和响度；确认修复报告记录了任务级动态字数上限、模型语义分段、`automatic_width_split_count=0`，再结合预检/渲染报告复核每条字幕的显式换行、行数和宽度，并抽取最长字幕帧确认左右没有越界。继续人工检查普通素材只出现在利益点、特殊利益点使用了符合画面要求的完整素材、“满三毛提现”没有误用局部截图或余额卡片、素材和动效的有效内容没有进入 logo/警示语保护区、空白画布没有导致无意义缩放、字幕位于素材上方、图标跟随最终字幕行数定位、logo 位于素材/字幕/CTA 上方、警示语处于最终最高层，字幕黑色细描边为 `2–3px`、阴影为 `0`、无背景黑条或承托层，以及黑屏/冻帧、logo 重叠、禁投歌曲、第三方标识和手机扬声器听感。
+使用 `qa` 检查分辨率、帧率、编码、时长、完整解码和响度；该报告只代表 `technical_media_only`。确认修复报告记录了任务级动态字数上限、模型语义分段、`automatic_width_split_count=0`，再结合预检/渲染报告复核每条字幕的显式换行、行数和宽度，并抽取最长字幕帧确认左右没有越界。继续人工检查普通素材只出现在利益点、特殊利益点使用了符合画面要求的完整素材、“满三毛提现”没有误用局部截图或余额卡片、素材和动效的有效内容没有进入 logo/警示语保护区、空白画布没有导致无意义缩放、字幕位于素材上方、图标跟随最终字幕行数定位、logo 位于素材/字幕/CTA 上方、警示语处于最终最高层，字幕黑色细描边为 `2–3px`、阴影为 `0`、无背景黑条或承托层，以及黑屏/冻帧、logo 重叠、禁投歌曲、第三方标识和手机扬声器听感。
+
+最终还必须读取 render 生成的 delivery report：`pipeline_entry` 必须为 `soda_pipeline.py render`，`formal_delivery_ready` 必须为 true。环境、Manifest、字幕修复、合规、preflight、官方 renderer 或完整 QA 任一未通过时，成片即使可播放也只能是 blocked，不能交付为正式版本。
 
 QA 记录实际时长但不设置最低时长，也不区分正式成片与短 Demo；实际长度应与处理后的数字人口播和官方尾帧一致。
 

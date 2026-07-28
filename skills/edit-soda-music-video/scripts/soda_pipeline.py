@@ -46,6 +46,7 @@ from timeline_handoffs import (
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RENDERER = SKILL_ROOT / "scripts" / "standalone_renderer.py"
 VISUAL_ASSET_LIBRARY_SKILL_NAME = "manage-visual-asset-library"
+ENVIRONMENT_SKILL_NAME = "setup-video-editing-environment"
 
 CHANNELS = ("old-down", "new-high-mid", "free-listen", "coin-non-down", "general")
 GLOBAL_BANNED_TERMS = ("红包", "花不完", "必听", "必点", "躺平", "emo")
@@ -55,6 +56,7 @@ THIRD_PARTY_TERMS = ("抖音", "剪映")
 DEFAULT_BGM_TARGET_LUFS = -28.0
 DEFAULT_BGM_FINE_VOLUME = 1.0
 DEFAULT_ASSET_MANIFEST_NAME = "visual_assets_manifest.json"
+DEFAULT_ENVIRONMENT_REPORT_NAME = "video_environment.json"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".svg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
@@ -478,7 +480,7 @@ def resolve_asset_manifest_path(timeline_path: Path, value: Path | None) -> Path
     return timeline_path.expanduser().resolve().parent / DEFAULT_ASSET_MANIFEST_NAME
 
 
-def resolve_visual_asset_library_script() -> Path:
+def resolve_visual_asset_library_script(script_name: str = "asset_manifest.py") -> Path:
     candidates: list[Path] = []
     configured = os.environ.get("VISUAL_ASSET_LIBRARY_SKILL_DIR")
     if configured:
@@ -489,7 +491,7 @@ def resolve_visual_asset_library_script() -> Path:
 
     checked: list[str] = []
     for root in candidates:
-        script = root.resolve() / "scripts" / "asset_manifest.py"
+        script = root.resolve() / "scripts" / script_name
         if str(script) in checked:
             continue
         checked.append(str(script))
@@ -503,112 +505,148 @@ def resolve_visual_asset_library_script() -> Path:
     )
 
 
+def resolve_environment_report_path(timeline_path: Path, value: Path | None) -> Path:
+    if value is not None:
+        return value.expanduser().resolve()
+    return timeline_path.expanduser().resolve().parent / DEFAULT_ENVIRONMENT_REPORT_NAME
+
+
+def validate_environment_report(path: Path, *, require_whisper: bool) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    report: dict[str, Any] = {
+        "ok": False,
+        "status": "missing",
+        "report": str(resolved),
+        "required_profile": "soda-scripted-render" if require_whisper else "soda-timeline-render",
+        "errors": [],
+    }
+    if not resolved.is_file():
+        report["errors"].append(
+            "环境报告不存在；先使用 setup-video-editing-environment 生成 video_environment.json。"
+        )
+        return report
+    try:
+        source = json.loads(resolved.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        report["errors"].append(f"环境报告无法读取：{exc}")
+        return report
+    if not isinstance(source, dict):
+        report["errors"].append("环境报告顶层必须是 JSON 对象。")
+        return report
+    report["profile"] = source.get("profile")
+    report["environment_status"] = source.get("status")
+    report["checks"] = source.get("checks")
+    report["python_executable"] = (
+        source.get("current_environment", {}).get("python_executable")
+        if isinstance(source.get("current_environment"), dict)
+        else None
+    )
+    if not source.get("ok"):
+        report["errors"].append("环境报告 ok 不是 true。")
+    checks = source.get("checks")
+    if not isinstance(checks, dict):
+        report["errors"].append("环境报告缺少 checks。")
+        checks = {}
+    required_checks = ["ffmpeg", "ffprobe", "manage_visual_asset_library"]
+    if require_whisper:
+        required_checks.append("whisper")
+        if source.get("profile") != "soda-scripted-render":
+            report["errors"].append(
+                "带口播台词的正式渲染必须使用 soda-scripted-render 环境报告。"
+            )
+    for name in required_checks:
+        check = checks.get(name)
+        if not isinstance(check, dict) or not check.get("ok"):
+            report["errors"].append(f"环境能力未通过：{name}")
+    reported_python = str(report.get("python_executable") or "")
+    if reported_python:
+        active = os.path.normcase(os.path.abspath(sys.executable))
+        reported = os.path.normcase(os.path.abspath(reported_python))
+        if active != reported:
+            report["errors"].append(
+                f"当前 Python 与环境报告不一致：{sys.executable} != {reported_python}"
+            )
+    else:
+        report["errors"].append("环境报告缺少当前 Python 路径。")
+    report["status"] = "ready" if not report["errors"] else "blocked"
+    report["ok"] = not report["errors"]
+    return report
+
+
+def resolve_whisper_model_dir(model: str) -> Path | None:
+    if model != "tiny":
+        return None
+    candidates: list[Path] = []
+    configured = os.environ.get("WHISPER_MODEL_DIR")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(SKILL_ROOT.parent / ENVIRONMENT_SKILL_NAME / "assets" / "whisper")
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    candidates.append(codex_home / "skills" / ENVIRONMENT_SKILL_NAME / "assets" / "whisper")
+    workbuddy_home = Path(
+        os.environ.get("WORKBUDDY_HOME", Path.home() / ".workbuddy")
+    ).expanduser()
+    candidates.append(
+        workbuddy_home / "skills" / ENVIRONMENT_SKILL_NAME / "assets" / "whisper"
+    )
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if (resolved / "tiny.pt").is_file():
+            return resolved
+    return None
+
+
 def validate_asset_understanding(
     manifest_path: Path,
     asset_root: Path,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Gate rendering on a synced manifest whose visual assets have descriptions."""
-    report: dict[str, Any] = {
-        "manifest": str(manifest_path),
-        "asset_root": str(asset_root),
-        "ok": False,
-        "status": "missing",
-        "visual_asset_count": 0,
-        "missing_descriptions": [],
-        "missing_effective_regions": [],
-        "invalid_effective_regions": [],
-        "untracked_timeline_visual_assets": [],
-        "errors": [],
-    }
-    if not manifest_path.exists():
-        report["errors"].append(
-            "视觉素材 Manifest 不存在；先使用 manage-visual-asset-library 完成同步、Read 理解和校验。"
-        )
-        return report
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        report["errors"].append(f"素材 Manifest 无法读取：{exc}")
-        return report
-    if not isinstance(manifest, dict):
-        report["errors"].append("素材 Manifest 顶层必须是 JSON 对象。")
-        return report
-
-    manifest_root = Path(str(manifest.get("asset_root", ""))).expanduser().resolve()
-    if manifest_root != asset_root.expanduser().resolve():
-        report["errors"].append(
-            f"素材 Manifest 的 asset_root 与当前 --asset-root 不一致：{manifest_root} != {asset_root}。"
-        )
-    assets = manifest.get("assets", [])
-    if not isinstance(assets, list):
-        report["errors"].append("素材 Manifest 的 assets 必须是数组。")
-        return report
-
-    visual_assets = [
-        item
-        for item in assets
-        if isinstance(item, dict) and str(item.get("kind", "")).lower() in {"image", "video"}
-    ]
-    report["visual_asset_count"] = len(visual_assets)
-    missing_descriptions = sorted(
-        str(item.get("relative_path", ""))
-        for item in visual_assets
-        if not str(item.get("description", "")).strip()
+    """Run the generic validator, then add Soda timeline-reference checks."""
+    validator = resolve_visual_asset_library_script("validate_manifest.py")
+    result = run_command(
+        [
+            sys.executable,
+            str(validator),
+            "--manifest",
+            str(manifest_path),
+            "--asset-root",
+            str(asset_root),
+        ],
+        check=False,
     )
-    report["missing_descriptions"] = missing_descriptions
-    if missing_descriptions:
-        report["errors"].append(
-            "素材理解未完成，以下图片/视频缺少 description：" + ", ".join(missing_descriptions)
-        )
+    try:
+        report = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise PipelineError(
+            f"manage-visual-asset-library validator returned invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(report, dict):
+        raise PipelineError("manage-visual-asset-library validator returned a non-object")
+    report["validator"] = str(validator)
+    report.setdefault("errors", [])
+    report.setdefault("untracked_timeline_visual_assets", [])
 
-    missing_effective_regions: list[str] = []
-    invalid_effective_regions: list[str] = []
-    for item in visual_assets:
-        relative_path = str(item.get("relative_path", ""))
-        region = item.get("effective_region")
-        if not isinstance(region, dict):
-            missing_effective_regions.append(relative_path)
-            continue
+    assets: list[dict[str, Any]] = []
+    if manifest_path.is_file():
         try:
-            x = float(region["x"])
-            y = float(region["y"])
-            width = float(region["width"])
-            height = float(region["height"])
-        except (KeyError, TypeError, ValueError):
-            invalid_effective_regions.append(relative_path)
-            continue
-        media = item.get("media", {}) if isinstance(item.get("media"), dict) else {}
-        source_width = float(media.get("width") or 0)
-        source_height = float(media.get("height") or 0)
-        coordinate_space = str(region.get("coordinate_space", "source_pixels"))
-        invalid = (
-            coordinate_space != "source_pixels"
-            or x < 0
-            or y < 0
-            or width <= 0
-            or height <= 0
-            or (source_width > 0 and x + width > source_width + 1)
-            or (source_height > 0 and y + height > source_height + 1)
-        )
-        if invalid:
-            invalid_effective_regions.append(relative_path)
-    report["missing_effective_regions"] = sorted(missing_effective_regions)
-    report["invalid_effective_regions"] = sorted(invalid_effective_regions)
-    if missing_effective_regions:
-        report["errors"].append(
-            "素材有效区域理解未完成，以下图片/视频缺少 effective_region："
-            + ", ".join(sorted(missing_effective_regions))
-        )
-    if invalid_effective_regions:
-        report["errors"].append(
-            "以下素材的 effective_region 不是有效的 source_pixels 边界："
-            + ", ".join(sorted(invalid_effective_regions))
-        )
-
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_assets = manifest.get("assets", []) if isinstance(manifest, dict) else []
+            if isinstance(raw_assets, list):
+                assets = [
+                    item
+                    for item in raw_assets
+                    if isinstance(item, dict)
+                    and str(item.get("kind", "")).lower() in {"image", "video"}
+                ]
+        except (OSError, json.JSONDecodeError):
+            assets = []
     by_relative_path = {
         str(item.get("relative_path")): item
-        for item in visual_assets
+        for item in assets
         if item.get("relative_path")
     }
     timeline_visual_refs: list[tuple[str, Path]] = []
@@ -656,6 +694,19 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
         timeline_path,
         getattr(args, "asset_manifest", None),
     )
+    environment_path = resolve_environment_report_path(
+        timeline_path,
+        getattr(args, "environment_report", None),
+    )
+    require_whisper = bool(
+        getattr(args, "require_whisper", False)
+        or getattr(args, "script_file", None)
+        or getattr(args, "text", None)
+    )
+    environment = validate_environment_report(
+        environment_path,
+        require_whisper=require_whisper,
+    )
     renderer = DEFAULT_RENDERER.resolve()
     logo_variant = args.logo_variant
 
@@ -683,11 +734,14 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
     check("renderer", renderer)
     check("asset_root", asset_root)
     check("asset_manifest", manifest_path)
+    check("environment_report", environment_path)
     check("timeline_json", timeline_path)
     if input_path:
         check("input", input_path)
     if bgm:
         check("bgm", bgm)
+    if not environment["ok"]:
+        visual_errors.extend(str(item) for item in environment["errors"])
     if timeline_path.exists():
         config = load_timeline_config(timeline_path)
         try:
@@ -765,6 +819,8 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
         "ok": not missing and not missing_binaries and not visual_errors,
         "asset_root": str(asset_root),
         "asset_manifest": str(manifest_path),
+        "environment_report": str(environment_path),
+        "environment": environment,
         "asset_understanding": asset_understanding,
         "material_timeline": material_timeline,
         "caption_layout": caption_layout,
@@ -879,27 +935,31 @@ def whisper_word_timestamps(
             raise PipelineError(message)
         return [], "Whisper CLI not found; word-level pause candidates were skipped."
     with tempfile.TemporaryDirectory(prefix="soda_whisper_") as temp_dir:
+        command = [
+            executable,
+            str(source),
+            "--model",
+            model,
+            "--language",
+            language,
+            "--task",
+            "transcribe",
+            "--output_dir",
+            temp_dir,
+            "--output_format",
+            "json",
+            "--word_timestamps",
+            "True",
+            "--fp16",
+            "False",
+            "--verbose",
+            "False",
+        ]
+        model_dir = resolve_whisper_model_dir(model)
+        if model_dir is not None:
+            command.extend(["--model_dir", str(model_dir)])
         result = run_command(
-            [
-                executable,
-                str(source),
-                "--model",
-                model,
-                "--language",
-                language,
-                "--task",
-                "transcribe",
-                "--output_dir",
-                temp_dir,
-                "--output_format",
-                "json",
-                "--word_timestamps",
-                "True",
-                "--fp16",
-                "False",
-                "--verbose",
-                "False",
-            ],
+            command,
             check=False,
         )
         json_files = sorted(Path(temp_dir).glob("*.json"))
@@ -1660,6 +1720,136 @@ def cmd_validate_rules(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 2
 
 
+def persist_json(data: Any, output: Path) -> None:
+    resolved = output.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_json_object(path: Path) -> dict[str, Any] | None:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        return None
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def resolve_delivery_report_path(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "delivery_report", None)
+    if configured is not None:
+        return configured.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    return output.with_name(output.stem + "_delivery_report.json")
+
+
+def build_delivery_report(
+    args: argparse.Namespace,
+    *,
+    status: str,
+    subtitle_repair: dict[str, Any] | None,
+    compliance: dict[str, Any] | None,
+    preflight: dict[str, Any] | None,
+    renderer_report: dict[str, Any] | None,
+    qa: dict[str, Any] | None,
+    blocked_reason: str | None = None,
+) -> dict[str, Any]:
+    script_timing_required = bool(
+        getattr(args, "script_file", None) or getattr(args, "text", None)
+    )
+    environment = preflight.get("environment") if isinstance(preflight, dict) else None
+    asset_understanding = (
+        preflight.get("asset_understanding") if isinstance(preflight, dict) else None
+    )
+    official_renderer = bool(
+        isinstance(renderer_report, dict)
+        and str(renderer_report.get("renderer", "")).startswith("standalone-ffmpeg")
+    )
+    checks = {
+        "environment": bool(isinstance(environment, dict) and environment.get("ok")),
+        "asset_manifest": bool(
+            isinstance(asset_understanding, dict) and asset_understanding.get("ok")
+        ),
+        "subtitle_timing": bool(
+            not script_timing_required
+            or (
+                isinstance(subtitle_repair, dict)
+                and subtitle_repair.get("whisper_word_timestamps") is True
+                and subtitle_repair.get("timeline_time_mode") == "input"
+            )
+        ),
+        "compliance": bool(isinstance(compliance, dict) and compliance.get("ok")),
+        "preflight": bool(isinstance(preflight, dict) and preflight.get("ok")),
+        "official_renderer": official_renderer,
+        "technical_qa": bool(
+            isinstance(qa, dict) and qa.get("ok") and not getattr(args, "quick_qa", False)
+        ),
+    }
+    formal_ready = status == "ready" and all(checks.values())
+    output_path = args.output.expanduser().resolve()
+    renderer_report_path = output_path.with_suffix(".json")
+    return {
+        "schema_version": 1,
+        "pipeline_entry": "soda_pipeline.py render",
+        "status": "ready"
+        if formal_ready
+        else ("dry-run" if status == "dry-run" else "blocked"),
+        "formal_delivery_ready": formal_ready,
+        "blocked_reason": blocked_reason,
+        "checks": checks,
+        "artifacts": {
+            "input": str(args.input.expanduser().resolve()),
+            "output": str(output_path),
+            "timeline": str(args.timeline_json.expanduser().resolve()),
+            "asset_manifest": str(args.asset_manifest.expanduser().resolve()),
+            "environment_report": str(
+                resolve_environment_report_path(
+                    args.timeline_json,
+                    getattr(args, "environment_report", None),
+                )
+            ),
+            "compliance_report": str(args.compliance_report.expanduser().resolve())
+            if args.compliance_report
+            else None,
+            "preflight_report": str(args.preflight_report.expanduser().resolve())
+            if args.preflight_report
+            else None,
+            "renderer_report": str(renderer_report_path),
+            "qa_report": str(args.qa_report.expanduser().resolve())
+            if args.qa_report
+            else None,
+        },
+        "stages": {
+            "environment": environment,
+            "asset_manifest": asset_understanding,
+            "subtitle_repair": subtitle_repair
+            if script_timing_required
+            else {"required": False, "ok": True},
+            "compliance": compliance,
+            "preflight": preflight,
+            "renderer": {
+                "ok": official_renderer,
+                "entry": str(DEFAULT_RENDERER.resolve()),
+                "report": str(renderer_report_path),
+                "reported_renderer": renderer_report.get("renderer")
+                if isinstance(renderer_report, dict)
+                else None,
+            },
+            "qa": qa,
+        },
+        "delivery_policy": {
+            "only_soda_pipeline_render_may_claim_formal_delivery": True,
+            "standalone_qa_is_technical_media_only": True,
+            "custom_ffmpeg_or_custom_renderer_is_not_formal_delivery": True,
+        },
+    }
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     # Resolve the manifest before prepare_repaired_timeline changes the timeline path
     # to an output-directory copy.
@@ -1667,9 +1857,44 @@ def cmd_render(args: argparse.Namespace) -> int:
         args.timeline_json,
         getattr(args, "asset_manifest", None),
     )
-    subtitle_repair = prepare_repaired_timeline(args)
-    if subtitle_repair:
-        print(json.dumps({"subtitle_repair": subtitle_repair}, ensure_ascii=False, indent=2))
+    args.environment_report = resolve_environment_report_path(
+        args.timeline_json,
+        getattr(args, "environment_report", None),
+    )
+    output_for_reports = args.output.expanduser().resolve()
+    if args.compliance_report is None:
+        args.compliance_report = output_for_reports.with_name(
+            output_for_reports.stem + "_compliance.json"
+        )
+    if args.preflight_report is None:
+        args.preflight_report = output_for_reports.with_name(
+            output_for_reports.stem + "_preflight.json"
+        )
+    if args.qa_report is None:
+        args.qa_report = output_for_reports.with_name(output_for_reports.stem + "_qa.json")
+    delivery_path = resolve_delivery_report_path(args)
+    subtitle_repair: dict[str, Any] | None = None
+    compliance: dict[str, Any] | None = None
+    preflight: dict[str, Any] | None = None
+    renderer_report: dict[str, Any] | None = None
+    qa: dict[str, Any] | None = None
+    try:
+        subtitle_repair = prepare_repaired_timeline(args)
+        if subtitle_repair:
+            print(json.dumps({"subtitle_repair": subtitle_repair}, ensure_ascii=False, indent=2))
+    except (PipelineError, OSError, ValueError, json.JSONDecodeError) as exc:
+        delivery = build_delivery_report(
+            args,
+            status="blocked",
+            subtitle_repair=None,
+            compliance=None,
+            preflight=None,
+            renderer_report=None,
+            qa=None,
+            blocked_reason=f"subtitle_repair: {exc}",
+        )
+        persist_json(delivery, delivery_path)
+        raise
     args.speed = validate_speed(args.speed)
     args.bgm_target_lufs, args.bgm_volume = validate_bgm_settings(
         args.bgm_target_lufs, args.bgm_volume
@@ -1681,6 +1906,19 @@ def cmd_render(args: argparse.Namespace) -> int:
     compliance = validate_rules(args)
     if not compliance["ok"]:
         write_json(compliance, args.compliance_report)
+        persist_json(
+            build_delivery_report(
+                args,
+                status="blocked",
+                subtitle_repair=subtitle_repair,
+                compliance=compliance,
+                preflight=None,
+                renderer_report=None,
+                qa=None,
+                blocked_reason="compliance_failed",
+            ),
+            delivery_path,
+        )
         return 2
     if args.compliance_report:
         args.compliance_report.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
@@ -1691,6 +1929,19 @@ def cmd_render(args: argparse.Namespace) -> int:
     preflight = preflight_report(args)
     if not preflight["ok"]:
         write_json(preflight, args.preflight_report)
+        persist_json(
+            build_delivery_report(
+                args,
+                status="blocked",
+                subtitle_repair=subtitle_repair,
+                compliance=compliance,
+                preflight=preflight,
+                renderer_report=None,
+                qa=None,
+                blocked_reason="preflight_failed",
+            ),
+            delivery_path,
+        )
         return 2
     if args.preflight_report:
         args.preflight_report.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
@@ -1738,10 +1989,37 @@ def cmd_render(args: argparse.Namespace) -> int:
     print(json.dumps({"render_command": command}, ensure_ascii=False, indent=2))
     result = run_command(command, capture=False, check=False)
     if result.returncode != 0:
+        persist_json(
+            build_delivery_report(
+                args,
+                status="blocked",
+                subtitle_repair=subtitle_repair,
+                compliance=compliance,
+                preflight=preflight,
+                renderer_report=None,
+                qa=None,
+                blocked_reason=f"renderer_failed:{result.returncode}",
+            ),
+            delivery_path,
+        )
         return result.returncode
     if args.dry_run:
+        persist_json(
+            build_delivery_report(
+                args,
+                status="dry-run",
+                subtitle_repair=subtitle_repair,
+                compliance=compliance,
+                preflight=preflight,
+                renderer_report=None,
+                qa=None,
+                blocked_reason="dry_run_has_no_formal_output",
+            ),
+            delivery_path,
+        )
         return 0
 
+    renderer_report = load_json_object(output_path.with_suffix(".json"))
     qa_args = argparse.Namespace(
         input=output_path,
         output_json=args.qa_report,
@@ -1750,7 +2028,28 @@ def cmd_render(args: argparse.Namespace) -> int:
         expected_fps=30.0,
         quick=args.quick_qa,
     )
-    return cmd_qa(qa_args)
+    qa = technical_qa_report(qa_args)
+    write_json(qa, args.qa_report)
+    final_status = "ready" if qa["ok"] and not args.quick_qa else "blocked"
+    blocked_reason = None
+    if renderer_report is None:
+        blocked_reason = "official_renderer_report_missing_or_invalid"
+    elif args.quick_qa:
+        blocked_reason = "quick_qa_is_not_formal_delivery"
+    elif not qa["ok"]:
+        blocked_reason = "technical_qa_failed"
+    delivery = build_delivery_report(
+        args,
+        status=final_status,
+        subtitle_repair=subtitle_repair,
+        compliance=compliance,
+        preflight=preflight,
+        renderer_report=renderer_report,
+        qa=qa,
+        blocked_reason=blocked_reason,
+    )
+    persist_json(delivery, delivery_path)
+    return 0 if delivery["formal_delivery_ready"] else 2
 
 
 def measure_loudness(path: Path) -> dict[str, float | None]:
@@ -1778,7 +2077,7 @@ def measure_loudness(path: Path) -> dict[str, float | None]:
     }
 
 
-def cmd_qa(args: argparse.Namespace) -> int:
+def technical_qa_report(args: argparse.Namespace) -> dict[str, Any]:
     require_binary("ffmpeg")
     source = args.input.expanduser().resolve()
     summary = media_summary(source)
@@ -1822,6 +2121,12 @@ def cmd_qa(args: argparse.Namespace) -> int:
 
     report = {
         "ok": not errors,
+        "scope": "technical_media_only",
+        "formal_delivery_ready": False,
+        "formal_delivery_note": (
+            "This report only checks media structure, decoding, and loudness. "
+            "Only soda_pipeline.py render may issue formal_delivery_ready=true."
+        ),
         "file": str(source),
         "summary": summary,
         "decode_ok": decode_ok,
@@ -1835,6 +2140,11 @@ def cmd_qa(args: argparse.Namespace) -> int:
             "使用耳机和手机扬声器复听，确认 BGM 不过小且不盖住人声。",
         ],
     }
+    return report
+
+
+def cmd_qa(args: argparse.Namespace) -> int:
+    report = technical_qa_report(args)
     write_json(report, args.output_json)
     return 0 if report["ok"] else 2
 
@@ -1895,6 +2205,16 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--bgm", type=Path, required=True)
     preflight.add_argument("--input", type=Path)
     preflight.add_argument("--timeline-json", type=Path, required=True)
+    preflight.add_argument(
+        "--environment-report",
+        type=Path,
+        help="setup-video-editing-environment report; defaults to video_environment.json beside the timeline",
+    )
+    preflight.add_argument(
+        "--require-whisper",
+        action="store_true",
+        help="Require a soda-scripted-render environment report",
+    )
     preflight.add_argument("--logo-variant", choices=("white", "black"), default="white")
     preflight.add_argument("--motion-effects", choices=("auto", "off", "required"))
     preflight.add_argument("--motion-seed")
@@ -1951,7 +2271,10 @@ def build_parser() -> argparse.ArgumentParser:
     rules.add_argument("--output-json", type=Path)
     rules.set_defaults(func=cmd_validate_rules)
 
-    render = sub.add_parser("render", help="Validate and call the bundled standalone FFmpeg renderer")
+    render = sub.add_parser(
+        "render",
+        help="Run the only formal Soda delivery path and call the bundled standalone renderer",
+    )
     add_common_rule_arguments(render)
     render.add_argument("--asset-root", type=Path, required=True)
     render.add_argument(
@@ -1960,6 +2283,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Synced visual_assets_manifest.json; legacy soda_assets_manifest.json remains accepted when passed explicitly",
     )
     render.add_argument("--timeline-json", type=Path, required=True)
+    render.add_argument(
+        "--environment-report",
+        type=Path,
+        help="setup-video-editing-environment report; defaults to video_environment.json beside the original timeline",
+    )
     render.add_argument("--logo-variant", choices=("white", "black"), default="white")
     render.add_argument("--input", type=Path, required=True)
     render.add_argument("--bgm", type=Path, required=True)
@@ -1985,6 +2313,11 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--compliance-report", type=Path)
     render.add_argument("--preflight-report", type=Path)
     render.add_argument("--qa-report", type=Path)
+    render.add_argument(
+        "--delivery-report",
+        type=Path,
+        help="Formal delivery evidence; defaults to <output>_delivery_report.json",
+    )
     render.add_argument("--quick-qa", action="store_true")
     render.add_argument("--motion-effects", choices=("auto", "off", "required"))
     render.add_argument("--motion-seed")
@@ -2003,7 +2336,10 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--dry-run", action="store_true")
     render.set_defaults(func=cmd_render)
 
-    qa = sub.add_parser("qa", help="Probe, decode, and loudness-check an output video")
+    qa = sub.add_parser(
+        "qa",
+        help="Technical media-only probe/decode/loudness check; never claims formal delivery",
+    )
     qa.add_argument("--input", type=Path, required=True)
     qa.add_argument("--output-json", type=Path)
     qa.add_argument("--expected-width", type=int, default=1080)
@@ -2022,6 +2358,34 @@ def main() -> int:
     try:
         return int(args.func(args))
     except (PipelineError, OSError, ValueError, json.JSONDecodeError) as exc:
+        if getattr(args, "command", None) == "render" and hasattr(args, "output"):
+            try:
+                delivery_path = resolve_delivery_report_path(args)
+                persist_json(
+                    {
+                        "schema_version": 1,
+                        "pipeline_entry": "soda_pipeline.py render",
+                        "status": "blocked",
+                        "formal_delivery_ready": False,
+                        "blocked_reason": f"unhandled_pipeline_error: {exc}",
+                        "artifacts": {
+                            "input": str(args.input.expanduser().resolve())
+                            if getattr(args, "input", None)
+                            else None,
+                            "output": str(args.output.expanduser().resolve()),
+                            "timeline": str(args.timeline_json.expanduser().resolve())
+                            if getattr(args, "timeline_json", None)
+                            else None,
+                        },
+                        "delivery_policy": {
+                            "only_soda_pipeline_render_may_claim_formal_delivery": True,
+                            "custom_ffmpeg_or_custom_renderer_is_not_formal_delivery": True,
+                        },
+                    },
+                    delivery_path,
+                )
+            except (OSError, ValueError):
+                pass
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
 

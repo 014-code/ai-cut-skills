@@ -125,6 +125,24 @@ def whisper_cache_candidates() -> list[Path]:
     return candidates
 
 
+def whisper_model_candidates() -> list[tuple[str, Path]]:
+    candidates: list[tuple[str, Path]] = []
+    configured = os.environ.get("WHISPER_MODEL_DIR")
+    if configured:
+        candidates.append(("configured", Path(configured).expanduser() / "tiny.pt"))
+    candidates.append(("bundled", SKILL_ROOT / "assets" / "whisper" / "tiny.pt"))
+    candidates.extend(("cache", path) for path in whisper_cache_candidates())
+    result: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for source, path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append((source, resolved))
+    return result
+
+
 def whisper_cli_candidate() -> tuple[str | None, bool]:
     from_path = shutil.which("whisper")
     if from_path:
@@ -143,9 +161,11 @@ def whisper_check(mode: str) -> dict[str, Any]:
     executable, visible_in_path = whisper_cli_candidate()
     module = run_capture([sys.executable, "-c", "import whisper; print(whisper.__file__)"])
     cli = run_capture([str(executable), "--help"]) if executable else {"ok": False, "error": "CLI not found"}
-    candidates = whisper_cache_candidates()
-    cached = next((path for path in candidates if path.is_file()), None)
-    usable = bool(module["ok"] and cli["ok"] and visible_in_path and cached)
+    candidates = whisper_model_candidates()
+    available = next(((source, path) for source, path in candidates if path.is_file()), None)
+    model_source = available[0] if available else None
+    model_path = available[1] if available else None
+    usable = bool(module["ok"] and cli["ok"] and visible_in_path and model_path)
     return {
         "ok": usable,
         "required": required,
@@ -155,9 +175,16 @@ def whisper_check(mode: str) -> dict[str, Any]:
         "cli_path": executable,
         "cli_usable": bool(cli["ok"]),
         "cli_visible_in_path": visible_in_path,
-        "tiny_model_cached": bool(cached),
-        "tiny_model_path": str(cached) if cached else None,
-        "cache_candidates": [str(path) for path in candidates],
+        "tiny_model_available": bool(model_path),
+        "tiny_model_source": model_source,
+        "tiny_model_cached": model_source == "cache",
+        "tiny_model_path": str(model_path) if model_path else None,
+        "tiny_model_dir": str(model_path.parent) if model_path else None,
+        "model_candidates": [
+            {"source": source, "path": str(path)}
+            for source, path in candidates
+        ],
+        "cache_candidates": [str(path) for path in whisper_cache_candidates()],
     }
 
 
@@ -241,14 +268,16 @@ def platform_guidance() -> list[str]:
             "brew install python@3.11 ffmpeg",
             "python3.11 -m venv ~/.virtualenvs/ai-video-editing",
             "~/.virtualenvs/ai-video-editing/bin/python -m pip install -U openai-whisper",
-            '~/.virtualenvs/ai-video-editing/bin/python -c \'import whisper; whisper.load_model("tiny")\'',
+            f'export WHISPER_MODEL_DIR="{skill}/assets/whisper"',
+            '~/.virtualenvs/ai-video-editing/bin/python -c \'import os, whisper; whisper.load_model("tiny", download_root=os.environ["WHISPER_MODEL_DIR"])\'',
         ]
     return [
         f'python3 "{skill}/scripts/discover_environments.py" --profile soda-scripted-render --motion-effects auto',
         "sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip ffmpeg",
         "python3 -m venv ~/.virtualenvs/ai-video-editing",
         "~/.virtualenvs/ai-video-editing/bin/python -m pip install -U openai-whisper",
-        '~/.virtualenvs/ai-video-editing/bin/python -c \'import whisper; whisper.load_model("tiny")\'',
+        f'export WHISPER_MODEL_DIR="{skill}/assets/whisper"',
+        '~/.virtualenvs/ai-video-editing/bin/python -c \'import os, whisper; whisper.load_model("tiny", download_root=os.environ["WHISPER_MODEL_DIR"])\'',
     ]
 
 

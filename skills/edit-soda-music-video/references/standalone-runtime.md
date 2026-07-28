@@ -5,12 +5,15 @@
 - Python 3.10 或更高版本，仅使用标准库；
 - `ffmpeg`，需要 `libx264`、`aac`、`subtitles/libass`、`loudnorm` 和 `ebur128`；
 - `ffprobe`；
-- 本地 `whisper` CLI 和已缓存 `tiny` 模型：无调用方台词时不可用可退化为多阈值音量检测；提供台词时必须可用并输出 `--word_timestamps True` 的词级 JSON，否则渲染失败；
+- 本地 `whisper` CLI 和内置或已缓存的 `tiny` 模型：无调用方台词时不可用可退化为多阈值音量检测；提供台词时必须可用并输出 `--word_timestamps True` 的词级 JSON，否则渲染失败；
+- `setup-video-editing-environment` 内置官方 `tiny.pt`，汽水脚本会优先把其目录传给 Whisper CLI；它只替代权重下载，不替代 `openai-whisper` 包和 CLI；
 - 输入视频、BGM、素材目录和时间轴 JSON。
 - 必需安装 `manage-visual-asset-library`；它负责生成和校验工作区 `visual_assets_manifest.json`。汽水 `preflight`/`render` 只消费 Manifest 并执行最低契约门禁。
 - 可选 `${CODEX_HOME:-$HOME/.codex}/skills/video-motion-effects`；启用时额外需要 Node.js、Chrome/Chromium 及该 Skill 已安装的 Remotion 依赖。
 
-不需要任何业务项目、虚拟环境、数据库、API 服务或 Python 第三方包。
+不需要任何业务项目、数据库或 API 服务。基础 renderer 本身只使用 Python 标准库；带台词的正式流程额外要求当前 Python 安装 `openai-whisper`，因为字幕时间必须来自本地 Whisper 词级识别。
+
+正式 preflight/render 还必须读取 `setup-video-editing-environment` 生成的 `video_environment.json`。环境报告默认位于时间轴同目录；带台词任务必须是 `soda-scripted-render`，并且报告中的 Python 必须等于当前运行 pipeline 的 Python。缺失或不一致时停止，不得切换到自写 FFmpeg 流程。
 
 ## BGM 响度
 
@@ -43,6 +46,8 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/manage-visual-asset-library/scripts/
 ```
 
 Manifest 默认写入工作区的 `visual_assets_manifest.json`，只记录图片和视频。Read 理解、description 质量、effective_region 和普通候选输出全部遵循通用 Skill。汽水 `sync-assets` 仅是兼容转发入口；旧 `soda_assets_manifest.json` 仍可通过 `--asset-manifest` 显式传入。生成视频前，`preflight`/`render` 会阻止 Manifest 缺失、asset_root 不一致、description/effective_region 门禁失败或时间轴引用未入库视觉素材的任务。
+
+通用 Skill 的 `build_understanding_queue.py` 会把新增、变化和缺字段记录写入工作区队列，并为待处理视频导出可复用代表帧。Soda 不维护第二套理解检查器；preflight 直接调用通用 `validate_manifest.py`，再追加时间轴引用检查。
 
 ## 时间轴 JSON
 

@@ -9,7 +9,13 @@ description: Create, revise, or validate Soda Music portrait talking-head mixed-
 
 **REQUIRED SUB-SKILL:** Use manage-visual-asset-library
 
+**REQUIRED SUB-SKILL:** Use setup-video-editing-environment
+
 所有图片/视频的扫描、Read 内容理解、`description`、`effective_region`、完整性校验和普通语义候选检索都由该通用 Skill 完成。本 Skill 只消费 `visual_assets_manifest.json` 与 `asset_candidates.json`，并负责汽水业务决策、最终选材、时间轴和渲染。
+
+正式交付只能由 `scripts/soda_pipeline.py render` 调用 Skill 内置 `standalone_renderer.py` 生成。禁止为了赶进度新建 `build_mix.py`、自写 renderer、直接拼 FFmpeg 命令或绕过 Manifest/Whisper/preflight；环境、素材理解、字幕或任一门禁未完成时状态必须为 `blocked`，不得自行降级成“可播放草稿”。非合规草稿只有用户明确知情并单独要求时才可生成，且不得标记为正式交付。
+
+正式 render 会生成 `delivery_report.json`，只有环境、通用 Manifest、Whisper 字幕修复、合规、preflight、内置 renderer 报告和完整技术 QA 全部通过时才写入 `formal_delivery_ready=true`。单独运行 `qa` 只验证媒体结构、解码和响度，固定输出 `scope=technical_media_only`、`formal_delivery_ready=false`。
 
 保留原始视频、BGM 和素材包，只输出新文件。除 [special-material-matches.md](references/special-material-matches.md) 中由用户明确批准的特殊匹配外，Skill 内不得保存或假设具体素材名称、文件名、绝对路径、固定时间码或样片脚本；只维护素材种类、输入契约和剪辑规则。特殊匹配只保存参考相对路径、画面识别条件和触发规则，不保存文件哈希，也不能把素材文件复制进 Skill。所有任务视觉素材仍必须由调用方提供并进入当前工作区 Manifest。
 
@@ -45,18 +51,19 @@ BGM 必须先按目标综合响度归一化，再做小范围后置微调。默�
 
 ## 执行顺序
 
-1. 确认工作区、素材根目录和时间轴 JSON；用户已指定时采用其渠道/BGM，未指定时由执行模型按上面的契约自行选择并记录依据。继续确认金币/歌单状态、歌曲审查结果和第三方授权；实际时长以数字人口播处理结果为准。
-2. 使用 `manage-visual-asset-library` 同步素材、Read 理解全部图片/视频并校验 `visual_assets_manifest.json`。若检测到新增或修改，必须在通用 Skill 中补齐理解结果后再继续。
-3. 生成任何视频前确认通用 Manifest 校验 `ok=true`。汽水 preflight 还会在消费端检查 `asset_root`、引用路径、非空 description 和合法 effective_region；任一失败都返回通用 Skill 修复，不能在汽水 Skill 中另建一套描述规则。
-4. 先逐句判断是否为利益点。特殊规则未命中时才把利益点文本交给通用 Skill，读取 `asset_candidates.json` 后决定是否采用；每条最终物料必须记录 `semantic_role=benefit_point` 和对应的 `matched_benefit_text`。非利益点不查询普通候选。如果调用方提供口播，先运行 `caption-budget` 取得由当前字幕样式动态计算的单行字数上限；执行模型复制原台词并只插入语义换行，再把这份语义字幕稿传给 `repair-captions`。随后对当前输入视频执行 Whisper 词级转写，把每个语义行映射到实际词级时间；原始台词、原始时间轴不覆盖，修正版时间轴和修复报告单独输出。最后运行预检，检查素材契约、利益点选材、字幕样式、品牌保护区、缩放、图层顺序和源素材固定黑边；不要在素材或运行环境缺失时猜测路径。
-5. 使用多组音量阈值交叉检测停顿；固定调用 Whisper `tiny` 增加逐词时间戳校验。提供口播时，字幕时序仍必须由对当前输入执行的 `--word_timestamps True` 结果驱动。
-6. 结合语义、波形、呼吸、尾音、口型和动作人工确认范围，每处默认保留约 `0.16s`，不得整段删除。
-7. 先输出去气口中间视频，再应用倍速。未指定时使用 `1.1×`，指定时使用调用方传入的倍速。
-8. 使用 Whisper 实际词级时间戳生成 `time_mode=input` 字幕，再填入已经按动态字数上限完成语义分行的口播台词；一行严格对应一个 caption event，禁止渲染脚本再做等宽时间切分。把时间轴和全部物料统一到 `input`，直接复用修复后字幕 input `start/end`，不使用映射后 output 时间回填素材。字幕事件内部仍按实际像素宽度显式均衡换行，优先一到两行、最多三行，超限直接失败，不缩小字号。同一 `sequence_id` 内相邻素材必须满足上一条 `end ==` 下一条 `start`，不留缓冲、不重叠；数字人空档必须切换 `sequence_id`。只在利益点时间段匹配真实物料，最终字幕去除普通标点并保留数字内部小数点。检测 `video-motion-effects` 并按稳定随机种子为合格图片选择入场效果。字幕使用 `2–3px` 黑色细描边且无阴影，不得带背景条；素材不受字幕安全区限制。渲染器只检查素材 `effective_region` 是否进入品牌保护区；无内容画布不触发移动或缩放。只有有效内容真实遮挡时才先平移，无法平移解决时再等比缩放。字幕和 CTA 在素材及动效上方绘制，logo 再叠加于字幕与 CTA 上方。第 0 秒直接显示数字人，非利益点默认不叠加普通素材。
-9. 先运行规则校验，再渲染。校验失败时不要通过改参数绕过红线。
-10. 使用调用方提供的官方 logo、规定警示语和官方尾帧视频。正片中 logo 必须位于素材、动效、字幕和 CTA 上方，警示语必须最后绘制为最高层；尾帧硬切进入，不叠加其他元素。
-11. 先把 BGM 归一化到目标响度，再混入人声和轻提示音，完成人声、BGM、响度和手机扬声器复听。
-12. 运行完整 QA，交付成片、封面、素材/时间轴报告、合规报告和技术验收报告。
+1. 使用 `setup-video-editing-environment` 按能力发现或初始化环境，在任务工作区生成 `video_environment.json`；带口播台词时 profile 必须为 `soda-scripted-render`。只有报告 `ok=true` 且当前 Python 与报告一致才能继续。
+2. 确认工作区、素材根目录和时间轴 JSON；用户已指定时采用其渠道/BGM，未指定时由执行模型按上面的契约自行选择并记录依据。继续确认金币/歌单状态、歌曲审查结果和第三方授权；实际时长以数字人口播处理结果为准。
+3. 使用 `manage-visual-asset-library` 同步素材，生成可恢复理解队列，只 Read 待处理图片/视频并校验 `visual_assets_manifest.json`。若检测到新增、修改或缺字段，必须补齐后再继续。
+4. 生成任何视频前确认通用 Manifest 校验 `ok=true`。汽水 preflight 直接调用通用 validator，再补充时间轴引用检查，不能维护另一套精简理解门禁；任一失败都返回通用 Skill 修复。
+5. 先逐句判断是否为利益点。特殊规则未命中时才把利益点文本交给通用 Skill，读取 `asset_candidates.json` 后决定是否采用；每条最终物料必须记录 `semantic_role=benefit_point` 和对应的 `matched_benefit_text`。非利益点不查询普通候选。如果调用方提供口播，先运行 `caption-budget` 取得由当前字幕样式动态计算的单行字数上限；执行模型复制原台词并只插入语义换行，再把这份语义字幕稿传给 `repair-captions`。随后对当前输入视频执行 Whisper 词级转写，把每个语义行映射到实际词级时间；原始台词、原始时间轴不覆盖，修正版时间轴和修复报告单独输出。最后运行预检，检查环境报告、素材契约、利益点选材、字幕样式、品牌保护区、缩放、图层顺序和源素材固定黑边；不要在素材或运行环境缺失时猜测路径。
+6. 使用多组音量阈值交叉检测停顿；固定调用 Whisper `tiny` 增加逐词时间戳校验。提供口播时，字幕时序仍必须由对当前输入执行的 `--word_timestamps True` 结果驱动。
+7. 结合语义、波形、呼吸、尾音、口型和动作人工确认范围，每处默认保留约 `0.16s`，不得整段删除。
+8. 先输出去气口中间视频，再应用倍速。未指定时使用 `1.1×`，指定时使用调用方传入的倍速。
+9. 使用 Whisper 实际词级时间戳生成 `time_mode=input` 字幕，再填入已经按动态字数上限完成语义分行的口播台词；一行严格对应一个 caption event，禁止渲染脚本再做等宽时间切分。把时间轴和全部物料统一到 `input`，直接复用修复后字幕 input `start/end`，不使用映射后 output 时间回填素材。字幕事件内部仍按实际像素宽度显式均衡换行，优先一到两行、最多三行，超限直接失败，不缩小字号。同一 `sequence_id` 内相邻素材必须满足上一条 `end ==` 下一条 `start`，不留缓冲、不重叠；数字人空档必须切换 `sequence_id`。只在利益点时间段匹配真实物料，最终字幕去除普通标点并保留数字内部小数点。检测 `video-motion-effects` 并按稳定随机种子为合格图片选择入场效果。字幕使用 `2–3px` 黑色细描边且无阴影，不得带背景条；素材不受字幕安全区限制。渲染器只检查素材 `effective_region` 是否进入品牌保护区；无内容画布不触发移动或缩放。只有有效内容真实遮挡时才先平移，无法平移解决时再等比缩放。字幕和 CTA 在素材及动效上方绘制，logo 再叠加于字幕与 CTA 上方。第 0 秒直接显示数字人，非利益点默认不叠加普通素材。
+10. 先运行规则校验，再渲染。校验失败时不要通过改参数绕过红线。
+11. 使用调用方提供的官方 logo、规定警示语和官方尾帧视频。正片中 logo 必须位于素材、动效、字幕和 CTA 上方，警示语必须最后绘制为最高层；尾帧硬切进入，不叠加其他元素。
+12. 先把 BGM 归一化到目标响度，再混入人声和轻提示音，完成人声、BGM、响度和手机扬声器复听。
+13. 运行完整 QA，并确认 delivery report 的 `formal_delivery_ready=true` 后，才交付成片、封面、素材/时间轴报告、合规报告、技术验收报告和正式交付凭证。
 
 ## 命令入口
 
@@ -99,6 +106,7 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
 ```bash
 "$PY" "$PIPE" preflight \
   --input /absolute/path/source.mov \
+  --environment-report /absolute/path/workspace/video_environment.json \
   --asset-root /absolute/path/assets \
   --asset-manifest /absolute/path/workspace/visual_assets_manifest.json \
   --bgm /absolute/path/background-music.mp3 \
@@ -106,7 +114,7 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
   --output-json /absolute/path/preflight.json
 ```
 
-必须检查 `ok=true`。`--asset-root`、`--bgm` 和 `--timeline-json` 没有 CLI 默认值，必须按任务显式传入；用户没有指定 BGM 时，由执行模型先从任务内候选自主选定路径再传给 `--bgm`，不要把参数必填转化成对用户的追问。
+必须检查 `ok=true`。`--environment-report` 省略时默认读取时间轴同目录的 `video_environment.json`；带台词的预检增加 `--require-whisper`。`--asset-root`、`--bgm` 和 `--timeline-json` 没有 CLI 默认值，必须按任务显式传入；用户没有指定 BGM 时，由执行模型先从任务内候选自主选定路径再传给 `--bgm`，不要把参数必填转化成对用户的追问。
 
 可复制 `$SKILL_DIR/references/timeline-template.json` 到任务输出目录，填写调用方实际提供的路径、字幕、物料和时间点，再通过 `--timeline-json` 传入。模板只描述字段结构，不包含现有素材信息。
 
@@ -171,6 +179,7 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
 ```bash
 "$PY" "$PIPE" render \
   --input /absolute/path/source_去气口.mp4 \
+  --environment-report /absolute/path/workspace/video_environment.json \
   --asset-root /absolute/path/assets \
   --asset-manifest /absolute/path/workspace/visual_assets_manifest.json \
   --bgm /absolute/path/background-music.mp3 \
@@ -184,12 +193,13 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
   --compliance-report /absolute/path/compliance.json \
   --preflight-report /absolute/path/preflight.json \
   --qa-report /absolute/path/qa.json \
+  --delivery-report /absolute/path/delivery_report.json \
   --motion-effects auto \
   --motion-seed version-a \
   --dry-run
 ```
 
-确认无误后移除 `--dry-run`。基础 renderer 依赖 Python 3 标准库、FFmpeg、FFprobe、输入视频、BGM、素材目录和时间轴；启用已安装的 `video-motion-effects` 时额外使用 Node、Chrome 和该 Skill 的 Remotion 依赖。`--bgm-target-lufs` 控制归一化目标，默认 `-28`；`--bgm-volume` 是归一化后的微调倍率，默认 `1.0`、允许范围 `0.5–1.5`。需要调整时优先每次改变目标响度约 `1–2 LUFS`；只有细微听感修正时才把微调倍率每次改变约 `0.03–0.05`，并重新运行完整响度与人声清晰度 QA。
+确认无误后移除 `--dry-run`。不显式指定报告路径时，render 会在输出视频旁生成 compliance、preflight、QA 和 delivery 报告。只有 delivery report 的 `pipeline_entry=soda_pipeline.py render` 且 `formal_delivery_ready=true` 才是正式交付；`--dry-run`、`--quick-qa`、自写脚本或单独 QA 都不能得到正式状态。基础 renderer 依赖 Python 3 标准库、FFmpeg、FFprobe、输入视频、BGM、素材目录和时间轴；启用已安装的 `video-motion-effects` 时额外使用 Node、Chrome 和该 Skill 的 Remotion 依赖。`--bgm-target-lufs` 控制归一化目标，默认 `-28`；`--bgm-volume` 是归一化后的微调倍率，默认 `1.0`、允许范围 `0.5–1.5`。需要调整时优先每次改变目标响度约 `1–2 LUFS`；只有细微听感修正时才把微调倍率每次改变约 `0.03–0.05`，并重新运行完整响度与人声清晰度 QA。
 
 `--speed` 在去气口之后应用，默认值为 `1.1`。不要根据口播快慢自行改回原速；只有调用方明确传入其他值时才覆盖默认值。新流程的字幕、物料和提示音都使用去气口后当前 input 的时间：不得再扣减 `removed_ranges`，渲染器只统一除以最终 `speed`。仅 `time_mode=original` 的旧兼容时间轴才先按删除区间映射，再应用倍速。
 
@@ -197,7 +207,7 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
 
 `render` 收到 `--script-file` 或 `--text` 时必须先用本地 Whisper `tiny` 对当前 `--input` 执行 `--word_timestamps True`；调用方台词是字幕文本权威来源，但传入文本必须已经按 `caption-budget` 的动态上限完成模型语义分行。每行是一个 caption event，入点/出点来自该行首尾文字对应的 Whisper 真实词级时序，禁止复用原字幕区间或让脚本按宽度自动切分。修正版时间轴统一写为 `time_mode=input`；所有素材也必须在渲染前改为 input 时间，并直接对齐修正字幕的 input `start/end`。缺少 Whisper CLI、词级 JSON、有效词时间戳或存在超限语义行时直接失败。原时间轴保持不变，可通过 `--repaired-timeline-json` 和 `--subtitle-repair-report` 指定修正版时间轴与修复报告路径。修正版中如果仍有素材使用 `original/output` 或未对齐 input 字幕边界，预检必须失败。
 
-`preflight` 和 `render` 都会检查 `--asset-manifest`（省略时默认为时间轴 JSON 所在目录的 `visual_assets_manifest.json`）：Manifest 必须与 `--asset-root` 一致，消费端门禁校验 description 非空、`effective_region` 合法以及时间轴视觉素材已经入库；语义完整性以通用 Skill 的校验和 Read 复核为准。显式传入旧 `soda_assets_manifest.json` 时，只要其中视觉记录满足同一契约仍可使用。每条 `materials[]` 还必须标记 `semantic_role=benefit_point` 和 `matched_benefit_text`；声明 `special_match_rule` 时只校验规则 ID 合法，不校验素材 SHA-256。执行模型必须通过 Read 确认实际画面满足特殊规则。Whisper 时间轴门禁会强制顶层、字幕和全部素材使用 `time_mode=input`，直接在 input 时钟比较字幕/素材边界；同时校验半开区间、禁止重叠、同 `sequence_id` 严格无缝和字幕切换点对齐。门禁失败时先完成素材理解、利益点标注、特殊素材纠正或重算素材时间，再重新预检。
+`preflight` 和 `render` 都会检查 `video_environment.json`，并直接调用通用 Skill 的 `validate_manifest.py` 校验 `--asset-manifest`（省略时默认为时间轴 JSON 所在目录的 `visual_assets_manifest.json`），再补充时间轴视觉素材是否已入库。显式传入旧 `soda_assets_manifest.json` 时，只要其中视觉记录满足同一契约仍可使用。每条 `materials[]` 还必须标记 `semantic_role=benefit_point` 和 `matched_benefit_text`；声明 `special_match_rule` 时只校验规则 ID 合法，不校验素材 SHA-256。执行模型必须通过 Read 确认实际画面满足特殊规则。Whisper 时间轴门禁会强制顶层、字幕和全部素材使用 `time_mode=input`，直接在 input 时钟比较字幕/素材边界；同时校验半开区间、禁止重叠、同 `sequence_id` 严格无缝和字幕切换点对齐。门禁失败时先修复环境、完成素材理解、利益点标注、特殊素材纠正或重算素材时间，再重新预检。
 
 素材策略写在时间线的 `visual_policy` 中：`match_materials_only_for_benefit_points=true`、`preserve_material_size=true`、`reposition_before_scale=true`、`seamless_material_handoffs=true`、`align_material_cuts_to_caption_boundaries=true`，小图标相对字幕的默认位置由 `icon_caption_placement={mode: above_caption, gap: 72, line_height_scale: 1.2}` 控制。渲染器把 Manifest 的 `effective_region` 映射到画布，只在有效内容真实进入 logo/警示语保护区时处理；空白或透明画布越界不触发任何尺寸变化。`phone`、`full_alpha` 和 `cta_icon` 默认使用完整源文件的源像素尺寸，`icon` 默认按 effective_region 裁去空白画布并以裁后内容源像素尺寸 `1:1` 叠加；不得固定缩放到 230px、300×300 或输出画布。只有有效内容碰撞且移动无法解决时，才等比缩小到最大安全尺寸。
 
@@ -211,7 +221,7 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
   --output-json /absolute/path/qa.json
 ```
 
-只有排查环境时才使用 `--quick`；最终交付必须执行完整解码和响度扫描。QA 记录实际时长，但不按时长判定失败。
+只有排查环境时才使用 `--quick`；最终交付必须执行完整解码和响度扫描。无论 QA 是否 `ok=true`，单独 QA 都固定标记 `scope=technical_media_only`、`formal_delivery_ready=false`；正式状态只看 render 生成的 delivery report。QA 记录实际时长，但不按时长判定失败。
 
 ## 渲染与内容边界
 
@@ -225,4 +235,4 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
 
 ## 交付说明
 
-最终回复列出：输入文件、渠道及选择依据、去气口范围、速度、素材根目录、BGM 及选择依据、BGM 目标 LUFS 和后置微调倍率、实际时长、输出视频、封面、合规报告、预检报告和 QA 结果。
+最终回复列出：输入文件、环境报告、渠道及选择依据、去气口范围、速度、素材根目录、理解队列进度、BGM 及选择依据、BGM 目标 LUFS 和后置微调倍率、实际时长、输出视频、封面、合规报告、预检报告、QA 结果和 `formal_delivery_ready=true` 的 delivery report。

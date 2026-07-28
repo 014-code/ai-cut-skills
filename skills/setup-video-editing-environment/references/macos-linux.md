@@ -14,7 +14,8 @@ python3.11 -m venv "$HOME/.virtualenvs/ai-video-editing"
 source "$HOME/.virtualenvs/ai-video-editing/bin/activate"
 python -m pip install --upgrade pip
 python -m pip install -U openai-whisper
-python -c 'import whisper; whisper.load_model("tiny")'
+export WHISPER_MODEL_DIR="$SKILL_DIR/assets/whisper"
+python -c 'import os, whisper; whisper.load_model("tiny", download_root=os.environ["WHISPER_MODEL_DIR"])'
 ```
 
 ## Ubuntu/Debian
@@ -32,11 +33,12 @@ python3 -m venv "$HOME/.virtualenvs/ai-video-editing"
 source "$HOME/.virtualenvs/ai-video-editing/bin/activate"
 python -m pip install --upgrade pip
 python -m pip install -U openai-whisper
-python -c 'import whisper; whisper.load_model("tiny")'
+export WHISPER_MODEL_DIR="$SKILL_DIR/assets/whisper"
+python -c 'import os, whisper; whisper.load_model("tiny", download_root=os.environ["WHISPER_MODEL_DIR"])'
 ```
 
 发现阶段会检查当前 Python、已激活环境、项目虚拟环境、`~/.virtualenvs`、`~/.venvs`、Conda 和 `PATH` 候选。环境名称不参与通过判断：任何业务环境只要满足目标 profile 都可以复用；任何环境即使名为 `ai-video-editing` 也必须先验证。
 
-只有所有候选失败时才创建统一命名的 `~/.virtualenvs/ai-video-editing`。安装后保持同一 shell，确认 `command -v python ffmpeg ffprobe whisper`，再用该环境的 Python 运行 `scripts/check_environment.py`。
+只有所有候选失败时才创建统一命名的 `~/.virtualenvs/ai-video-editing`。安装后保持同一 shell，确认 `command -v python ffmpeg ffprobe whisper`，设置 `WHISPER_MODEL_DIR="$SKILL_DIR/assets/whisper"`，再用该环境的 Python 运行 `scripts/check_environment.py --output-json /absolute/path/video_environment.json`。
 
 如果启用必需动效，额外安装 Node.js LTS、Chrome/Chromium 和 `video-motion-effects` Skill 的固定 Remotion 依赖。`auto` 模式缺失时允许静态回退。

@@ -16,8 +16,8 @@ description: Use when a task needs a reusable image/video asset manifest, Read-b
 ## 工作流
 
 1. 运行 `asset_manifest.py`，把素材根目录中的全部图片和视频同步到工作区 `visual_assets_manifest.json`。
-2. 检查 `changes.added`、`changes.modified` 以及缺少 `description` 或 `effective_region` 的记录。
-3. 对图片逐张使用 Read 查看原图；对视频先运行 `extract_video_frames.py`，再使用 Read 查看全部代表帧。
+2. 运行 `build_understanding_queue.py` 生成可恢复的 `understanding_queue.json`。队列只列出新增、变化或缺少有效 `description`/`effective_region` 的记录，并自动为待理解视频导出或复用代表帧。
+3. 按队列逐项处理：图片使用 Read 查看原图；视频使用 Read 查看队列中的全部代表帧。
 4. 把准确中文 `description` 和源像素坐标 `effective_region` 写回对应记录。不要添加 `keywords`、`recommended_usage`、向量或模型配置字段。
 5. 运行 `validate_manifest.py`。未通过时先完成或修正素材理解，不得继续检索。
 6. 接收调用方的查询文本，执行模型逐条比较 Manifest description，最多写出三个候选、匹配等级和基于画面事实的理由。
@@ -50,6 +50,17 @@ PY=python3
 ```
 
 代表帧脚本只导出画面，不生成 description，不判断有效区域，也不做语义匹配。
+
+### 生成或恢复理解队列
+
+```bash
+"$PY" "$ASSET_SKILL_DIR/scripts/build_understanding_queue.py" \
+  --manifest /absolute/path/workspace/visual_assets_manifest.json \
+  --asset-root /absolute/path/assets \
+  --output-json /absolute/path/workspace/understanding_queue.json
+```
+
+队列中的 `summary.complete/pending/progress_percent` 是当前进度；`items` 只包含仍需 Read 的记录。视频代表帧默认写入工作区 `asset_frames/`，相同源文件再次执行时复用已有帧。每完成一批就写回 Manifest 并重跑队列，已完成记录会从 `items` 消失，因此中断后不得重新理解全部素材。该脚本不生成描述或有效区域。
 
 ### 校验 Manifest
 

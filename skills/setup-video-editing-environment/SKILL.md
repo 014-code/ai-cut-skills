@@ -1,6 +1,6 @@
 ---
 name: setup-video-editing-environment
-description: Discover, reuse, install, diagnose, or verify cross-platform AI video-editing runtimes, with Windows PowerShell as the primary workflow and macOS/Linux support. Validates existing environments by capability before installing the uniformly named ai-video-editing environment. Covers Python 3.10+, FFmpeg/FFprobe, OpenAI Whisper CLI and tiny model cache, Soda editing Skill dependencies, and optional Node/Chrome/Remotion motion effects. Use when Whisper、FFmpeg、ffprobe、Python、Node、Chrome、Remotion 缺失，Windows 剪辑环境初始化，或运行 edit-soda-music-video 前需要发现、安装或检查依赖。
+description: Discover, reuse, install, diagnose, or verify cross-platform AI video-editing runtimes, with Windows PowerShell as the primary workflow and macOS/Linux support. Validates existing environments by capability before installing the uniformly named ai-video-editing environment. Covers Python 3.10+, FFmpeg/FFprobe, OpenAI Whisper CLI and bundled tiny model, Soda editing Skill dependencies, portable Windows FFmpeg, and optional Node/Chrome/Remotion motion effects. Use when Whisper、FFmpeg、ffprobe、Python、Node、Chrome、Remotion 缺失，Windows 剪辑环境初始化，或运行 edit-soda-music-video 前需要发现、安装或检查依赖。
 ---
 
 # 视频剪辑环境安装
@@ -13,14 +13,16 @@ description: Discover, reuse, install, diagnose, or verify cross-platform AI vid
 
 环境检查是只读操作，可以直接执行。安装 Python、FFmpeg、Whisper、Node 或 Chrome 会改变机器状态；仅在用户明确要求安装/初始化时执行。需要管理员权限、PowerShell 执行策略、sudo 或网络下载时，先说明影响并取得所需权限。
 
-不要声称“环境可用”直到 `scripts/check_environment.py` 对目标 profile 返回 `ok=true`。安装日志和环境报告写入任务工作区，不写回本 Skill。
+不要声称“环境可用”直到 `scripts/check_environment.py` 对目标 profile 返回 `ok=true`。安装日志和 `video_environment.json` 写入任务工作区，不写回本 Skill；后续正式 Soda preflight/render 必须消费该报告。
+
+Skill 内置官方 OpenAI Whisper `tiny.pt`，约 `72.1 MiB`。检查器优先使用 `WHISPER_MODEL_DIR`，其次使用内置权重，最后使用用户缓存；内置权重只省去模型下载，仍需在目标 Python 中安装 `openai-whisper` 并提供 `whisper` CLI。不得把模型复制进每个任务目录。
 
 ## Profile 选择
 
 | Profile | 必需能力 |
 | --- | --- |
 | `base-video` | Python 3.10+、FFmpeg/FFprobe 及规定滤镜/编码器 |
-| `soda-scripted-render` | 基础能力、Whisper CLI、当前 Python 的 Whisper 包、已缓存 tiny、`manage-visual-asset-library` |
+| `soda-scripted-render` | 基础能力、Whisper CLI、当前 Python 的 Whisper 包、内置或已缓存 tiny、`manage-visual-asset-library` |
 | `soda-timeline-render` | 基础能力、`manage-visual-asset-library`；Whisper 仅报告不阻断 |
 | `soda-detect-pauses` | 基础能力；Whisper 缺失时允许退化为音量检测 |
 
@@ -33,8 +35,8 @@ description: Discover, reuse, install, diagnose, or verify cross-platform AI vid
 3. 使用任一可运行的 Python 3.10+ 执行 `scripts/discover_environments.py`。候选的 Python Scripts 目录会临时加入检查进程的 `PATH`，避免把“未激活”误判为“不可用”。
 4. 如果发现 `ok=true` 的候选，直接复用报告里的 `selected_environment.python_executable`，不要重复安装。
 5. 如果用户只要求诊断且没有合格候选，交付候选检查结果、缺失项和建议命令，不执行安装。
-6. 如果用户明确要求初始化且没有合格候选，按平台文档创建 `ai-video-editing` 并安装缺失依赖。Windows 优先运行带 `-Install` 的 `setup_windows.ps1`。
-7. 使用选定 Python 和同一终端再次运行 `scripts/check_environment.py`。只有 `ok=true`、`errors=[]` 才交付环境。
+6. 如果用户明确要求初始化且没有合格候选，按平台文档创建 `ai-video-editing` 并安装缺失依赖。Windows 优先运行带 `-Install` 的 `setup_windows.ps1`；脚本必须先确认 Python 同时具备 `venv`、`ensurepip` 和 `pip`。
+7. 使用选定 Python 和同一终端再次运行 `scripts/check_environment.py`，并始终生成任务工作区 `video_environment.json`。只有 `ok=true`、`errors=[]` 才交付环境。
 
 ## Windows 快速入口
 
@@ -54,6 +56,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 脚本始终先发现并验证已有环境；发现合格候选时，即使带 `-Install` 也不会重复安装。只有无候选合格且带 `-Install` 时，才创建 `~\.virtualenvs\ai-video-editing`。可用 `-EnvironmentPath` 显式覆盖新环境路径。继续在同一个 PowerShell 会话中运行后续剪辑命令，以继承脚本设置的 `PATH`。
 
+FFmpeg 默认仍优先复用现有完整版本或通过 WinGet 安装。网络或 WinGet 不稳定时可显式使用：
+
+- `-FfmpegBinDir C:\tools\ffmpeg\bin`：直接复用已有便携目录；
+- `-FfmpegArchive C:\downloads\ffmpeg.zip`：校验 ZIP 后解压；
+- `-FfmpegDownloadUrl <url>`：使用 `curl.exe -C -` 断点续传，下载完成且 ZIP 可读取后才解压。
+
+三种便携方式最终都必须通过 `ffprobe`、`subtitles`、`loudnorm`、`ebur128`、`libx264` 和 `aac` 能力检查。
+
 ## macOS/Linux 快速入口
 
 ```bash
@@ -64,7 +74,7 @@ python3 "$SKILL_DIR/scripts/discover_environments.py" \
   --output-json /absolute/path/video_environment.json
 ```
 
-退出码为 `0` 表示已选出可复用环境；退出码为 `2` 表示所有候选均不合格，明确要求安装时再按 [macos-linux.md](references/macos-linux.md) 初始化。安装完成后用新环境的 Python 运行 `check_environment.py` 复检。
+退出码为 `0` 表示已选出可复用环境；退出码为 `2` 表示所有候选均不合格，明确要求安装时再按 [macos-linux.md](references/macos-linux.md) 初始化。安装完成后设置 `WHISPER_MODEL_DIR="$SKILL_DIR/assets/whisper"`，再用新环境的 Python 运行 `check_environment.py` 并输出 `video_environment.json`。
 
 ## 交付
 

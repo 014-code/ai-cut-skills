@@ -79,6 +79,7 @@ class SkillConsistencyTests(unittest.TestCase):
         self.assertFalse((SKILL_ROOT / "scripts" / "asset_manifest.py").exists())
         self.assertIn('DEFAULT_ASSET_MANIFEST_NAME = "visual_assets_manifest.json"', pipeline)
         self.assertIn("resolve_visual_asset_library_script", pipeline)
+        self.assertIn('resolve_visual_asset_library_script("validate_manifest.py")', pipeline)
         self.assertIn("VISUAL_ASSET_LIBRARY_SKILL_DIR", pipeline)
         self.assertIn("legacy soda_assets_manifest.json remains accepted", pipeline)
         self.assertNotIn("stores asset categories only", pipeline)
@@ -86,6 +87,19 @@ class SkillConsistencyTests(unittest.TestCase):
             pipeline.index("SKILL_ROOT.parent / VISUAL_ASSET_LIBRARY_SKILL_NAME"),
             pipeline.index('codex_home / "skills" / VISUAL_ASSET_LIBRARY_SKILL_NAME'),
         )
+
+    def test_formal_delivery_forbids_custom_renderer_bypass(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        workflow = (SKILL_ROOT / "references" / "workflow.md").read_text(
+            encoding="utf-8"
+        )
+        agent = (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        combined = "\n".join((skill, workflow, agent))
+
+        self.assertIn("build_mix.py", combined)
+        self.assertIn("formal_delivery_ready=true", combined)
+        self.assertIn("technical_media_only", combined)
+        self.assertIn("setup-video-editing-environment", skill)
 
     def test_motion_docs_use_effective_region_for_collision_not_general_cropping(self) -> None:
         paths = [

@@ -68,12 +68,40 @@ class EnvironmentSkillTests(unittest.TestCase):
         self.assertIn("Gyan.FFmpeg", combined)
         self.assertIn("openai-whisper", combined)
         self.assertIn("load_model('tiny')", script)
+        self.assertIn("Test-PythonBootstrapCapabilities", script)
+        self.assertIn("ensurepip", script)
+        self.assertIn("FfmpegBinDir", script)
+        self.assertIn("FfmpegArchive", script)
+        self.assertIn("FfmpegDownloadUrl", script)
+        self.assertIn("Expand-ValidatedFfmpegArchive", script)
+        self.assertIn("-C -", script)
         self.assertIn("sysconfig.get_path('scripts')", script)
         self.assertIn("discover_environments.py", script)
         self.assertIn('EnvironmentName = "ai-video-editing"', script)
         self.assertIn("Set-ExecutionPolicy -Scope Process", windows)
         self.assertIn("能力检查", windows)
         self.assertNotIn("smart-flow-agent", combined)
+
+    @mock.patch.object(check_environment, "run_capture")
+    @mock.patch.object(check_environment.shutil, "which")
+    def test_bundled_tiny_satisfies_model_availability(
+        self, which: mock.Mock, run: mock.Mock
+    ) -> None:
+        which.side_effect = lambda name: {
+            "whisper": "/env/bin/whisper",
+        }.get(name)
+        run.return_value = {"ok": True, "output": "ok", "error": None}
+        bundled = SKILL_ROOT / "assets" / "whisper" / "tiny.pt"
+        with mock.patch.object(
+            check_environment,
+            "whisper_model_candidates",
+            return_value=[("bundled", bundled)],
+        ), mock.patch.object(Path, "is_file", return_value=True):
+            report = check_environment.whisper_check("required")
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["tiny_model_source"], "bundled")
+        self.assertTrue(report["tiny_model_available"])
 
     def test_discovery_selects_first_capability_valid_candidate(self) -> None:
         candidates = [

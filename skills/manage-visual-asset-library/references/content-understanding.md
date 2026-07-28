@@ -6,6 +6,8 @@
 
 不能只看文件名、目录名、粗分类或视频第一帧。无法从画面确认的事实不得写入 description。
 
+开始前运行 `build_understanding_queue.py`。只处理 `understanding_queue.json.items`；每完成一批就写回 Manifest 并重新生成队列，以 `summary.pending=0` 作为理解完成条件。队列和代表帧都属于工作区可恢复进度，不得复制回 Skill。
+
 ## 图片流程
 
 1. 从 Manifest 找到新增、修改或缺少理解字段的图片。
