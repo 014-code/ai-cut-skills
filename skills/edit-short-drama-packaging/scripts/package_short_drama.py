@@ -185,7 +185,6 @@ def drawtext(
     x: str,
     y: str,
     border: int,
-    box: bool = False,
 ) -> str:
     options = [
         f"fontfile='{escape_filter_value(str(font))}'",
@@ -194,12 +193,115 @@ def drawtext(
         f"fontsize={size}",
         f"borderw={border}",
         "bordercolor=black",
+        "shadowx=0",
+        "shadowy=0",
         f"x={x}",
         f"y={y}",
     ]
-    if box:
-        options.extend(["box=1", "boxcolor=black@0.45", f"boxborderw={max(4, border * 2)}"])
     return "drawtext=" + ":".join(options)
+
+
+def estimated_text_units(text: str) -> float:
+    return sum(1.0 if ord(character) > 127 else 0.62 for character in text)
+
+
+def fit_font_size(text: str, requested_size: int, width: int) -> int:
+    if not text:
+        return requested_size
+    horizontal_margin = max(12, round(width * 0.04))
+    usable_width = max(1, width - horizontal_margin * 2)
+    units = max(1.0, estimated_text_units(text))
+    fitted_maximum = int(usable_width / (units * 1.06))
+    if fitted_maximum < 10:
+        raise SystemExit(
+            "Overlay text is too long to remain readable inside the horizontal safe margin"
+        )
+    return min(requested_size, fitted_maximum)
+
+
+def resolve_overlay_plan(args: argparse.Namespace, width: int, height: int) -> dict[str, Any]:
+    requested_title_size = args.title_font_size or max(28, round(height * 0.03))
+    requested_benefit_size = args.benefit_font_size or max(24, round(height * 0.025))
+    requested_notice_size = args.notice_font_size or max(14, round(height * 0.0125))
+    title_gap = max(10, round(height * 0.01))
+    if min(requested_title_size, requested_benefit_size, requested_notice_size) <= 0:
+        raise SystemExit("Overlay font sizes must be positive")
+
+    if args.source_title_present:
+        if args.title_bottom is None:
+            raise SystemExit(
+                "--source-title-present requires --title-bottom from the visual title audit"
+            )
+        if args.title_y is not None:
+            raise SystemExit("--title-y is only valid when adding --title-text")
+        title_text = ""
+        title_y = None
+        title_bottom = args.title_bottom
+        title_size = requested_title_size
+    else:
+        title_text = (args.title_text or "").strip()
+        if not title_text:
+            raise SystemExit("A source without a title requires non-empty --title-text")
+        if args.title_bottom is not None:
+            raise SystemExit("--title-bottom is only valid with --source-title-present")
+        title_y = args.title_y if args.title_y is not None else max(20, round(height * 0.02))
+        if title_y < 0:
+            raise SystemExit("--title-y must be within the frame")
+        title_size = fit_font_size(title_text, requested_title_size, width)
+        title_bottom = title_y + title_size
+
+    if title_bottom <= 0 or title_bottom >= height:
+        raise SystemExit(f"Title bottom must be within the frame; got {title_bottom}")
+
+    benefit_size = fit_font_size(args.benefit_text, requested_benefit_size, width)
+    minimum_benefit_y = title_bottom + title_gap
+    benefit_y = args.benefit_y if args.benefit_y is not None else minimum_benefit_y
+    if args.benefit_text and benefit_y < minimum_benefit_y:
+        raise SystemExit(
+            f"Benefit text must start at or below y={minimum_benefit_y} to clear the title"
+        )
+    if args.benefit_text and benefit_y + benefit_size >= height:
+        raise SystemExit("Benefit text does not fit inside the frame")
+
+    risk_text = "" if args.source_risk_present else (args.risk_text or "").strip()
+    ai_text = "" if args.source_ai_present else (args.ai_text or "").strip()
+    if not args.source_risk_present and not risk_text:
+        raise SystemExit(
+            "Declare --source-risk-present or provide non-empty --risk-text"
+        )
+    if not args.source_ai_present and not ai_text:
+        raise SystemExit(
+            "Declare --source-ai-present or provide non-empty --ai-text"
+        )
+
+    notice_text = " · ".join(text for text in (risk_text, ai_text) if text)
+    notice_size = fit_font_size(notice_text, requested_notice_size, width)
+    if args.notice_y is not None:
+        if args.notice_y < 0 or args.notice_y + notice_size >= height:
+            raise SystemExit("--notice-y places the added notice outside the frame")
+        notice_y = str(args.notice_y)
+    else:
+        notice_y = f"h-text_h-{max(10, round(height * 0.015))}"
+
+    return {
+        "source_title_present": bool(args.source_title_present),
+        "added_title_text": title_text,
+        "title_y": title_y,
+        "title_bottom": title_bottom,
+        "title_size": title_size,
+        "title_gap": title_gap,
+        "benefit_y": benefit_y,
+        "benefit_size": benefit_size,
+        "source_risk_present": bool(args.source_risk_present),
+        "source_ai_present": bool(args.source_ai_present),
+        "added_risk_text": risk_text,
+        "added_ai_text": ai_text,
+        "notice_text": notice_text,
+        "notice_y": notice_y,
+        "notice_size": notice_size,
+        "notice_background": False,
+        "notice_shadow": 0,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -216,11 +318,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cut-at", type=float)
     parser.add_argument("--benefit-text", default="0元免费看全集")
-    parser.add_argument("--risk-text", default="本故事纯属虚构")
-    parser.add_argument("--ai-text", default="视频由AI生成")
+    title_group = parser.add_mutually_exclusive_group(required=True)
+    title_group.add_argument("--source-title-present", action="store_true")
+    title_group.add_argument("--title-text")
+    risk_group = parser.add_mutually_exclusive_group(required=True)
+    risk_group.add_argument("--source-risk-present", action="store_true")
+    risk_group.add_argument("--risk-text")
+    ai_group = parser.add_mutually_exclusive_group(required=True)
+    ai_group.add_argument("--source-ai-present", action="store_true")
+    ai_group.add_argument("--ai-text")
     parser.add_argument("--font-file", type=Path)
+    parser.add_argument("--title-font-size", type=int)
     parser.add_argument("--benefit-font-size", type=int)
     parser.add_argument("--notice-font-size", type=int)
+    parser.add_argument("--title-bottom", type=int)
+    parser.add_argument("--title-y", type=int)
+    parser.add_argument("--benefit-y", type=int)
+    parser.add_argument("--notice-y", type=int)
+    parser.add_argument("--title-color", default="FFF4C2")
     parser.add_argument("--benefit-color", default="FFE12B")
     parser.add_argument("--notice-color", default="FFFFFF")
     parser.add_argument("--crf", type=int, default=18)
@@ -282,38 +397,48 @@ def main() -> int:
     tail_duration = duration_of(tail_probe, tail_video)
     font = discover_font(args.font_file)
 
-    benefit_size = args.benefit_font_size or max(24, round(height * 0.025))
-    notice_size = args.notice_font_size or max(14, round(height * 0.0125))
+    overlay_plan = resolve_overlay_plan(args, width, height)
     border = max(2, round(height * 0.0015))
+    notice_border = max(1, min(2, round(height * 0.001)))
     body_video_filters = [
         f"trim=start=0:end={cut_at:.6f}",
         "setpts=PTS-STARTPTS",
         f"scale={width}:{height}:flags=lanczos",
     ]
+    if overlay_plan["added_title_text"]:
+        body_video_filters.append(
+            drawtext(
+                font=font,
+                text=overlay_plan["added_title_text"],
+                size=overlay_plan["title_size"],
+                color=args.title_color,
+                x="(w-text_w)/2",
+                y=str(overlay_plan["title_y"]),
+                border=border,
+            )
+        )
     if args.benefit_text:
         body_video_filters.append(
             drawtext(
                 font=font,
                 text=args.benefit_text,
-                size=benefit_size,
+                size=overlay_plan["benefit_size"],
                 color=args.benefit_color,
                 x="(w-text_w)/2",
-                y=f"{max(20, round(height * 0.04))}",
+                y=str(overlay_plan["benefit_y"]),
                 border=border,
             )
         )
-    notice_text = " · ".join(text for text in (args.risk_text, args.ai_text) if text)
-    if notice_text:
+    if overlay_plan["notice_text"]:
         body_video_filters.append(
             drawtext(
                 font=font,
-                text=notice_text,
-                size=notice_size,
+                text=overlay_plan["notice_text"],
+                size=overlay_plan["notice_size"],
                 color=args.notice_color,
                 x="(w-text_w)/2",
-                y=f"h-text_h-{max(10, round(height * 0.015))}",
-                border=max(1, border - 1),
-                box=True,
+                y=overlay_plan["notice_y"],
+                border=notice_border,
             )
         )
     body_video_filters.extend([f"fps={fps}", "setsar=1", "format=yuv420p"])
@@ -433,6 +558,21 @@ def main() -> int:
         "duration": abs(output_duration - expected_duration) <= duration_tolerance,
         "video_codec": bool(output_video and output_video.get("codec_name") == "h264"),
         "audio_codec": bool(output_audio and output_audio.get("codec_name") == "aac"),
+        "title_present_exactly_once": (
+            overlay_plan["source_title_present"] != bool(overlay_plan["added_title_text"])
+        ),
+        "title_benefit_separation": (
+            not args.benefit_text
+            or overlay_plan["benefit_y"]
+            >= overlay_plan["title_bottom"] + overlay_plan["title_gap"]
+        ),
+        "fiction_notice_not_duplicated": (
+            overlay_plan["source_risk_present"] != bool(overlay_plan["added_risk_text"])
+        ),
+        "ai_notice_not_duplicated": (
+            overlay_plan["source_ai_present"] != bool(overlay_plan["added_ai_text"])
+        ),
+        "notice_background_disabled": not overlay_plan["notice_background"],
     }
     status = "passed" if all(checks.values()) else "failed"
     manifest_path = (
@@ -451,11 +591,31 @@ def main() -> int:
         "source_orientation": source_orientation,
         "copy": {
             "benefit": args.benefit_text,
-            "fiction_risk": args.risk_text,
-            "ai_notice": args.ai_text,
+            "title_added": overlay_plan["added_title_text"],
+            "fiction_risk_added": overlay_plan["added_risk_text"],
+            "ai_notice_added": overlay_plan["added_ai_text"],
+        },
+        "source_overlay_audit": {
+            "title_present": overlay_plan["source_title_present"],
+            "risk_notice_present": overlay_plan["source_risk_present"],
+            "ai_notice_present": overlay_plan["source_ai_present"],
+        },
+        "overlay_layout": {
+            "title_y": overlay_plan["title_y"],
+            "title_bottom": overlay_plan["title_bottom"],
+            "title_benefit_gap": overlay_plan["title_gap"],
+            "benefit_y": overlay_plan["benefit_y"],
+            "notice_y": overlay_plan["notice_y"],
+            "notice_background": False,
+            "notice_border": notice_border,
+            "notice_shadow": 0,
         },
         "font_file": str(font),
-        "font_sizes": {"benefit": benefit_size, "notice": notice_size},
+        "font_sizes": {
+            "title": overlay_plan["title_size"],
+            "benefit": overlay_plan["benefit_size"],
+            "notice": overlay_plan["notice_size"],
+        },
         "expected_duration_seconds": expected_duration,
         "output": str(output),
         "output_probe": output_probe,

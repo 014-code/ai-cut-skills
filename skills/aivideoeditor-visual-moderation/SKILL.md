@@ -1,6 +1,6 @@
 ---
 name: aivideoeditor-visual-moderation
-description: Visual and dialogue content moderation workflow for AIVideoEditor image, video, video-frame, OCR, subtitle, ASR, and masking/redaction safety checks. Use when Codex needs to design, implement, test, or refine picture/frame violation detection, video moderation, multimodal moderation, LangGraph/LangChain moderation orchestration, mosaic masking, audio mute, subtitle replacement, or policies for real military-sensitive, real ID document, credential, NSFW, nudity, sexual, or vulgar visual/dialogue risks.
+description: Visual, dialogue, and provider-backed content moderation workflow for AIVideoEditor image, video, video-frame, OCR, subtitle, ASR, masking/redaction, and Aliyun Green CIP video moderation checks. Use when Codex needs to design, implement, test, or refine picture/frame violation detection, video moderation, 阿里云视频审核/视频审核增强版/Green VideoModeration, review-mask-rereview loops, multimodal moderation, LangGraph/LangChain orchestration, mosaic masking, audio mute, subtitle replacement, or policies for real military-sensitive, real ID document, credential, NSFW, nudity, sexual, or vulgar visual/dialogue risks.
 ---
 
 # AIVideoEditor Visual Moderation
@@ -32,6 +32,8 @@ When asked to implement, debug, or test moderation:
 6. For image tests, prefer sidecar JSON or an OpenAI-compatible VLM endpoint; do not hardcode credentials.
 7. If risky visual or dialogue evidence is detected, emit redaction targets and create masked outputs only from those targets.
 8. Add or update regression fixtures whenever a policy rule changes.
+
+For Aliyun Green CIP provider review or review-mask-rereview loops, read `references/aliyun_green_video.md` and use `scripts/run_aliyun_video_moderation.py` or `scripts/run_aliyun_review_mask_rereview.py`.
 
 ## Backend Integration Guidance
 
@@ -114,5 +116,27 @@ Create masked image copies when the decision contains visual redaction targets:
 ```powershell
 python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_visual_moderation.py .\frame.jpg --provider dashscope --model qwen3-vl-flash --mask-output-dir .\masked
 ```
+
+Run Aliyun Green CIP video moderation, visual-only normalized policy by default:
+
+```powershell
+$env:ALIBABA_CLOUD_ACCESS_KEY_ID = "..."
+$env:ALIBABA_CLOUD_ACCESS_KEY_SECRET = "..."
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_video_moderation.py `
+  --video .\input.mp4 `
+  --poll `
+  --output .\aliyun_green_report.json
+```
+
+Run Aliyun review -> scoped visual masking -> re-review:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_review_mask_rereview.py `
+  --video .\input.mp4 `
+  --output-dir .\aliyun_rereview `
+  --output .\aliyun_rereview\flow_report.json
+```
+
+Both Aliyun scripts ignore audio/dialogue evidence by default. Add `--include-audio` only when the user explicitly wants audio mute or subtitle replacement behavior.
 
 The image script uses standard library HTTP calls and optional LangGraph orchestration. If `langgraph` is unavailable, it falls back to the same sequential node order. The video script uses OpenCV for sampling and preview masking, including dynamic `bbox_keyframes` for moving mosaic targets. Default NSFW localization uses NudeNet for exposed/suggestive body-part candidates, MediaPipe Pose for chest/torso/pelvis constraints or gated fallback, and simple track smoothing to avoid fixed or jittery mosaics. OpenCV preview videos are visual-only; backend production export should translate `ffmpeg_plan` into ffmpeg filters to preserve audio and apply `audio_mute` spans. Never hardcode API keys into the skill or backend repository.
