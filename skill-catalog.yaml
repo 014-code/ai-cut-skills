@@ -135,7 +135,7 @@
     },
     "edit-short-drama-packaging": {
       "category": "production",
-      "summary": "为短剧增加利益点、风险提示、AI 提示并替换匹配尾板。",
+      "summary": "审查或补齐短剧剧名，避让利益点，去重无背景风险/AI提示并替换匹配尾板。",
       "requires": [],
       "optional": [
         "setup-video-editing-environment"

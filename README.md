@@ -27,7 +27,7 @@
 
 - `aivideoeditor-pre-roll`：独立本地前贴视频渲染，覆盖资产清单、Logo 选择、字幕模式、免责声明和预检，不依赖远程服务。
 - `edit-soda-music-video`：汽水音乐竖屏数字人口播混剪，覆盖素材理解、去气口、Whisper 字幕、BGM、合规、品牌布局、导出和正式交付 QA。
-- `edit-short-drama-packaging`：短剧轻包装，覆盖免费利益点、风险提示、AI 生成提示、原尾板替换和横竖屏尾板拼接。
+- `edit-short-drama-packaging`：短剧轻包装，覆盖剧名审查与补齐、利益点避让、风险/AI 提示去重、无背景提示语、原尾板替换和横竖屏尾板拼接。
 
 ### 5. 衍生加工
 
