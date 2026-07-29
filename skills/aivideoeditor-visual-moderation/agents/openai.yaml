@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIVideoEditor Visual Moderation"
+  short_description: "Visual safety, masking, and Aliyun video review"
+  default_prompt: "Use $aivideoeditor-visual-moderation to run visual moderation, masking, or Aliyun Green video review for military, ID document, and NSFW risks."
