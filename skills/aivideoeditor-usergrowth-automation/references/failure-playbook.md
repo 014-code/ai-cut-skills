@@ -7,6 +7,9 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - Normal dry-run success
   Read `<output-root>/<timestamp>_<task-name>/task.json`, `run.log`, and `result.xlsx`.
 
+- Normal multi-batch success or partial failure
+  Read `<output-root>/batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log` first. Then open each child batch's `task_json`/`run_log` or `error_json`/`error_log` paths listed in the aggregate summary.
+
 - Normal live success or per-order platform failure
   Read `<output-root>/<timestamp>_<task-name>/task.json` and `run.log`. For browser/platform failures, also read `debug/run.log` and the newest `debug/*.png`/`debug/*.txt`.
 
@@ -29,6 +32,7 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - `debug/<name>.txt`: page URL and body text at the failing browser step.
 - `debug/<name>.png`: full-page screenshot at the failing browser step.
 - `duplicate_songs.xlsx`: duplicate song-name records relevant to the selected batch, when duplicates are found.
+- `batch_runs/<timestamp>_<task-name>/batch_summary.json`: aggregate multi-batch result with per-batch status, child task folder paths, selected counts, and error log pointers.
 
 ## Common Failures
 
@@ -77,10 +81,13 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - Excel save failure
   Check whether Excel/WPS has the workbook open. The runner lock does not solve external file locks.
 
+- Batch manifest failure
+  Check whether `batches` is a non-empty array, each batch has `video_folder`, `order_id`, and one of `videos`, `video_globs`, `video_list`, or `all_videos=true`. For unmatched selectors, read CLI stderr and `<output-root>/_cli_errors/`.
+
 ## High-Risk Gotchas
 
 - UI state currently persists `account` and `password`; avoid expanding this pattern.
 - Live upload writes directly to the original backfill Excel after each successful order.
 - Existing CID rows are intentionally preserved; new rows start at the first empty CID row.
-- Browser defaults currently use the first item for all selected items via one-click reuse.
-- Planner/backfill month tag can differ from live browser tags because `_fill_card_defaults` does not pass `config.month_tag`.
+- Multi-batch live mode can open multiple browser instances. Keep `concurrency` conservative if the machine or platform session is unstable.
+- Browser tag fill uses each item's planner values. It only uses one-click reuse when tags are identical or when non-song-ID tags are identical and `gq_id` is appended per card afterward.

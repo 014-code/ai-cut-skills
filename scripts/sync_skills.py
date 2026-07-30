@@ -17,6 +17,23 @@ from typing import Any, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CATALOG = REPO_ROOT / "skill-catalog.yaml"
 DEFAULT_SKILLS_DIR = REPO_ROOT / "skills"
+LOW_SIGNAL_TERMS = {
+    "skill",
+    "ad",
+    "video",
+    "videos",
+    "file",
+    "files",
+    "task",
+    "tasks",
+    "需要",
+    "只需要",
+    "视频",
+    "素材",
+    "生成",
+    "输出",
+    "处理",
+}
 
 
 class CatalogError(RuntimeError):
@@ -42,6 +59,30 @@ class SyncStats:
             "unchanged": self.unchanged,
             "deleted": self.deleted,
             "directories_created": self.directories_created,
+        }
+
+
+@dataclass
+class RouteCandidate:
+    skill_name: str
+    score: float
+    match_score: float
+    negative_score: float
+    quality_score: float
+    capability_path: list[str]
+    reasons: list[str]
+    negative_reasons: list[str]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "skill": self.skill_name,
+            "score": round(self.score, 4),
+            "match_score": round(self.match_score, 4),
+            "negative_score": round(self.negative_score, 4),
+            "quality_score": round(self.quality_score, 4),
+            "capability_path": self.capability_path,
+            "reasons": self.reasons,
+            "negative_reasons": self.negative_reasons,
         }
 
 
@@ -74,6 +115,24 @@ def require_string_list(value: Any, field: str) -> list[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
         raise CatalogError(f"{field} must be a list of non-empty strings")
     return value
+
+
+def require_optional_string_list(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    return require_string_list(value, field)
+
+
+def require_optional_quality(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise CatalogError(f"{field} must be an object")
+    for metric_name, metric_value in value.items():
+        if metric_name not in {"confidence", "success_rate"}:
+            raise CatalogError(f"{field}.{metric_name} is not supported")
+        if not isinstance(metric_value, (int, float)) or not 0 <= metric_value <= 1:
+            raise CatalogError(f"{field}.{metric_name} must be a number from 0 to 1")
 
 
 def validate_catalog(catalog: dict[str, Any], skills_dir: Path) -> None:
@@ -121,6 +180,9 @@ def validate_catalog(catalog: dict[str, Any], skills_dir: Path) -> None:
             raise CatalogError(f"skill {skill_name} references unknown category: {category}")
         if not isinstance(metadata.get("summary"), str) or not metadata["summary"]:
             raise CatalogError(f"skill {skill_name} is missing summary")
+        for field in ("capability_path", "tags", "when_to_use", "when_not_use", "inputs", "outputs"):
+            require_optional_string_list(metadata.get(field), f"skills.{skill_name}.{field}")
+        require_optional_quality(metadata.get("quality"), f"skills.{skill_name}.quality")
         for field in ("requires", "optional", "next_stage"):
             references = require_string_list(metadata.get(field), f"skills.{skill_name}.{field}")
             unknown = sorted(set(references) - catalog_names)
@@ -181,6 +243,159 @@ def choose_skills(
         for skill_name in initially_selected:
             add_dependencies(skill_name)
     return [skill_name for skill_name in skills if skill_name in selected]
+
+
+def normalize_text(value: str) -> str:
+    return " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
+
+
+def split_terms(value: str) -> list[str]:
+    normalized = normalize_text(value)
+    separators = " \t\r\n,.;:，。；：、/\\|()[]{}<>\"'`"
+    current = []
+    terms = []
+    for character in normalized:
+        if character in separators:
+            if current:
+                terms.append("".join(current))
+                current = []
+            continue
+        current.append(character)
+    if current:
+        terms.append("".join(current))
+    return [term for term in terms if len(term) >= 2 and term not in LOW_SIGNAL_TERMS]
+
+
+def add_weighted_matches(
+    *,
+    query: str,
+    phrases: Iterable[str],
+    weight: float,
+    label: str,
+    reasons: list[str],
+) -> float:
+    score = 0.0
+    seen = set(reasons)
+    normalized_query = normalize_text(query)
+    for phrase in phrases:
+        normalized_phrase = normalize_text(phrase)
+        if not normalized_phrase:
+            continue
+        reason = f"{label}: {phrase}"
+        if normalized_phrase in normalized_query:
+            score += weight
+            if reason not in seen:
+                reasons.append(reason)
+                seen.add(reason)
+            continue
+        term_hits = [term for term in split_terms(normalized_phrase) if term in normalized_query]
+        if term_hits:
+            score += weight * min(1.0, 0.35 * len(term_hits))
+            term_reason = f"{label}: {'/'.join(term_hits)}"
+            if term_reason not in seen:
+                reasons.append(term_reason)
+                seen.add(term_reason)
+    return score
+
+
+def metadata_quality(metadata: dict[str, Any]) -> float:
+    quality = metadata.get("quality") or {}
+    if not quality:
+        return 1.0
+    metrics = [
+        float(quality[metric_name])
+        for metric_name in ("confidence", "success_rate")
+        if metric_name in quality
+    ]
+    if not metrics:
+        return 1.0
+    return sum(metrics) / len(metrics)
+
+
+def route_skills(catalog: dict[str, Any], query: str, *, top: int = 5) -> list[RouteCandidate]:
+    if not query.strip():
+        raise CatalogError("route query cannot be empty")
+    if top <= 0:
+        raise CatalogError("top must be greater than 0")
+
+    candidates = []
+    categories = catalog["categories"]
+    for skill_name, metadata in catalog["skills"].items():
+        category = metadata["category"]
+        category_text = [category, categories[category]["label"]]
+        capability_path = metadata.get("capability_path", [])
+        reasons: list[str] = []
+        negative_reasons: list[str] = []
+
+        match_score = 0.0
+        match_score += add_weighted_matches(
+            query=query,
+            phrases=[skill_name, metadata["summary"], *category_text],
+            weight=1.0,
+            label="summary",
+            reasons=reasons,
+        )
+        match_score += add_weighted_matches(
+            query=query,
+            phrases=capability_path,
+            weight=1.4,
+            label="capability",
+            reasons=reasons,
+        )
+        match_score += add_weighted_matches(
+            query=query,
+            phrases=metadata.get("tags", []),
+            weight=1.6,
+            label="tag",
+            reasons=reasons,
+        )
+        match_score += add_weighted_matches(
+            query=query,
+            phrases=metadata.get("when_to_use", []),
+            weight=2.2,
+            label="when_to_use",
+            reasons=reasons,
+        )
+        match_score += add_weighted_matches(
+            query=query,
+            phrases=metadata.get("inputs", []),
+            weight=0.8,
+            label="input",
+            reasons=reasons,
+        )
+        match_score += add_weighted_matches(
+            query=query,
+            phrases=metadata.get("outputs", []),
+            weight=0.8,
+            label="output",
+            reasons=reasons,
+        )
+
+        negative_score = add_weighted_matches(
+            query=query,
+            phrases=metadata.get("when_not_use", []),
+            weight=2.5,
+            label="when_not_use",
+            reasons=negative_reasons,
+        )
+        quality_score = metadata_quality(metadata)
+        score = max(match_score - negative_score, 0.0) * quality_score
+        if score > 0:
+            candidates.append(
+                RouteCandidate(
+                    skill_name=skill_name,
+                    score=score,
+                    match_score=match_score,
+                    negative_score=negative_score,
+                    quality_score=quality_score,
+                    capability_path=capability_path,
+                    reasons=reasons[:6],
+                    negative_reasons=negative_reasons[:4],
+                )
+            )
+
+    candidates.sort(key=lambda candidate: (-candidate.score, -candidate.match_score, candidate.skill_name))
+    return candidates[:top]
 
 
 def default_runtime_skills_dir(environment_name: str, fallback_directory: str) -> Path:
@@ -354,6 +569,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-dependencies", action="store_true", help="Do not include required Skill dependencies.")
     parser.add_argument("--check", action="store_true", help="Validate the catalog and exit.")
     parser.add_argument("--list", action="store_true", help="List categories and skills, then exit.")
+    parser.add_argument("--route", help="Rank candidate skills for a user intent, then exit.")
+    parser.add_argument("--top", type=int, default=5, help="Candidate count for --route.")
     return parser.parse_args()
 
 
@@ -381,6 +598,20 @@ def main() -> int:
         return 0
     if args.list:
         print_catalog(catalog)
+        return 0
+    if args.route:
+        candidates = route_skills(catalog, args.route, top=args.top)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "query": args.route,
+                    "candidates": [candidate.as_dict() for candidate in candidates],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
 
     selected = choose_skills(

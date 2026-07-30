@@ -1,13 +1,13 @@
 ---
 name: aivideoeditor-pre-roll
-description: Create pre-roll videos with the standalone local runner. Use when Codex needs to preview, troubleshoot, or locally render a pre-roll/front-ad video from ad copy, visual type, asset strategy, subtitle placement, disclaimer text, required project/workspace logo and explicit 方正兰亭/Soda font file paths, auto-selecting light/dark logo variants from background brightness, local asset manifest understanding, or optional Ark/Seedance/TTS credentials and voice choices.
+description: Create pre-roll videos with the standalone local runner. Use when Codex needs to preview, troubleshoot, or locally render a pre-roll/front-ad video from ad copy, visual type, asset strategy, subtitle placement, disclaimer text, required project/workspace logo image assets, auto-selecting light/dark logo variants from background brightness, local asset manifest understanding, or Ark/Seedance/TTS credentials and voice choices; when AI-generated video is requested, require a user-provided AI video generation API key before rendering.
 ---
 
 # AIVideoEditor Pre-roll
 
 Use the standalone local runner bundled with this skill. This skill is designed for local rendering without any server connection or login.
 
-Material assets must come from the caller's current project/workspace. Do not assume the material folder has any fixed name; search the opened workspace/project and common roots such as `storage/temp`, `assets`, `materials`, `素材`, and `物料` for folders containing real Soda Music logos, SodaFont/方正兰亭 fonts, coin/reward screenshots, and body/overlay materials. Pass the discovered project paths explicitly through `--logo-light-path`, `--logo-dark-path`, `--subtitle-logo-path`, `--fonts-dir`, `--asset-root`, and `--asset-manifest`. This skill does not bundle business materials, logos, or pre-roll fonts.
+Material assets should come from the caller's current project/workspace first. Do not assume the material folder has any fixed name; search the opened workspace/project and common roots such as `storage/temp`, `assets`, `materials`, `素材`, and `物料` for folders containing real Soda Music logos, SodaFont/方正兰亭 fonts, coin/reward screenshots, and body/overlay materials. Pass the discovered project paths explicitly through `--logo-light-path`, `--logo-dark-path`, `--subtitle-logo-path`, `--fonts-dir`, `--asset-root`, and `--asset-manifest`. Any material package inside the skill directory is only a compatibility fallback for local experiments, not the normal source of business material.
 
 ## Hard Rules
 
@@ -15,14 +15,16 @@ Material assets must come from the caller's current project/workspace. Do not as
 - The persistent Soda Music logo is required and fixed at the top-left: crop transparent padding, render the real logo at 190px wide, x=40, y=40, opacity 1.0. Do not disable it or vary its size/position per request.
 - Every deliverable video must include the persistent top-left Soda Music logo and the bottom-right visual-only disclaimer. These two layers are mandatory even when the user only asks for a quick test, disables main subtitles, or provides a custom payload.
 - Deliverable videos must have real visual content. Do not use color blocks, procedural test animations, blank clips, or other placeholder footage as the main video.
+- For any pre-roll that will create or replace the visual source with AI-generated video (`assetStrategy=generated`, Seedance/Ark video generation, or any equivalent AI video provider), require a current user-provided AI video generation API key before rendering. Ask the user for the key if it is not present in the current request or current environment (`ARK_API_KEY` / `AIVIDEOEDITOR_ARK_API_KEY`), and stop instead of rendering.
+- Do not silently switch an AI-generated-video request to scraped, local, procedural, or bundled fallback footage because the key is missing. Only use scraped/local visuals without an AI video key when the user explicitly chose that non-AI source strategy.
+- Treat API keys as secrets: never hard-code them into scripts, configs, manifests, logs, final answers, or persisted skill files. Pass them through environment variables or runtime CLI arguments, and do not reuse a key remembered from an earlier conversation unless the user provides it again or it is already available in the current environment.
 - When revising an unsatisfactory video, always restart from a clean/uncomposited source video such as `baseVideoPath`, `revisionSourcePath`, `generatedVideoPath`, `scrapedVideoPath`, `imageVideoPath`, `backgroundVideo`, or `backgroundImage`. Do not use `finalVideoPath`, `final.mp4`, or any clip that already contains subtitles, logos, disclaimers, motion effects, BGM mixing, or overlays as the next input.
 - Copy/subtitles must not contain `红包` or `花不完`; do not send those words to voiceover.
 - Generated voiceover must use Edge Neural TTS. Do not use Windows SAPI, local system voices, silent fallback, or robotic/default voices. Use lively Chinese Edge voices such as `zh-CN-XiaoyiNeural`, `zh-CN-XiaoxiaoNeural`, `zh-CN-YunxiNeural`, `zh-CN-YunxiaNeural`, `zh-CN-liaoning-XiaobeiNeural`, and `zh-CN-shaanxi-XiaoniNeural`. If Edge TTS is unavailable, fail and ask for `edge-tts` installation or an approved lively `--voiceover-path`.
 - Main voiceover and main subtitles must use the exact same cleaned `scriptText`. Do not rebuild subtitle text from TTS/provider frontend text; only use provider timestamps to align timing. The visual-only disclaimer is separate and must not be spoken.
-- Rendered main subtitles must remove sentence punctuation at the final display step only. Preserve punctuation that carries numeric meaning, including decimal points, time colons, date/range separators, negative signs, and thousands separators. Do not remove punctuation before voiceover generation, subtitle splitting, timing alignment, or cue ordering.
+- Rendered main subtitles must remove punctuation at the final display step only. Do not remove punctuation before voiceover generation, subtitle splitting, timing alignment, or cue ordering.
 - Main subtitles must be rendered exactly once. Use the default `--subtitle-render-mode burn` only when no animated subtitle layer will be applied. When using `subtitle-motion-effects` or any external animated subtitle layer, run this pre-roll runner with `--subtitle-render-mode motion`; this suppresses the original ASS main subtitles while preserving timing data and the mandatory bottom-right disclaimer.
 - Main subtitles must render `汽水音乐` and `汽水` with SodaFont, brand green `#3BFD42`, black outline, and a slightly larger scale by default. Other main subtitle text should use 方正兰亭.
-- Every production render must receive both `--body-font-path` and `--brand-font-path` as real `.ttf`/`.otf`/`.ttc` files. `--fonts-dir` is optional and cannot replace either explicit path. The ASS `--body-font-name` and `--brand-font-name` must match the selected files' real internal family names; never allow FFmpeg to fall back silently to Arial, Verdana, or another system font. Dry-run may omit paths only to inspect the generated plan, and must report the missing requirements.
 - The visual-only disclaimer defaults to clear white `Microsoft YaHei` with a black outline. Do not apply subtitle motion effects to the disclaimer.
 - When main subtitles contain `汽水音乐` or `汽水`, keep the normal subtitle font rule and additionally place a real logo/icon above that subtitle line.
 - Ordinary overlay/insert materials should render below the main subtitle/disclaimer layers. Prefer fixing layer order over moving captions; only use `keywordMaterialOverlay.avoidSubtitleArea=true` when the material should also stay physically away from the caption area.
@@ -100,10 +102,6 @@ python scripts\run_pre_roll_standalone.py --script-text "打开汽水音乐，�
   --logo-light-path "D:\assets\logo\汽水logo-白色竖版.png" `
   --logo-dark-path "D:\assets\logo\汽水logo-黑色竖版.png" `
   --subtitle-logo-path "D:\assets\logo\汽水图标.png" `
-  --body-font-path "D:\assets\fonts\方正兰亭中粗黑简体.TTF" `
-  --body-font-name "FZLanTingHeiS-DB1-GB" `
-  --brand-font-path "D:\assets\fonts\SodaFont-Regular.otf" `
-  --brand-font-name "Soda Font" `
   --subtitle-logo-width-ratio 0.18
 ```
 
@@ -125,7 +123,7 @@ Standalone mode can:
 
 - use a caller-supplied background video or image
 - preserve the clean background as the revision source so later edits can recompose from a fresh base
-- optionally call Ark/Seedance with `--ark-api-key`
+- call Ark/Seedance with `--ark-api-key` only after the user provides a current AI video generation API key; `assetStrategy=generated` must not run without one
 - optionally call an OpenAI/Ark-compatible image API with `--image-api-key` for `assetStrategy=generated_image`, then convert the still image into a video background
 - generate subtitles and a visual-only disclaimer locally
 - overlay a caller-supplied logo image on every render
@@ -146,7 +144,7 @@ Recommended inputs:
 
 - `--script-text`
 - `--visual-template-id`
-- `--asset-strategy generated` with `--ark-api-key`, `--asset-strategy generated_image` with `--image-api-key`, or `--asset-strategy local_video/local_image/scraped` with a real background source
+- `--asset-strategy generated` with a current user-provided `--ark-api-key` or `ARK_API_KEY` / `AIVIDEOEDITOR_ARK_API_KEY`, `--asset-strategy generated_image` with `--image-api-key`, or `--asset-strategy local_video/local_image/scraped` with a real background source
 - `--image-model`, `--image-size`, and `--image-base-url` when using generated static images
 - `--background-video` or `--background-image` or `--background-url`
 - `--asset-root` and `--asset-manifest` when extra local visual files are used
@@ -155,10 +153,9 @@ Recommended inputs:
 - `--voiceover-path`, or default Edge Neural TTS through `--tts-engine edge`
 - `--logo-path`, or `--logo-light-path` plus `--logo-dark-path`
 - `--subtitle-logo-path` when you want a specific real icon above subtitles that contain `汽水音乐` or `汽水`
+- `--no-bundled-assets` only as a compatibility/debug option; normal renders should first find project/workspace material paths and pass them explicitly
 - `--no-subtitle-logo-enabled` to disable that subtitle-triggered logo layer
-- required `--body-font-path` plus `--brand-font-path`; use absolute paths unless the current working directory is deliberately fixed
-- matching `--body-font-name` and `--brand-font-name`; the default pair is `FZLanTingHeiS-DB1-GB` and `Soda Font`
-- optional `--fonts-dir` for additional font discovery; it never replaces the two explicit font files
+- `--fonts-dir`, or `--body-font-path` plus `--brand-font-path`
 - `--edge-voice` or `--voice-name` if you want one lively voice or a small voice pool, for example `zh-CN-XiaoyiNeural|zh-CN-XiaoxiaoNeural|zh-CN-YunxiNeural`; default Edge settings use `--edge-rate +12%` and `--edge-pitch +3Hz`
 - `--subtitle-position`
 - `--subtitle-render-mode burn` for normal built-in subtitles, or `--subtitle-render-mode motion` before applying `subtitle-motion-effects`; never overlay animated subtitles onto a video whose pre-roll JSON says `mainSubtitleBurned: true`
@@ -169,7 +166,7 @@ Recommended inputs:
 - `--disclaimer-text`; this customizes the mandatory bottom-right disclaimer text and cannot disable it
 - `--output`
 
-Before rendering, search the current project/workspace for real Soda Music logo variants, the subtitle-triggered icon, Soda Font and the required 方正兰亭字重, then pass those paths explicitly. If both light and dark logo variants are available, pass `--logo-light-path` and `--logo-dark-path` so the runner can pick the right one for the background. The selected caller-provided logo path must exist in the Manifest when `--asset-preflight required` is active. Do not search for or rely on business materials inside the skill directory. The shared `subtitle-motion-effects` Skill includes a verified 方正兰亭 font catalog, but callers must still pass the selected file's resolved path to this runner.
+Before rendering, search the current project/workspace for real Soda Music logo variants and the subtitle-triggered icon, then pass those paths explicitly. If both light and dark logo variants are available, pass `--logo-light-path` and `--logo-dark-path` so the runner can pick the right one for the background. The selected caller-provided logo path must exist in the Manifest when `--asset-preflight required` is active. Use skill-directory assets only as a last-resort compatibility fallback for local experiments.
 
 Do not use `--brand-text` as a logo replacement.
 

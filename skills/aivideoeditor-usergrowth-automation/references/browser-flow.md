@@ -32,31 +32,36 @@ Upload retry has two layers:
 
 ## Chameleon Entry And Tags
 
-After upload cards are ready, the browser clicks `继续编辑`, `确认提交`, selects all creative units, clicks `录入素材`, waits for a page containing `投放平台`/`汽水音乐`, confirms the delivery modal, then calls `_fill_card_defaults(page, items[0])`.
+After upload cards are ready, the browser clicks `继续编辑`, `确认提交`, selects all creative units, clicks `录入素材`, waits for a page containing `投放平台`/`汽水音乐`, confirms the delivery modal, then fills the first material card and uses `一键复用`.
 
-Batch guarantees:
+Chameleon tag strategy:
 
-- The planner splits one order into separate plans for each distinct `(classification_path, custom_tags)` profile.
-- `items[0]` drives the card defaults only after that homogeneous grouping; `一键复用` therefore applies the same intended values to the whole plan.
-- `_fill_card_defaults` consumes `item.classification_path` and `item.custom_tags` directly. It must not recompute them from the filename.
-- A caller-supplied `month_tag` is already part of the planned custom tags and is preserved in live browser entry.
+- The browser layer assumes one upload batch contains one song/type combination, so all selected material cards can share the first card's tags.
+- Fill the first card with defaults and custom tags, then click `一键复用` -> `全选` -> `一键复用`, then `提交` -> `查看任务详情`.
+- Do not put different songs into one browser upload batch unless the upstream planner/UI has split them first.
+
+Important current assumptions:
+
+- Browser filling uses the first active item in the batch as the source for shared classification/custom tags. Upstream batching must keep each browser batch homogeneous.
 
 Default form choices:
 
 - `请选择UGC内容` -> `不包含`.
 - Cascader `汽水音乐-素材类型` -> `汽水音乐-素材类型 / LUNA_剪辑制作 / LUNA_自产`.
 - Cascader `LUNA素材来源` -> `LUNA素材来源 / LUNA_千沧代理`.
-- Cascader `LUNA功能卖点` -> `LUNA功能卖点 / <item.classification_path>`.
-- Custom tags from `item.custom_tags`.
+- Cascader `LUNA功能卖点` -> `LUNA功能卖点 / <classification_path_for_material(file)>`.
+- Custom tags from `item.custom_tags`, with a fallback to `custom_tags_for_material`.
 - Radio `未成年人内容` -> `已授权`.
 - Radio `影视内容` -> `已授权`.
-- `一键复用` -> `全选` -> `一键复用` -> `提交` -> `查看任务详情`.
+- `一键复用` -> `全选` -> `一键复用`, then `提交` -> `查看任务详情`.
 
 ## Review And CID Backfill
 
 `_submit_review` clicks `送审`, confirms `确定`, then optionally clicks `查看任务详情`.
 
 `_fill_cids_for_task` searches the task by ID, waits for row success, opens `素材/文案列表查看` or related text, reads CIDs from the global search input, and requires at least as many CIDs as items. It zips item order with CID order.
+
+If task status keeps refreshing for a long time without reaching `全部成功`, the browser can first open `查看详情`, read CIDs, write them back to Excel, and mark the row note as `未送审`. This is a backup path, not the normal success path.
 
 Fallback CID reading clicks `查看详情`, tries `一键复制对象id`, then extracts CIDs from body text. `_read_material_type_by_cid` opens `查看素材` for the CID row and extracts `分类标签` for backfill material type.
 

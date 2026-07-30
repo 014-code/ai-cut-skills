@@ -6,7 +6,7 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .usergrowth_browser import UserGrowthBrowserClient
 from .usergrowth_excel import write_back_results
@@ -25,6 +25,22 @@ _BACKFILL_LOCKS_GUARD = threading.Lock()
 _BACKFILL_LOCKS: dict[str, threading.Lock] = {}
 
 
+def _clamp_batch_concurrency(value: Any, batch_count: int) -> int:
+    """多批任务必须并行；默认按批次数启动，最高 10 个 worker。"""
+    safe_batch_count = max(int(batch_count or 0), 1)
+    if value is None or str(value).strip() == "":
+        requested_workers = safe_batch_count
+    else:
+        try:
+            requested_workers = int(value)
+        except (TypeError, ValueError):
+            requested_workers = safe_batch_count
+    worker_count = max(1, min(requested_workers, 10, safe_batch_count))
+    if safe_batch_count > 1:
+        worker_count = max(2, worker_count)
+    return worker_count
+
+
 def run_usergrowth_batches(
         configs: list[UserGrowthRunConfig],
         *,
@@ -35,11 +51,7 @@ def run_usergrowth_batches(
     """并发执行多批 UserGrowth 任务；每批独立浏览器，同一回填 Excel 串行写入。"""
     if not configs:
         return []
-    try:
-        requested_workers = int(concurrency or 1)
-    except (TypeError, ValueError):
-        requested_workers = 10
-    worker_count = max(1, min(requested_workers, 10, len(configs)))
+    worker_count = _clamp_batch_concurrency(concurrency, len(configs))
     results: list[UserGrowthBatchResult | None] = [None] * len(configs)
 
     def run_one(index: int, config: UserGrowthRunConfig) -> UserGrowthBatchResult:
@@ -116,7 +128,10 @@ def run_usergrowth_task(
     duplicate_song_excel = task_root / "duplicate_songs.xlsx"
     task_root.mkdir(parents=True, exist_ok=True)
 
-    _emit(progress, "正在扫描视频文件夹并读取 Excel")
+    if config.selected_video_paths:
+        _emit(progress, f"正在读取已拆分批次：{len(config.selected_video_paths)} 个视频")
+    else:
+        _emit(progress, "正在扫描视频文件夹并读取 Excel")
     _raise_if_cancelled(cancel_event)
     plans, items = build_usergrowth_plan(config, duplicate_song_output_path=duplicate_song_excel)
     _raise_if_cancelled(cancel_event)
@@ -126,6 +141,7 @@ def run_usergrowth_task(
     ready_count = sum(1 for item in items if item.status != "skipped")
     skipped_count = sum(1 for item in items if item.status == "skipped")
     _emit(progress, f"预检完成：待上传 {ready_count} 个，跳过 {skipped_count} 个")
+    _emit_song_match_logs(progress, items)
 
     if config.dry_run:
         _raise_if_cancelled(cancel_event)
@@ -195,11 +211,15 @@ def _build_payload(
         "mode": "dry_run" if config.dry_run else "browser_upload",
         "config": {
             "video_folder": str(config.video_folder),
+            "batch_name": config.batch_name,
+            "selected_videos": [str(path) for path in config.selected_video_paths],
             "backfill_excel": str(config.order_excel),
             "song_excel": str(config.song_excel),
             "output_root": str(config.output_root),
             "order_id": config.order_id,
             "task_name": config.task_name,
+            "custom_tag_template_name": config.custom_tag_template_name,
+            "custom_tag_template_tags": list(config.custom_tag_template_tags),
             "month_tag": config.month_tag,
             "recursive": config.recursive,
             "dry_run": config.dry_run,
@@ -226,6 +246,7 @@ def _write_log(task_root: Path, payload: dict) -> None:
         f"task_id: {payload['task_id']}",
         f"mode: {payload['mode']}",
         f"video_folder: {payload['config']['video_folder']}",
+        f"batch_name: {payload['config'].get('batch_name', '')}",
         f"backfill_excel: {payload['config']['backfill_excel']}",
         f"song_excel: {payload['config']['song_excel']}",
         f"order_id: {payload['config']['order_id']}",
@@ -237,6 +258,16 @@ def _write_log(task_root: Path, payload: dict) -> None:
         "[summary]",
     ]
     lines.extend(f"{key}: {value}" for key, value in payload["summary"].items())
+    selected_videos = payload["config"].get("selected_videos") or []
+    if selected_videos:
+        lines.append("")
+        lines.append("[selected_videos]")
+        lines.extend(str(path) for path in selected_videos)
+    lines.append("")
+    lines.append("[song_matches]")
+    for plan in payload["plans"]:
+        for item in plan["items"]:
+            lines.append(f"  {_song_match_log_line(item)}")
     lines.append("")
     lines.append("[items]")
     for plan in payload["plans"]:
@@ -253,6 +284,32 @@ def _write_log(task_root: Path, payload: dict) -> None:
     (task_root / "run.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _emit_song_match_logs(progress: ProgressCallback | None, items: list[UserGrowthVideoItem]) -> None:
+    """把每个素材是否匹配到歌曲 ID 打印到 UI/CLI 进度日志。"""
+    for item in items:
+        _emit(progress, _song_match_log_line(item))
+
+
+def _song_match_log_line(item: UserGrowthVideoItem | dict[str, Any]) -> str:
+    """格式化单个素材的歌曲 ID 匹配结果。"""
+    file_name = str(_item_value(item, "file_name"))
+    material_type = str(_item_value(item, "material_type"))
+    song_name = str(_item_value(item, "song_name"))
+    song_id = str(_item_value(item, "song_id"))
+    message = str(_item_value(item, "song_match_message") or _item_value(item, "message"))
+    if material_type in {"金币VIP", "金币SVIP"}:
+        return f"歌曲匹配跳过：{file_name} | 素材类型={material_type} | {message or '不需要歌曲 ID'}"
+    if song_id:
+        return f"歌曲匹配成功：{file_name} | 歌曲={song_name or '-'} | ID={song_id} | {message or '匹配成功'}"
+    return f"歌曲匹配未命中：{file_name} | 识别歌曲={song_name or '-'} | {message or '未填写歌曲 ID'}"
+
+
+def _item_value(item: UserGrowthVideoItem | dict[str, Any], key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, "")
+    return getattr(item, key, "")
+
+
 def _safe_name(value: str) -> str:
     """把任务名转换为可用于文件夹名称的安全字符串。"""
     cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value.strip())
@@ -261,7 +318,8 @@ def _safe_name(value: str) -> str:
 
 def _batch_label(index: int, config: UserGrowthRunConfig) -> str:
     order = config.order_id or f"批次{index + 1}"
-    return f"{index + 1}:{order}"
+    suffix = f":{config.batch_name}" if config.batch_name else ""
+    return f"{index + 1}:{order}{suffix}"
 
 
 def _backfill_lock(path: Path) -> threading.Lock:
