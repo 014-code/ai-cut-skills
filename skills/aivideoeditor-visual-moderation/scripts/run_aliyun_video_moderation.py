@@ -16,9 +16,27 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-POLICY_VERSION = "visual-moderation-baseline-2026-07-28"
+POLICY_VERSION = "visual-moderation-baseline-2026-07-29"
 ACTION_RANK = {"PASS": 0, "REVIEW": 1, "BLOCK": 2}
-CATEGORY_SCORE_KEYS = ("military", "id_document", "nsfw")
+CATEGORY_SCORE_KEYS = ("military", "political", "nsfw")
+
+CATEGORY_DISPLAY_NAMES = {
+    "military": "涉军",
+    "political": "涉政",
+    "nsfw": "色情/低俗",
+}
+
+LABEL_DISPLAY_OVERRIDES = {
+    "sexual_cleavage": "乳沟",
+    "sexual_partialnudity": "肢体裸露或性感",
+    "sexual_nudity": "裸露",
+    "sexual_porn": "色情",
+    "sexual_behavior": "性行为",
+    "political_taintedcelebrity": "涉政公众人物",
+    "political_figure": "涉政人物",
+    "military_uniform": "涉军制服",
+    "military_weapon": "涉军武器",
+}
 
 RISK_TO_ACTION = {
     "none": "PASS",
@@ -52,20 +70,42 @@ NSFW_KEYWORDS = (
     "低俗",
 )
 
-ID_KEYWORDS = (
-    "id",
-    "identity",
-    "credential",
-    "certificate",
-    "passport",
-    "driver",
-    "license",
-    "card",
-    "身份证",
-    "护照",
-    "证件",
-    "证书",
-    "驾驶证",
+POLITICAL_KEYWORDS = (
+    "political",
+    "politics",
+    "government",
+    "party",
+    "election",
+    "leader",
+    "official",
+    "president",
+    "prime minister",
+    "parliament",
+    "national emblem",
+    "national flag",
+    "protest",
+    "demonstration",
+    "separatism",
+    "sovereignty",
+    "territorial",
+    "涉政",
+    "政治",
+    "政府",
+    "政党",
+    "选举",
+    "领导人",
+    "官员",
+    "总统",
+    "总理",
+    "国徽",
+    "国旗",
+    "党徽",
+    "游行",
+    "示威",
+    "抗议",
+    "分裂",
+    "主权",
+    "领土",
 )
 
 MILITARY_KEYWORDS = (
@@ -148,11 +188,130 @@ def classify_label(label: str, description: str = "") -> List[str]:
     categories: List[str] = []
     if any(keyword.lower() in text for keyword in NSFW_KEYWORDS):
         categories.append("nsfw")
-    if any(keyword.lower() in text for keyword in ID_KEYWORDS):
-        categories.append("id_document")
+    if any(keyword.lower() in text for keyword in POLITICAL_KEYWORDS):
+        categories.append("political")
     if any(keyword.lower() in text for keyword in MILITARY_KEYWORDS):
         categories.append("military")
     return categories
+
+
+def normalize_time(value: float) -> float:
+    return round(max(0.0, float(value)), 3)
+
+
+def format_seconds(value: float) -> str:
+    text = f"{float(value):.1f}".rstrip("0").rstrip(".")
+    return f"{text} 秒"
+
+
+def readable_violation_name(category: str, label: str, description: str = "") -> str:
+    lowered_label = label.lower()
+    lowered_description = description.lower()
+    if lowered_label in LABEL_DISPLAY_OVERRIDES:
+        return LABEL_DISPLAY_OVERRIDES[lowered_label]
+    if "乳沟" in description or "cleavage" in lowered_label or "cleavage" in lowered_description:
+        return "乳沟"
+    if description:
+        return description
+    return CATEGORY_DISPLAY_NAMES.get(category, label or category)
+
+
+def unique_sorted_times(times: Iterable[float]) -> List[float]:
+    return sorted({normalize_time(value) for value in times})
+
+
+def build_time_ranges(times: Iterable[float], max_gap: float = 1.25) -> List[Dict[str, float]]:
+    sorted_times = unique_sorted_times(times)
+    if not sorted_times:
+        return []
+    ranges: List[Dict[str, float]] = []
+    start = previous = sorted_times[0]
+    for value in sorted_times[1:]:
+        if value - previous <= max_gap:
+            previous = value
+            continue
+        ranges.append({"start_time": normalize_time(start), "end_time": normalize_time(previous)})
+        start = previous = value
+    ranges.append({"start_time": normalize_time(start), "end_time": normalize_time(previous)})
+    return ranges
+
+
+def build_violation_groups(points: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+    for point in points:
+        key = (
+            str(point.get("source") or ""),
+            str(point.get("modality") or ""),
+            str(point.get("category") or ""),
+            str(point.get("label") or ""),
+            str(point.get("name") or ""),
+        )
+        group = grouped.setdefault(
+            key,
+            {
+                "source": point.get("source"),
+                "modality": point.get("modality"),
+                "category": point.get("category"),
+                "category_name": CATEGORY_DISPLAY_NAMES.get(str(point.get("category") or ""), point.get("category")),
+                "name": point.get("name"),
+                "label": point.get("label"),
+                "description": point.get("description"),
+                "service": point.get("service"),
+                "time_points": [],
+                "time_ranges": [],
+                "segments": [],
+                "count": 0,
+                "max_confidence": 0.0,
+            },
+        )
+        group["count"] += 1
+        group["max_confidence"] = max(float(group["max_confidence"]), float(point.get("confidence") or 0.0))
+        if "time_seconds" in point:
+            group["time_points"].append(float(point["time_seconds"]))
+        if "start_time" in point or "end_time" in point:
+            group["segments"].append(
+                {
+                    "start_time": normalize_time(float(point.get("start_time") or 0.0)),
+                    "end_time": normalize_time(float(point.get("end_time") or point.get("start_time") or 0.0)),
+                }
+            )
+
+    result: List[Dict[str, Any]] = []
+    for group in grouped.values():
+        time_points = unique_sorted_times(group["time_points"])
+        group["time_points"] = time_points
+        group["time_ranges"] = build_time_ranges(time_points)
+        group["segments"] = sorted(
+            group["segments"],
+            key=lambda item: (float(item["start_time"]), float(item["end_time"])),
+        )
+        group["max_confidence"] = round(float(group["max_confidence"]), 4)
+        result.append(group)
+    return sorted(
+        result,
+        key=lambda item: (
+            str(item.get("category") or ""),
+            str(item.get("name") or ""),
+            item["time_points"][0] if item.get("time_points") else 10**9,
+        ),
+    )
+
+
+def build_violation_summary_text(groups: Iterable[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for group in groups:
+        name = str(group.get("name") or group.get("label") or "违规")
+        if group.get("time_points"):
+            times = "、".join(format_seconds(value) for value in group["time_points"])
+            lines.append(f"{name}命中时间点: {times}")
+            continue
+        if group.get("segments"):
+            segments = "、".join(
+                f"{format_seconds(item['start_time'])}-{format_seconds(item['end_time'])}"
+                for item in group["segments"]
+            )
+            lines.append(f"{name}命中时间段: {segments}")
+    return "\n".join(lines)
 
 
 def iter_frame_hits(frame_result: Dict[str, Any]) -> Iterable[Tuple[float, str, str, str, float]]:
@@ -211,6 +370,7 @@ def summarize_result(raw_body: Dict[str, Any], *, include_audio: bool = False) -
     labels: List[str] = []
     dialogue: List[Dict[str, Any]] = []
     redactions: List[Dict[str, Any]] = []
+    violation_points: List[Dict[str, Any]] = []
     scores = {key: 0.0 for key in CATEGORY_SCORE_KEYS}
     categories = set()
     actions = ["PASS"]
@@ -227,14 +387,27 @@ def summarize_result(raw_body: Dict[str, Any], *, include_audio: bool = False) -
         for category in hit_categories:
             categories.add(category)
             scores[category] = max(scores[category], confidence)
+            violation_points.append(
+                {
+                    "source": "aliyun_green_video",
+                    "modality": "frame",
+                    "category": category,
+                    "category_name": CATEGORY_DISPLAY_NAMES.get(category, category),
+                    "name": readable_violation_name(category, label, description),
+                    "label": label,
+                    "description": description,
+                    "service": service,
+                    "time_seconds": normalize_time(offset),
+                    "confidence": round(confidence, 4),
+                }
+            )
             redactions.append(
                 {
-                    "type": "visual_mosaic",
+                    "type": "visual_localization_required",
                     "category": category,
-                    "reason": f"Aliyun video moderation label={label}; description={description}".strip(),
+                    "reason": f"Aliyun video moderation label={label}; description={description}. Provider gave a risky time window but no localizable bbox.".strip(),
                     "start_time": max(0.0, offset - 0.5),
                     "end_time": offset + 0.5,
-                    "region": "full_frame",
                     "source": "aliyun_green_video",
                     "detector_label": label,
                     "detector_score": round(confidence, 4),
@@ -261,38 +434,52 @@ def summarize_result(raw_body: Dict[str, Any], *, include_audio: bool = False) -
         for category in hit_categories:
             categories.add(category)
             scores[category] = max(scores[category], confidence)
-            if category == "nsfw":
-                redactions.append(
-                    {
-                        "type": "audio_mute",
-                        "category": category,
-                        "reason": f"Aliyun audio moderation label={label}; description={description}".strip(),
-                        "start_time": max(0.0, start_time),
-                        "end_time": max(start_time, end_time),
-                        "source": "aliyun_green_audio",
-                        "detector_label": label,
-                        "detector_score": round(confidence, 4),
-                    }
-                )
-                redactions.append(
-                    {
-                        "type": "subtitle_replace",
-                        "category": category,
-                        "reason": f"Aliyun audio moderation label={label}; description={description}".strip(),
-                        "start_time": max(0.0, start_time),
-                        "end_time": max(start_time, end_time),
-                        "replacement": "[已处理]",
-                        "source": "aliyun_green_audio",
-                        "detector_label": label,
-                        "detector_score": round(confidence, 4),
-                    }
-                )
+            violation_points.append(
+                {
+                    "source": "aliyun_green_audio",
+                    "modality": "audio",
+                    "category": category,
+                    "category_name": CATEGORY_DISPLAY_NAMES.get(category, category),
+                    "name": readable_violation_name(category, label, description),
+                    "label": label,
+                    "description": description,
+                    "start_time": normalize_time(start_time),
+                    "end_time": normalize_time(end_time),
+                    "text": text[:160],
+                    "confidence": round(confidence, 4),
+                }
+            )
+            redactions.append(
+                {
+                    "type": "audio_mute",
+                    "category": category,
+                    "reason": f"Aliyun audio moderation label={label}; description={description}".strip(),
+                    "start_time": max(0.0, start_time),
+                    "end_time": max(start_time, end_time),
+                    "source": "aliyun_green_audio",
+                    "detector_label": label,
+                    "detector_score": round(confidence, 4),
+                }
+            )
+            redactions.append(
+                {
+                    "type": "subtitle_replace",
+                    "category": category,
+                    "reason": f"Aliyun audio moderation label={label}; description={description}".strip(),
+                    "start_time": max(0.0, start_time),
+                    "end_time": max(start_time, end_time),
+                    "replacement": "[已处理]",
+                    "source": "aliyun_green_audio",
+                    "detector_label": label,
+                    "detector_score": round(confidence, 4),
+                }
+            )
 
     action = strongest_action(actions)
     if categories:
         confidence = max(scores.values())
     else:
-        confidence = RISK_TO_SCORE.get(video_risk, 0.0) or (0.74 if action == "PASS" else 0.55)
+        confidence = 0.74 if action == "PASS" else RISK_TO_SCORE.get(video_risk, 0.55)
 
     reasons = []
     if action == "PASS":
@@ -300,18 +487,36 @@ def summarize_result(raw_body: Dict[str, Any], *, include_audio: bool = False) -
     else:
         reasons.append(f"Aliyun video moderation riskLevel={video_risk}.")
     if unscoped_risks:
-        reasons.append("Aliyun returned non-scoped risk labels that were kept as evidence but not mapped to military/id_document/nsfw.")
+        reasons.append("Aliyun returned non-scoped risk labels that were kept as evidence but not mapped to military/political/nsfw.")
+
+    violation_points = sorted(
+        violation_points,
+        key=lambda item: (
+            0 if item.get("modality") == "frame" else 1,
+            float(item.get("time_seconds") or item.get("start_time") or 0.0),
+            str(item.get("category") or ""),
+            str(item.get("name") or ""),
+            str(item.get("label") or ""),
+        ),
+    )
+    violation_groups = build_violation_groups(violation_points)
+    violation_summary_text = build_violation_summary_text(violation_groups)
 
     return {
         "action": action,
         "categories": sorted(categories),
         "confidence": round(min(1.0, max(0.0, confidence)), 4),
         "reasons": reasons,
+        "violation_points": violation_points,
+        "violation_groups": violation_groups,
+        "violation_summary_text": violation_summary_text,
         "evidence": {
             "scores": {key: round(value, 4) for key, value in scores.items()},
             "labels": labels,
             "ocr": [],
             "dialogue": dialogue,
+            "provider_points": violation_points,
+            "provider_unscoped_hits": unscoped_risks,
             "vision": {
                 "provider": "aliyun_green_cip",
                 "risk_level": video_risk,
@@ -327,6 +532,7 @@ def summarize_result(raw_body: Dict[str, Any], *, include_audio: bool = False) -
 
 class AliyunGreenVideoClient:
     def __init__(self, region_id: str, endpoint: str, is_vpc: bool = False) -> None:
+        ensure_aliyun_websocket_alias()
         from alibabacloud_green20220302.client import Client
         from alibabacloud_tea_openapi.models import Config
 
@@ -411,6 +617,22 @@ def extract_task_id(body: Dict[str, Any]) -> Optional[str]:
     return get_nested(body, "data", "taskId") or get_nested(body, "Data", "TaskId")
 
 
+def ensure_aliyun_websocket_alias() -> None:
+    """Bridge SDK builds that disagree on websocket module casing."""
+    import sys as _sys
+
+    try:
+        from alibabacloud_tea_openapi import websocket_utils as _utils
+        from alibabacloud_tea_openapi import websocket_utils_models as _models
+        import alibabacloud_tea_openapi as _openapi
+    except Exception:
+        return
+    setattr(_openapi, "websocketUtils", _utils)
+    setattr(_openapi, "websocketUtils_models", _models)
+    _sys.modules.setdefault("alibabacloud_tea_openapi.websocketUtils", _utils)
+    _sys.modules.setdefault("alibabacloud_tea_openapi.websocketUtils_models", _models)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--video")
@@ -472,7 +694,17 @@ def main() -> int:
     }
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"task_id": task_id, "action": report["decision"]["action"], "categories": report["decision"]["categories"]}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "action": report["decision"]["action"],
+                "categories": report["decision"]["categories"],
+                "violation_summary_text": report["decision"].get("violation_summary_text", ""),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

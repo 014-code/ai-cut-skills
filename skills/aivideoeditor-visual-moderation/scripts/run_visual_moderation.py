@@ -21,9 +21,19 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-POLICY_VERSION = "visual-moderation-baseline-2026-07-28"
-CATEGORIES = ("military", "id_document", "nsfw")
+POLICY_VERSION = "visual-moderation-baseline-2026-07-29"
+CATEGORIES = ("military", "political", "nsfw")
 ACTION_RANK = {"PASS": 0, "REVIEW": 1, "BLOCK": 2}
+VISUAL_MASK_TYPES = {"visual_mosaic", "visual_blur"}
+LOCAL_VISUAL_MAX_AREA = 0.38
+LOCAL_VISUAL_MAX_WIDTH = 0.94
+LOCAL_VISUAL_MAX_HEIGHT = 0.78
+NSFW_BODY_PART_MAX_AREA = 0.28
+NSFW_BODY_PART_MAX_WIDTH = 0.78
+NSFW_BODY_PART_MAX_HEIGHT = 0.62
+FULL_FRAME_AREA = 0.82
+FULL_FRAME_WIDTH = 0.96
+FULL_FRAME_HEIGHT = 0.88
 
 MILITARY_KEYWORDS = (
     "military",
@@ -98,19 +108,40 @@ FICTIONAL_CONTEXT_KEYWORDS = (
     "漫剧",
 )
 
-ID_KEYWORDS = (
-    "id card",
-    "identity",
-    "passport",
-    "driver license",
-    "credential",
-    "certificate",
-    "permit",
-    "身份证",
-    "护照",
-    "驾驶证",
-    "证件",
-    "证书",
+POLITICAL_KEYWORDS = (
+    "political",
+    "politics",
+    "government",
+    "party",
+    "election",
+    "president",
+    "prime minister",
+    "parliament",
+    "ministry",
+    "official",
+    "national emblem",
+    "national flag",
+    "political slogan",
+    "protest",
+    "demonstration",
+    "涉政",
+    "政治",
+    "政府",
+    "政党",
+    "选举",
+    "总统",
+    "首相",
+    "总理",
+    "议会",
+    "部长",
+    "官员",
+    "国徽",
+    "国旗",
+    "党徽",
+    "政治口号",
+    "游行",
+    "示威",
+    "抗议",
 )
 
 NSFW_KEYWORDS = (
@@ -143,9 +174,43 @@ SOFT_NSFW_KEYWORDS = (
     "擦边",
 )
 
-ID_NUMBER_RE = re.compile(r"(?<!\d)(?:\d{15}|\d{17}[\dXx])(?!\d)")
-PHONE_NUMBER_RE = re.compile(r"\b1[3-9]\d{9}\b")
 MILITARY_UNIT_RE = re.compile(r"(?:第?\d{2,4}(?:集团军|部队|旅|师|团|营)|\d{5,}部队)")
+REAL_POLITICAL_KEYWORDS = (
+    "communist party",
+    "state council",
+    "public security bureau",
+    "central committee",
+    "state leader",
+    "political propaganda",
+    "separatism",
+    "sovereignty",
+    "territorial dispute",
+    "sensitive political event",
+    "中国共产党",
+    "共产党",
+    "中华人民共和国",
+    "国务院",
+    "中央委员会",
+    "国家主席",
+    "总书记",
+    "国家领导人",
+    "政府机关",
+    "公安局",
+    "法院",
+    "检察院",
+    "政治宣传",
+    "分裂国家",
+    "台独",
+    "港独",
+    "藏独",
+    "疆独",
+    "主权争议",
+    "领土争议",
+    "敏感政治事件",
+)
+POLITICAL_OFFICE_RE = re.compile(
+    r"(?:国家主席|总书记|国务院总理|外交部|公安部|国防部|人民代表大会|政协|政府机关|党委|纪委|法院|检察院)"
+)
 
 
 def clamp_score(value: Any) -> float:
@@ -259,14 +324,18 @@ def normalize_signals(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     score_aliases = {
         "military": ("military", "military_score", "weapon", "gun", "uniform", "insignia"),
-        "id_document": (
-            "id_document",
-            "id_score",
-            "id_card",
-            "passport",
-            "driver_license",
-            "credential",
-            "certificate",
+        "political": (
+            "political",
+            "political_score",
+            "politics",
+            "government",
+            "party",
+            "election",
+            "leader",
+            "official",
+            "flag",
+            "emblem",
+            "protest",
         ),
         "nsfw": ("nsfw", "nsfw_score", "nudity", "nude", "porn", "sexual", "adult"),
     }
@@ -286,14 +355,17 @@ def normalize_signals(payload: Dict[str, Any]) -> Dict[str, Any]:
     real_military_hit = contains_any(all_text, REAL_MILITARY_KEYWORDS) or any(
         MILITARY_UNIT_RE.search(text) for text in all_text
     )
+    real_political_hit = contains_any(all_text, REAL_POLITICAL_KEYWORDS) or any(
+        POLITICAL_OFFICE_RE.search(text) for text in all_text
+    )
     if contains_any(labels, MILITARY_KEYWORDS) and not fictional_context:
         merge_score(scores, "military", 0.62)
     if real_military_hit:
         merge_score(scores, "military", 0.78)
-    if contains_any(all_text, ID_KEYWORDS):
-        merge_score(scores, "id_document", 0.72)
-    if any(ID_NUMBER_RE.search(text) for text in all_text):
-        merge_score(scores, "id_document", 0.9)
+    if contains_any(all_text, POLITICAL_KEYWORDS) and not fictional_context:
+        merge_score(scores, "political", 0.62)
+    if real_political_hit:
+        merge_score(scores, "political", 0.78)
     if contains_any(all_text, NSFW_KEYWORDS):
         merge_score(scores, "nsfw", 0.68)
 
@@ -315,6 +387,7 @@ def normalize_signals(payload: Dict[str, Any]) -> Dict[str, Any]:
         "dialogue_segments": dialogue_segments,
         "fictional_context": fictional_context,
         "real_military_hit": real_military_hit,
+        "real_political_hit": real_political_hit,
         "vision": vision or None,
     }
 
@@ -338,8 +411,8 @@ def stronger_action(current: str, candidate: str) -> str:
 def sensitive_text_snippets(texts: Iterable[str], category: str) -> List[str]:
     snippets = []
     for text in texts:
-        if category == "id_document":
-            if contains_any([text], ID_KEYWORDS) or ID_NUMBER_RE.search(text) or PHONE_NUMBER_RE.search(text):
+        if category == "political":
+            if contains_any([text], POLITICAL_KEYWORDS) or contains_any([text], REAL_POLITICAL_KEYWORDS) or POLITICAL_OFFICE_RE.search(text):
                 snippets.append(text)
         elif category == "military":
             if contains_any([text], REAL_MILITARY_KEYWORDS) or MILITARY_UNIT_RE.search(text):
@@ -363,6 +436,92 @@ def normalize_bbox(value: Any) -> Optional[List[float]]:
     if x2 <= x1 or y2 <= y1:
         return None
     return [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)]
+
+
+def bbox_dimensions(bbox: List[float]) -> Tuple[float, float, float]:
+    width = max(0.0, bbox[2] - bbox[0])
+    height = max(0.0, bbox[3] - bbox[1])
+    return width, height, width * height
+
+
+def local_visual_bbox_rejection_reason(bbox: Any, category: Optional[str] = None) -> Optional[str]:
+    normalized = normalize_bbox(bbox)
+    if not normalized:
+        return "missing reliable bbox"
+    width, height, area = bbox_dimensions(normalized)
+    if area >= FULL_FRAME_AREA or (width >= FULL_FRAME_WIDTH and height >= FULL_FRAME_HEIGHT):
+        return "bbox is full-frame sized"
+    if category == "nsfw":
+        if area > NSFW_BODY_PART_MAX_AREA or width > NSFW_BODY_PART_MAX_WIDTH or height > NSFW_BODY_PART_MAX_HEIGHT:
+            return "NSFW bbox is too broad; only the exposed/suggestive body part may be masked"
+    elif area > LOCAL_VISUAL_MAX_AREA or width > LOCAL_VISUAL_MAX_WIDTH or height > LOCAL_VISUAL_MAX_HEIGHT:
+        return "visual bbox is too broad for targeted masking"
+    return None
+
+
+def is_local_visual_bbox(bbox: Any, category: Optional[str] = None) -> bool:
+    return local_visual_bbox_rejection_reason(bbox, category) is None
+
+
+def sanitize_visual_redaction(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(item)
+    rtype = normalized.get("type")
+    if rtype not in VISUAL_MASK_TYPES:
+        return normalized
+
+    category = normalized.get("category")
+    if normalized.get("region") == "full_frame":
+        normalized["type"] = "visual_localization_required"
+        normalized["reason"] = (
+            str(normalized.get("reason") or "Visual mask needs localization.")
+            + " Full-frame visual masking is prohibited."
+        )
+        normalized.pop("bbox", None)
+        normalized.pop("bbox_keyframes", None)
+        normalized.pop("keyframes", None)
+        return normalized
+
+    bbox = normalize_bbox(normalized.get("bbox"))
+    bbox_reason = local_visual_bbox_rejection_reason(bbox, category) if bbox else "missing reliable bbox"
+    if bbox and bbox_reason is None:
+        normalized["bbox"] = bbox
+        return normalized
+
+    keyframes = []
+    rejected_keyframes = 0
+    for raw_keyframe in normalized.get("bbox_keyframes") or normalized.get("keyframes") or []:
+        if not isinstance(raw_keyframe, dict):
+            rejected_keyframes += 1
+            continue
+        timestamp = raw_keyframe.get("time")
+        if timestamp is None:
+            timestamp = raw_keyframe.get("timestamp")
+        keyframe_bbox = normalize_bbox(raw_keyframe.get("bbox"))
+        if timestamp is None or not keyframe_bbox or local_visual_bbox_rejection_reason(keyframe_bbox, category):
+            rejected_keyframes += 1
+            continue
+        keyframes.append({"time": round(float(timestamp), 3), "bbox": keyframe_bbox})
+    if keyframes:
+        normalized["bbox_keyframes"] = sorted(keyframes, key=lambda keyframe: keyframe["time"])
+        normalized.pop("keyframes", None)
+        normalized.pop("bbox", None)
+        if rejected_keyframes:
+            normalized["reason"] = (
+                str(normalized.get("reason") or "Visual mask target was localized.")
+                + f" Dropped {rejected_keyframes} over-broad keyframe(s)."
+            )
+        return normalized
+
+    reason = bbox_reason or "bbox_keyframes are missing or too broad"
+    normalized["type"] = "visual_localization_required"
+    normalized["reason"] = (
+        str(normalized.get("reason") or "Visual mask needs localization.")
+        + f" {reason}; no visual mask is emitted."
+    )
+    normalized.pop("bbox", None)
+    normalized.pop("bbox_keyframes", None)
+    normalized.pop("keyframes", None)
+    return normalized
 
 
 def vision_redaction_targets(vision: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -394,7 +553,7 @@ def vision_redaction_targets(vision: Optional[Dict[str, Any]]) -> List[Dict[str,
             redaction["start_time"] = target.get("start_time")
         if target.get("end_time") is not None:
             redaction["end_time"] = target.get("end_time")
-        targets.append(redaction)
+        targets.append(sanitize_visual_redaction(redaction))
     return targets
 
 
@@ -442,20 +601,30 @@ def build_redactions(action: str, categories: List[str], signals: Dict[str, Any]
                 }
             )
 
-    has_visual_target = any(item.get("type") in {"visual_mosaic", "visual_blur"} for item in redactions)
+    has_visual_target = any(
+        item.get("type") in VISUAL_MASK_TYPES
+        and (
+            is_local_visual_bbox(item.get("bbox"), item.get("category"))
+            or any(
+                is_local_visual_bbox(keyframe.get("bbox"), item.get("category"))
+                for keyframe in item.get("bbox_keyframes") or []
+                if isinstance(keyframe, dict)
+            )
+        )
+        for item in redactions
+    )
     has_visual_or_ocr_evidence = bool(signals.get("labels") or signals.get("ocr") or signals.get("vision"))
     if (
         not has_visual_target
         and has_visual_or_ocr_evidence
         and action == "BLOCK"
-        and any(hit.startswith(("nsfw.", "id_document.", "military.")) for hit in policy_hits)
+        and any(hit.startswith(("nsfw.", "political.", "military.")) for hit in policy_hits)
     ):
         redactions.append(
             {
-                "type": "visual_mosaic",
+                "type": "visual_localization_required",
                 "category": categories[0] if categories else "unknown",
-                "reason": "Confirmed block decision without a reliable bounding box; mask the full frame in prototype output.",
-                "region": "full_frame",
+                "reason": "Confirmed block decision without a reliable bounding box; full-frame masking is prohibited.",
             }
         )
     return redactions
@@ -473,20 +642,36 @@ def policy_decision(signals: Dict[str, Any]) -> Dict[str, Any]:
     action = "PASS"
     confidence = 0.74
 
-    id_keyword_hit = contains_any(all_text, ID_KEYWORDS)
-    id_number_hit = any(ID_NUMBER_RE.search(text) for text in all_text)
-    if scores["id_document"] >= 0.85 or (id_keyword_hit and id_number_hit):
+    real_political_hit = bool(signals.get("real_political_hit"))
+    fictional_context = bool(signals.get("fictional_context"))
+    visual_political_hit = contains_any(labels, POLITICAL_KEYWORDS)
+    political_block_hit = contains_any(
+        all_text,
+        (
+            "political propaganda",
+            "separatism",
+            "territorial dispute",
+            "state secret",
+            "政治宣传",
+            "分裂国家",
+            "主权争议",
+            "领土争议",
+            "国家机密",
+            "煽动",
+        ),
+    )
+    if political_block_hit or (scores["political"] >= 0.85 and real_political_hit):
         action = stronger_action(action, "BLOCK")
-        categories.append("id_document")
-        confidence = max(confidence, scores["id_document"], 0.92)
-        reasons.append("Real identity or credential evidence is high confidence.")
-        policy_hits.append("id_document.block.high_confidence_or_ocr")
-    elif scores["id_document"] >= 0.55 or id_keyword_hit:
+        categories.append("political")
+        confidence = max(confidence, scores["political"], 0.9)
+        reasons.append("Concrete real-world political-sensitive content is high confidence.")
+        policy_hits.append("political.block.real_world_sensitive_or_propaganda")
+    elif real_political_hit or (scores["political"] >= 0.55 and visual_political_hit and not fictional_context):
         action = stronger_action(action, "REVIEW")
-        categories.append("id_document")
-        confidence = max(confidence, scores["id_document"], 0.72)
-        reasons.append("Possible real identity or credential document requires review.")
-        policy_hits.append("id_document.review.possible_document")
+        categories.append("political")
+        confidence = max(confidence, scores["political"], 0.7)
+        reasons.append("Possible concrete real-world political-sensitive evidence requires review.")
+        policy_hits.append("political.review.real_symbol_leader_or_event")
 
     explicit_nsfw = contains_any(all_text, ("porn", "genitals", "sexual act", "sexual service", "裸体", "色情", "性行为"))
     if scores["nsfw"] >= 0.85 or explicit_nsfw:
@@ -503,7 +688,6 @@ def policy_decision(signals: Dict[str, Any]) -> Dict[str, Any]:
         policy_hits.append("nsfw.review.suggestive_or_medium_confidence")
 
     real_military_hit = bool(signals.get("real_military_hit"))
-    fictional_context = bool(signals.get("fictional_context"))
     visual_military_hit = contains_any(labels, MILITARY_KEYWORDS)
     propaganda_hit = contains_any(all_text, ("recruitment", "propaganda", "combat", "battle", "军事宣传", "征兵", "战斗"))
     if scores["military"] >= 0.85 and (propaganda_hit or real_military_hit):
@@ -566,9 +750,9 @@ def mock_payload_from_name(path: Path) -> Dict[str, Any]:
     if any(token in name for token in ("military", "army", "soldier", "weapon", "jun", "gun")):
         cv["military"] = 0.78
         labels.extend(["military uniform", "weapon"])
-    if any(token in name for token in ("id", "passport", "credential", "shenfenzheng")):
-        cv["id_document"] = 0.88
-        cv["ocr"] = ["ID card", "110101199001011234"]
+    if any(token in name for token in ("political", "politics", "government", "leader", "shezhen", "shezheng")):
+        cv["political"] = 0.88
+        cv["ocr"] = ["政治宣传", "国家领导人讲话"]
     if any(token in name for token in ("nsfw", "nude", "porn", "sexual")):
         cv["nsfw"] = 0.9
         labels.append("nudity")
@@ -627,15 +811,25 @@ def call_openai_compatible_vision(
         "Inspect this image only for these scoped risks: "
         "1) concrete real-world military-sensitive content, such as real units, uniforms, insignia, weapons, "
         "vehicles, maps, operations, recruitment, propaganda, bases, or secrets; "
-        "2) real ID/credential documents or private identity numbers; "
+        "2) concrete real-world political-sensitive content, such as real political leaders, party/government "
+        "organs, state emblems or flags, political slogans, protests, separatism, sovereignty or territorial "
+        "dispute content, propaganda, or sensitive political events; "
         "3) sexual/NSFW content. "
         "Read visible overlay text, OCR text, and subtitles when possible. "
         "Do not treat fictional, historical, game, anime, costume, or generic ancient city-defense scenes as "
-        "military violations unless real-world identifiers are present. "
+        "military or political violations unless real-world identifiers are present. "
         "Return strict JSON with keys: categories, scores, risk_level, confidence, reason, evidence, "
-        "redaction_targets. Categories must be only military, id_document, nsfw. Scores must be 0 to 1. "
+        "redaction_targets. Categories must be only military, political, nsfw. Scores must be 0 to 1. "
         "redaction_targets should include type, category, reason, and normalized bbox [x1,y1,x2,y2] when a "
-        "visual or text region needs mosaic. Do not decide the final PASS/REVIEW/BLOCK business policy."
+        "visual or text region needs mosaic. For nsfw redaction targets, never target the face, whole person, "
+        "whole chest, belly, covered buttocks, or ordinary low-cut clothing. Only return a visual nsfw target "
+        "for explicit exposed intimate parts or an obvious central cleavage groove/gap; for obvious cleavage, "
+        "treat visible cleavage, a visible chest gap, or a deep V opening with a clear central groove as REVIEW and "
+        "return a narrow strip around the middle groove, not the whole breast area, clothing, money, props, "
+        "subtitles, or the body outline. Do not return PASS when the crop or frame clearly shows a cleavage "
+        "groove/gap, even if nipples are covered; ordinary low-cut clothing without a clear groove should not "
+        "produce an nsfw redaction target. "
+        "Do not decide the final PASS/REVIEW/BLOCK business policy."
     )
     payload = {
         "model": model,
@@ -785,14 +979,14 @@ def built_in_cases() -> List[Dict[str, Any]]:
             },
         },
         {
-            "name": "id_block",
+            "name": "political_block",
             "expected_action": "BLOCK",
-            "expected_category": "id_document",
+            "expected_category": "political",
             "payload": {
                 "cv": {
-                    "id_document": 0.91,
-                    "labels": ["ID card"],
-                    "ocr": ["身份证", "110101199001011234"],
+                    "political": 0.91,
+                    "labels": ["national emblem", "political slogan"],
+                    "ocr": ["政治宣传", "国家领导人讲话"],
                 }
             },
         },
@@ -809,7 +1003,7 @@ def built_in_cases() -> List[Dict[str, Any]]:
             "expected_action": "PASS",
             "expected_category": None,
             "payload": {
-                "cv": {"military": 0.05, "id_document": 0.0, "nsfw": 0.04, "labels": ["city street"]}
+                "cv": {"military": 0.05, "political": 0.0, "nsfw": 0.04, "labels": ["city street"]}
             },
         },
         {
@@ -819,8 +1013,8 @@ def built_in_cases() -> List[Dict[str, Any]]:
             "payload": {
                 "cv": {"labels": ["ancient watchtower", "horse", "period attire"], "ocr": ["热门漫剧 纯属虚构 请勿模仿"]},
                 "vision": {
-                    "categories": ["military", "id_document", "nsfw"],
-                    "scores": {"military": 0.1, "id_document": 0.0, "nsfw": 0.0},
+                    "categories": ["military", "political", "nsfw"],
+                    "scores": {"military": 0.1, "political": 0.0, "nsfw": 0.0},
                     "risk_level": "low",
                     "confidence": 0.98,
                     "reason": "Fictional historical scene without real-world military identifiers.",
@@ -828,15 +1022,15 @@ def built_in_cases() -> List[Dict[str, Any]]:
             },
         },
         {
-            "name": "dialogue_id_block",
+            "name": "dialogue_political_block",
             "expected_action": "BLOCK",
-            "expected_category": "id_document",
+            "expected_category": "political",
             "payload": {
                 "dialogue": [
                     {
                         "start_time": 10.2,
                         "end_time": 12.6,
-                        "text": "我的身份证号码是110101199001011234",
+                        "text": "这里出现政治宣传和分裂国家相关台词",
                     }
                 ]
             },
@@ -855,6 +1049,54 @@ def built_in_cases() -> List[Dict[str, Any]]:
                 ]
             },
         },
+        {
+            "name": "full_frame_visual_mask_is_rejected",
+            "expected_action": "BLOCK",
+            "expected_category": "nsfw",
+            "expected_redaction_type": "visual_localization_required",
+            "forbidden_redaction_type": "visual_mosaic",
+            "payload": {
+                "cv": {"nsfw": 0.91, "labels": ["nudity"]},
+                "vision": {
+                    "categories": ["nsfw"],
+                    "scores": {"nsfw": 0.91},
+                    "risk_level": "high",
+                    "confidence": 0.91,
+                    "reason": "Unsafe visual content.",
+                    "redaction_targets": [
+                        {
+                            "type": "visual_mosaic",
+                            "category": "nsfw",
+                            "reason": "Model gave an over-broad target.",
+                            "bbox": [0, 0, 1, 1],
+                        }
+                    ],
+                },
+            },
+        },
+        {
+            "name": "local_body_part_mask_is_allowed",
+            "expected_action": "REVIEW",
+            "expected_category": "nsfw",
+            "expected_redaction_type": "visual_mosaic",
+            "payload": {
+                "vision": {
+                    "categories": ["nsfw"],
+                    "scores": {"nsfw": 0.72},
+                    "risk_level": "review",
+                    "confidence": 0.72,
+                    "reason": "Localized cleavage-heavy region.",
+                    "redaction_targets": [
+                        {
+                            "type": "visual_mosaic",
+                            "category": "nsfw",
+                            "reason": "Only the exposed chest region needs masking.",
+                            "bbox": [0.42, 0.30, 0.58, 0.45],
+                        }
+                    ],
+                },
+            },
+        },
     ]
 
 
@@ -870,6 +1112,12 @@ def run_self_test(engine: str) -> Dict[str, Any]:
         ok = decision["action"] == case["expected_action"]
         expected_category = case["expected_category"]
         if expected_category and expected_category not in decision["categories"]:
+            ok = False
+        expected_redaction_type = case.get("expected_redaction_type")
+        if expected_redaction_type and not any(item.get("type") == expected_redaction_type for item in decision.get("redactions", [])):
+            ok = False
+        forbidden_redaction_type = case.get("forbidden_redaction_type")
+        if forbidden_redaction_type and any(item.get("type") == forbidden_redaction_type for item in decision.get("redactions", [])):
             ok = False
         if not ok:
             failed += 1
@@ -921,10 +1169,10 @@ def apply_mask_output(input_path: Path, decision: Dict[str, Any], output_dir: Op
         if redaction_type not in {"visual_mosaic", "visual_blur", "text_mosaic"}:
             continue
         bbox = redaction.get("bbox")
+        if redaction_type in VISUAL_MASK_TYPES and not is_local_visual_bbox(bbox, redaction.get("category")):
+            continue
         if bbox:
             mask_targets.append(("bbox", bbox))
-        elif redaction.get("region") == "full_frame":
-            mask_targets.append(("full_frame", None))
 
     if not mask_targets:
         return None
@@ -940,19 +1188,16 @@ def apply_mask_output(input_path: Path, decision: Dict[str, Any], output_dir: Op
         image = image.convert("RGB")
         width, height = image.size
         for kind, bbox in mask_targets:
-            if kind == "full_frame":
-                box = (0, 0, width, height)
-            else:
-                normalized = normalize_bbox(bbox)
-                if not normalized:
-                    continue
-                x1, y1, x2, y2 = normalized
-                box = (
-                    int(round(x1 * width)),
-                    int(round(y1 * height)),
-                    int(round(x2 * width)),
-                    int(round(y2 * height)),
-                )
+            normalized = normalize_bbox(bbox)
+            if not normalized:
+                continue
+            x1, y1, x2, y2 = normalized
+            box = (
+                int(round(x1 * width)),
+                int(round(y1 * height)),
+                int(round(x2 * width)),
+                int(round(y2 * height)),
+            )
             pixelate_region(image, box)
         final_path = output_path / f"{input_path.stem}_masked.jpg"
         image.save(final_path, quality=92)
