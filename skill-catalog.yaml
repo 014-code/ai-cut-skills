@@ -192,7 +192,7 @@
     },
     "adxray-playlet-crawler": {
       "category": "assets",
-      "summary": "从 AdXRay 抖音热播短剧榜筛选、抓取并下载短剧素材视频。",
+      "summary": "从 AdXRay 抖音热播短剧榜筛选、抓取并下载短剧素材视频，下载后交给审核闸门。",
       "capability_path": [
         "Video",
         "Assets",
@@ -242,7 +242,8 @@
       "outputs": [
         "downloaded_playlet_videos",
         "manifest_json",
-        "debug_artifacts"
+        "debug_artifacts",
+        "moderation_handoff"
       ],
       "requires": [],
       "optional": [
@@ -255,7 +256,7 @@
     },
     "aivideoeditor-visual-moderation": {
       "category": "assets",
-      "summary": "对图片、视频帧、OCR、字幕和 ASR 证据执行视觉与对白风险审核。",
+      "summary": "调用阿里云 Green 视频审核增强版，输出涉政、涉军、NSFW 违规信息、命中时间点、过审路由和短剧剪辑闸门。",
       "capability_path": [
         "Video",
         "Analyze",
@@ -268,45 +269,46 @@
         "短剧审核",
         "全流程",
         "视频审核",
-        "图片审核",
-        "OCR",
-        "ASR",
-        "字幕",
-        "证件",
-        "身份证",
+        "阿里云",
+        "Green",
         "NSFW",
+        "乳沟",
         "裸露",
+        "涉政",
         "军事敏感",
-        "LangGraph"
+        "过审",
+        "没过",
+        "allow_short_drama_editing"
       ],
       "when_to_use": [
-        "需要审核图片 视频帧 OCR 字幕或 ASR 风险",
-        "需要在短剧下载后进入包装前审核",
+        "需要调用阿里云视频审核增强版审核本地视频或 URL",
+        "需要在短剧下载后进入包装前做视觉审核闸门",
         "需要跑短剧从下载审核到包装的全流程中的审核阶段",
-        "需要识别证件 军事敏感 NSFW 裸露 低俗等视觉对白风险"
+        "需要输出具体违规标签 命中时间点 原因和过审/未过审文件夹"
       ],
       "when_not_use": [
         "短剧下载",
         "短剧包装",
         "只需要下载短剧素材",
         "只需要生成或包装视频且不需要内容审核",
-        "只需要素材 Manifest 管理"
+        "只需要素材 Manifest 管理",
+        "需要打码 消音 或大模型二次理解"
       ],
       "inputs": [
-        "image_files",
         "video_files",
-        "frame_samples",
-        "ocr_text",
-        "subtitle_file",
-        "asr_transcript",
-        "policy_config"
+        "video_url",
+        "aliyun_credentials_env",
+        "route_dir"
       ],
       "outputs": [
         "moderation_report",
         "decision_schema",
         "violation_points",
         "violation_groups",
-        "violation_summary_text"
+        "violation_summary_text",
+        "pass_fail_routing",
+        "downstream_gate",
+        "audit_logs"
       ],
       "requires": [],
       "optional": [
@@ -544,7 +546,7 @@
     },
     "edit-short-drama-packaging": {
       "category": "production",
-      "summary": "审查或补齐短剧剧名，避让利益点，去重无背景风险/AI提示并替换匹配尾板。",
+      "summary": "只处理过审短剧素材，审查或补齐剧名，避让利益点，去重无背景风险/AI提示并替换匹配尾板。",
       "capability_path": [
         "Video",
         "Production",
@@ -563,6 +565,7 @@
         "竖屏"
       ],
       "when_to_use": [
+        "短剧素材已经在审核 过了 文件夹或 allow_short_drama_editing 为 true",
         "需要给短剧视频添加免费利益点 风险提示 AI 生成提示",
         "需要在短剧下载和审核之后完成包装",
         "需要跑短剧从下载审核到包装的全流程中的包装阶段",
@@ -580,10 +583,12 @@
         "证件",
         "NSFW",
         "需要审核视频风险",
+        "素材在 没过 文件夹或 allow_short_drama_editing 不为 true",
         "需要汽水音乐混剪"
       ],
       "inputs": [
-        "short_drama_video",
+        "moderation_passed_short_drama_video",
+        "moderation_gate_report",
         "tail_board_assets",
         "packaging_copy"
       ],

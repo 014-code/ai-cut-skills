@@ -13,6 +13,7 @@ import os
 import shutil
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -354,8 +355,12 @@ def route_reviewed_video(
 
     passed = decision.get("action") == "PASS"
     target_status = "passed" if passed else "failed"
-    folder_name = passed_folder if passed else failed_folder
-    target_dir = Path(route_dir) / folder_name
+    route_root = Path(route_dir)
+    passed_dir = route_root / passed_folder
+    failed_dir = route_root / failed_folder
+    passed_dir.mkdir(parents=True, exist_ok=True)
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = passed_dir if passed else failed_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = unique_destination_path(target_dir / source.name)
 
@@ -370,7 +375,134 @@ def route_reviewed_video(
         "target_status": target_status,
         "source_path": str(source),
         "target_path": str(target_path),
+        "route_dir": str(route_root),
+        "passed_dir": str(passed_dir),
+        "failed_dir": str(failed_dir),
+        "passed_folder": passed_folder,
+        "failed_folder": failed_folder,
         "decision_action": decision.get("action"),
+        "allow_short_drama_editing": passed,
+    }
+
+
+def build_downstream_gate(decision: Dict[str, Any], routing: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(decision.get("action") or "PASS")
+    allow = action == "PASS"
+    target_status = str(routing.get("target_status") or ("passed" if allow else "failed"))
+    reason = (
+        "Aliyun returned PASS. The routed file in 过了 may enter downstream short-drama editing."
+        if allow
+        else f"Aliyun returned {action}. The routed file stays in 没过 and must not enter downstream short-drama editing."
+    )
+    return {
+        "allow_short_drama_editing": allow,
+        "status": "allowed" if allow else "blocked",
+        "decision_action": action,
+        "reason": reason,
+        "policy": "Only PASS videos may feed downstream short-drama editing.",
+        "source_path": routing.get("source_path"),
+        "target_path": routing.get("target_path"),
+        "target_status": target_status,
+        "route_dir": routing.get("route_dir"),
+        "passed_folder": routing.get("passed_folder"),
+        "failed_folder": routing.get("failed_folder"),
+        "categories": decision.get("categories") or [],
+        "confidence": decision.get("confidence"),
+        "reasons": decision.get("reasons") or [],
+        "violation_summary_text": decision.get("violation_summary_text") or "",
+        "violation_groups": decision.get("violation_groups") or [],
+        "violation_points": decision.get("violation_points") or [],
+        "policy_version": decision.get("policy_version"),
+    }
+
+
+def format_gate_log_text(decision: Dict[str, Any], routing: Dict[str, Any], downstream_gate: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append(f"审核结果: {downstream_gate.get('decision_action')}")
+    lines.append(f"是否允许进入短剧剪辑: {'是' if downstream_gate.get('allow_short_drama_editing') else '否'}")
+    if routing.get("source_path"):
+        lines.append(f"源视频: {routing['source_path']}")
+    if routing.get("target_path"):
+        lines.append(f"路由视频: {routing['target_path']}")
+    if routing.get("route_dir"):
+        lines.append(f"路由目录: {routing['route_dir']}")
+    lines.append(
+        f"结果文件夹: {routing.get('passed_folder') if downstream_gate.get('allow_short_drama_editing') else routing.get('failed_folder')}"
+    )
+    categories = decision.get("categories") or []
+    lines.append(f"命中类别: {', '.join(categories) if categories else '无'}")
+    confidence = decision.get("confidence")
+    if confidence is not None:
+        lines.append(f"置信度: {float(confidence):.4f}")
+    if downstream_gate.get("reasons"):
+        lines.append("原因:")
+        for reason in downstream_gate["reasons"]:
+            lines.append(f"- {reason}")
+    else:
+        lines.append(f"原因: {downstream_gate.get('reason')}")
+
+    summary = str(decision.get("violation_summary_text") or "").strip()
+    if summary:
+        lines.append("命中时间点:")
+        for line in summary.splitlines():
+            lines.append(f"- {line}")
+
+    points = decision.get("violation_points") or []
+    if points:
+        lines.append("命中明细:")
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            if "time_seconds" in point:
+                when = format_seconds(float(point.get("time_seconds") or 0.0))
+            elif "start_time" in point or "end_time" in point:
+                when = f"{format_seconds(float(point.get('start_time') or 0.0))}-{format_seconds(float(point.get('end_time') or point.get('start_time') or 0.0))}"
+            else:
+                when = "未知时间"
+            name = str(point.get("name") or point.get("label") or "违规")
+            category_name = str(point.get("category_name") or point.get("category") or "")
+            label = str(point.get("label") or "")
+            description = str(point.get("description") or "")
+            service = str(point.get("service") or "")
+            confidence_value = point.get("confidence")
+            confidence_text = (
+                f"{float(confidence_value):.4f}"
+                if confidence_value is not None
+                else "unknown"
+            )
+            lines.append(
+                f"- {when} | {name} | {category_name} | {label} | {description} | confidence={confidence_text} | service={service}"
+            )
+    return "\n".join(lines)
+
+
+def write_gate_logs(decision: Dict[str, Any], routing: Dict[str, Any], downstream_gate: Dict[str, Any]) -> Dict[str, Any]:
+    if not routing.get("enabled") or not routing.get("target_path"):
+        return {"enabled": False}
+
+    target_path = Path(str(routing["target_path"]))
+    json_path = target_path.with_name(f"{target_path.stem}.audit.json")
+    text_path = unique_destination_path(target_path.with_name("审核说明.txt"))
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "policy_version": decision.get("policy_version"),
+        "source_path": routing.get("source_path"),
+        "reviewed_path": routing.get("target_path"),
+        "route_dir": routing.get("route_dir"),
+        "allow_short_drama_editing": downstream_gate.get("allow_short_drama_editing"),
+        "routing": routing,
+        "downstream_gate": downstream_gate,
+        "decision": decision,
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    text_path.write_text(
+        format_gate_log_text(decision, routing, downstream_gate) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "enabled": True,
+        "json_path": str(json_path),
+        "text_path": str(text_path),
     }
 
 
@@ -757,6 +889,11 @@ def main() -> int:
         args.passed_folder,
         args.failed_folder,
     )
+    downstream_gate = build_downstream_gate(decision, routing)
+    gate_log = write_gate_logs(decision, routing, downstream_gate)
+    if routing.get("enabled"):
+        routing["allow_short_drama_editing"] = downstream_gate["allow_short_drama_editing"]
+        routing["gate_log"] = gate_log
 
     report = {
         "provider": "aliyun_green_cip",
@@ -769,6 +906,8 @@ def main() -> int:
         "result": scrub_sensitive_values(result_body),
         "decision": decision,
         "routing": routing,
+        "downstream_gate": downstream_gate,
+        "gate_log": gate_log,
     }
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -779,7 +918,9 @@ def main() -> int:
                 "action": report["decision"]["action"],
                 "categories": report["decision"]["categories"],
                 "violation_summary_text": report["decision"].get("violation_summary_text", ""),
+                "allow_short_drama_editing": report["downstream_gate"].get("allow_short_drama_editing"),
                 "routing": report["routing"],
+                "gate_log": report["gate_log"],
             },
             ensure_ascii=False,
         )

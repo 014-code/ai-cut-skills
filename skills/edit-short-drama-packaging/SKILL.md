@@ -1,29 +1,39 @@
 ---
 name: edit-short-drama-packaging
-description: Package a short-drama video for distribution while preserving story order and existing subtitles. Audit and preserve or add the drama title, position a free-viewing benefit below it, add only missing fictional/AI notices without background bars, remove an existing source end card, and append the matching portrait or landscape tail board. Use for 短剧包装剪辑、剧名补充、免费利益点、风险提示语、AI生成提示语、原尾板替换、横竖屏尾板拼接或单视频轻剪交付。
+description: Package a moderation-passed short-drama video for distribution while preserving story order and existing subtitles. Use only sources from the visual moderation `过了` folder or reports/logs with `downstream_gate.allow_short_drama_editing=true`; refuse `没过` sources. Audit and preserve or add the drama title, position a free-viewing benefit below it, add only missing fictional/AI notices without background bars, remove an existing source end card, and append the matching portrait or landscape tail board. Use for 短剧包装剪辑、剧名补充、免费利益点、风险提示语、AI生成提示语、原尾板替换、横竖屏尾板拼接或单视频轻剪交付。
 ---
 
 # Edit Short Drama Packaging
 
 Create one delivery-ready MP4 while preserving the source story, dialogue, embedded subtitles, and timing.
 
+## Moderation Gate
+
+Before any short-drama packaging/editing, verify the source passed `aivideoeditor-visual-moderation`:
+
+- Accept only files from the moderation `过了` folder; or a report/sidecar log where `downstream_gate.allow_short_drama_editing == true`.
+- Reject every file from `没过`. Do not trim, package, re-encode, or otherwise continue with failed material.
+- If a failed source is encountered, report the sidecar `审核说明.txt` / `.audit.json` path and summarize its failed timestamps and reasons.
+- Treat both `REVIEW` and `BLOCK` as not allowed for downstream short-drama editing.
+
 ## Workflow
 
-1. Probe the source and every candidate tail board with `ffprobe`.
-2. Extract and visually inspect opening, middle, and late-body frames before rendering.
-3. Audit the title in source-pixel coordinates:
+1. Verify the moderation gate. Stop unless the source is in `过了` or has `downstream_gate.allow_short_drama_editing == true`.
+2. Probe the source and every candidate tail board with `ffprobe`.
+3. Extract and visually inspect opening, middle, and late-body frames before rendering.
+4. Audit the title in source-pixel coordinates:
    - If the original title is visible, preserve it, record its lower edge, and use `--source-title-present --title-bottom <px>`.
    - If no title is visible, add the authoritative original title with `--title-text "《剧名》"`.
    - Resolve the title from task input, trusted metadata, or an unambiguous filename, in that order. Never invent a title; request it when it cannot be confirmed.
-4. Audit fictional and AI notices independently:
+5. Audit fictional and AI notices independently:
    - Declare an existing fictional notice with `--source-risk-present`; otherwise provide `--risk-text`.
    - Declare an existing AI notice with `--source-ai-present`; otherwise provide `--ai-text`.
    - Add only missing meaning. Never repeat an existing notice.
-5. Position the benefit below the preserved or newly added title. Keep at least 1% of frame height, and normally 10–20px on a 1080×1920 canvas, between their visible bounds.
-6. Render added notices as white text with a 1–2px black outline, no rectangle, no translucent backing layer, and zero shadow.
-7. Review the final 6–10 seconds frame by frame. If an original promotional end card exists, cut at its first frame without removing the preceding story shot.
-8. Append the orientation-matched tail board. Do not overlay body copy on the tail board.
-9. Fully decode-check and visually inspect the opening, middle, final story frame, and tail-board transition.
+6. Position the benefit below the preserved or newly added title. Keep at least 1% of frame height, and normally 10–20px on a 1080×1920 canvas, between their visible bounds.
+7. Render added notices as white text with a 1–2px black outline, no rectangle, no translucent backing layer, and zero shadow.
+8. Review the final 6–10 seconds frame by frame. If an original promotional end card exists, cut at its first frame without removing the preceding story shot.
+9. Append the orientation-matched tail board. Do not overlay body copy on the tail board.
+10. Fully decode-check and visually inspect the opening, middle, final story frame, and tail-board transition.
 
 ## Overlay Audit Contract
 
@@ -94,6 +104,7 @@ The script writes `<output>.json` with the source-overlay audit, added copy, tit
 
 Require all of the following:
 
+- Source came from the moderation `过了` folder or has `downstream_gate.allow_short_drama_editing == true`.
 - Preserve the original story order and embedded subtitles.
 - Show the authoritative drama title exactly once: preserve it when present; add it when absent.
 - Keep the benefit below the title with visible separation and no overlap.

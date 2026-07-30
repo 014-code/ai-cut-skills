@@ -26,6 +26,14 @@ SORT_LABELS = {
     "most_plays": ("最多播放", "最高播放"),
 }
 VIDEO_BUTTON_SELECTOR = ".a6de18a4-cover-video-play-btn"
+VIDEO_BUTTON_SELECTORS = (
+    ".a6de18a4-cover-video-play-btn",
+    "[class*='cover-video-play-btn']",
+    "[class*='video-play']",
+    "[class*='play-btn']",
+    ".anticon-play-circle",
+    ".anticon-play",
+)
 
 
 @dataclass
@@ -134,9 +142,9 @@ class AdxrayPlayletCrawler:
                 ),
                 self.config.password,
             )
-            if not await self._click_locator(page.locator("button.btn-login").first):
-                if not await self._click_text_optional(page, "登 录"):
-                    await self._click_text(page, "登录")
+            await self._fill_captcha_if_present(page)
+            await self._accept_agreement_if_present(page)
+            await self._click_login_button(page)
             if await self._wait_login_ready(page, timeout_ms=15000):
                 self._log("login success")
                 return
@@ -336,7 +344,8 @@ class AdxrayPlayletCrawler:
 
     async def _collect_sort_videos(self, page, context, drama_title: str, slug: str, sort_key: str) -> list[dict[str, Any]]:
         await self._wait_for_video_buttons(page)
-        total = await page.locator(VIDEO_BUTTON_SELECTOR).count()
+        buttons = await self._video_buttons(page)
+        total = len(buttons)
         if total <= 0:
             raise RuntimeError("当前排序下没有找到素材播放按钮")
         limit = total if self.config.max_videos_per_sort <= 0 else min(total, self.config.max_videos_per_sort)
@@ -346,7 +355,10 @@ class AdxrayPlayletCrawler:
 
         for index in range(limit):
             await self._close_modal(page)
-            button = page.locator(VIDEO_BUTTON_SELECTOR).nth(index)
+            buttons = await self._video_buttons(page)
+            if index >= len(buttons):
+                break
+            button = buttons[index]
             card_text = await self._card_text_for_button(button)
             row: dict[str, Any] = {
                 "sort": sort_key,
@@ -385,13 +397,122 @@ class AdxrayPlayletCrawler:
         deadline = asyncio.get_running_loop().time() + self.config.timeout_ms / 1000
         while asyncio.get_running_loop().time() < deadline:
             try:
-                count = await page.locator(VIDEO_BUTTON_SELECTOR).count()
-                if count > 0:
+                if await self._video_buttons(page):
                     return
             except Exception:
                 pass
             await page.wait_for_timeout(800)
         raise RuntimeError("等待素材播放按钮超时")
+
+    async def _fill_captcha_if_present(self, page) -> None:
+        image = page.locator("img[alt='code']").first
+        try:
+            if not await image.count() or not await image.is_visible():
+                return
+            data = await image.screenshot(timeout=5000)
+        except Exception:
+            return
+        try:
+            import ddddocr
+
+            recognizer = ddddocr.DdddOcr(beta=False, show_ad=False)
+            code = recognizer.classification(data)
+        except Exception as exc:
+            self._log(f"captcha OCR failed: {exc}")
+            return
+        code = re.sub(r"[^0-9A-Za-z]", "", code or "")
+        if not code:
+            self._log("captcha OCR returned empty text")
+            return
+        text_inputs = await self._visible_locators(page.locator("input[type='text']"), limit=10)
+        if len(text_inputs) < 2:
+            return
+        await text_inputs[-1].fill(code[:8], timeout=5000)
+        self._log("captcha filled by OCR")
+
+    async def _accept_agreement_if_present(self, page) -> None:
+        checkbox = page.locator("input[type='checkbox']").first
+        try:
+            if not await checkbox.count() or not await checkbox.is_visible():
+                return
+            if await checkbox.is_checked():
+                return
+            await checkbox.check(force=True, timeout=5000)
+        except Exception:
+            try:
+                box = await checkbox.bounding_box(timeout=1000)
+                if box:
+                    await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            except Exception:
+                pass
+
+    async def _click_login_button(self, page) -> None:
+        locators = (
+            page.locator("button.btn-login").first,
+            page.locator("button.login").first,
+            page.locator("button:has-text('登录')").first,
+            page.locator("button:has-text('登 录')").first,
+        )
+        for locator in locators:
+            if await self._click_locator_center(page, locator):
+                return
+            if await self._click_locator(locator):
+                return
+        if await self._click_text_optional(page, "登 录"):
+            return
+        await self._click_text(page, "登录")
+
+    async def _video_buttons(self, page) -> list[Any]:
+        buttons: list[Any] = []
+        seen: set[str] = set()
+        for selector in VIDEO_BUTTON_SELECTORS:
+            for item in await self._visible_locators(page.locator(selector), limit=80):
+                key = await self._locator_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                buttons.append(item)
+        if buttons:
+            return buttons
+
+        play_like = page.locator("div,span,button,i").filter(has_text=re.compile(r"^$"))
+        for item in await self._visible_locators(play_like, limit=200):
+            try:
+                box = await item.bounding_box(timeout=1000)
+                if not box or box["width"] < 18 or box["height"] < 18:
+                    continue
+                classes = await item.evaluate("(el) => el.className || ''")
+                style = await item.evaluate("(el) => getComputedStyle(el).cssText || ''")
+                if "play" not in str(classes).lower() and "triangle" not in str(style).lower():
+                    continue
+                key = await self._locator_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                buttons.append(item)
+            except Exception:
+                continue
+        return buttons
+
+    async def _locator_key(self, locator) -> str:
+        try:
+            return await locator.evaluate(
+                """
+                (el) => {
+                  const rect = el.getBoundingClientRect();
+                  return [
+                    Math.round(rect.left),
+                    Math.round(rect.top),
+                    Math.round(rect.width),
+                    Math.round(rect.height),
+                    el.className || '',
+                    el.tagName || ''
+                  ].join('|');
+                }
+                """
+            )
+        except Exception:
+            return str(id(locator))
 
     async def _card_text_for_button(self, button) -> str:
         try:

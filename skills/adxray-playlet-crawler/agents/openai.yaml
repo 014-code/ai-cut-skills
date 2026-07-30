@@ -1,4 +1,4 @@
 interface:
   display_name: "AdXRay Playlet Crawler"
-  short_description: "Batch download AdXRay hot playlet videos."
-  default_prompt: "Use $adxray-playlet-crawler to download Douyin hot playlet videos from AdXRay for visual moderation."
+  short_description: "Batch download AdXRay hot playlet videos for moderation-gated editing."
+  default_prompt: "Use $adxray-playlet-crawler to download Douyin hot playlet videos from AdXRay, then send them through moderation first. Only videos with allow_short_drama_editing=true or files in the moderation 过了 folder may enter short-drama editing."

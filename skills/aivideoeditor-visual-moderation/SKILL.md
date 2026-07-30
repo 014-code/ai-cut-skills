@@ -12,7 +12,9 @@ Use this skill only for provider-backed violation detection reports. The current
 3. Normalize Aliyun frame labels into the scoped categories: `political`, `military`, `nsfw`.
 4. Return concrete evidence with provider label, description, confidence, and timestamp.
 5. If `--route-dir` is provided for a local video, place `PASS` videos under `过了` and non-pass videos under `没过`.
-6. Stop after the report and optional routing. Do not run any downstream processing unless the user explicitly asks for a separate workflow.
+6. Write a moderation gate: only `decision.action == "PASS"` sets `downstream_gate.allow_short_drama_editing=true`.
+7. Write sidecar audit logs next to routed videos. Failed logs must explain hit timestamps, labels, categories, confidence, and reasons.
+8. Stop after the report and optional routing. Do not run any downstream processing unless the user explicitly asks for a separate workflow.
 
 ## Required Inputs
 
@@ -64,8 +66,16 @@ Routing defaults to copy mode. The script creates:
 
 - `D:\path\reviewed\过了`: `decision.action == "PASS"`
 - `D:\path\reviewed\没过`: `decision.action == "REVIEW"` or `decision.action == "BLOCK"`
+- `*.audit.json` and `审核说明.txt` next to each routed video. For `没过`, these logs are the handoff artifact for why the video cannot continue.
 
 Use `--route-mode move` only when the original local video should be moved instead of copied.
+
+Downstream short-drama editing must consume only:
+
+- files under the routed `过了` folder; or
+- reports/logs where `downstream_gate.allow_short_drama_editing == true`.
+
+Never feed files from `没过` into later short-drama packaging/editing. Treat both `REVIEW` and `BLOCK` as blocked for downstream work.
 
 Run a URL review:
 
@@ -89,6 +99,8 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
 - `evidence.provider_points`: same hit list for downstream audit.
 - `evidence.provider_unscoped_hits`: Aliyun labels that were not mapped to the current business scope.
 - `routing`: optional file routing result when `--route-dir` is provided.
+- `downstream_gate`: stable pass/fail gate for later short-drama editing.
+- `gate_log`: optional sidecar audit log paths when `--route-dir` is provided.
 
 Example shape:
 
@@ -124,6 +136,17 @@ Example shape:
       }
     ],
     "violation_summary_text": "乳沟命中时间点: 13.5 秒、14.5 秒、16.5 秒"
+  },
+  "downstream_gate": {
+    "allow_short_drama_editing": false,
+    "status": "blocked",
+    "decision_action": "BLOCK",
+    "reason": "Aliyun returned BLOCK. The routed file stays in 没过 and must not enter downstream short-drama editing."
+  },
+  "gate_log": {
+    "enabled": true,
+    "json_path": "D:\\path\\reviewed\\没过\\input.audit.json",
+    "text_path": "D:\\path\\reviewed\\没过\\审核说明.txt"
   }
 }
 ```

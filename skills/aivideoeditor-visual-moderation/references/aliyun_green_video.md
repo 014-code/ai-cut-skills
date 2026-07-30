@@ -71,8 +71,15 @@ Routing result:
 
 - `PASS` -> `D:\path\reviewed\过了`
 - `REVIEW` / `BLOCK` -> `D:\path\reviewed\没过`
+- every routed video gets sidecar logs: `<video-stem>.audit.json` and `审核说明.txt`
 
 Default routing mode is `copy`. Add `--route-mode move` only when the original local video should be moved.
+
+Downstream short-drama editing gate:
+
+- only `downstream_gate.allow_short_drama_editing == true` may enter later packaging/editing
+- with local routing, this means use only files under `D:\path\reviewed\过了`
+- never use files under `D:\path\reviewed\没过`; their audit logs are for failure explanation and manual review only
 
 Review from URL:
 
@@ -93,12 +100,20 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
 - scrubbed `submitted` and `result`
 - normalized `decision`
 - `routing` when `--route-dir` is provided
+- `downstream_gate` on every report
+- `gate_log` paths when local routing writes sidecar logs
 
 Inside `decision`, the important report fields are:
 
 - `violation_points`
 - `violation_groups`
 - `violation_summary_text`
+
+Inside `downstream_gate`, the important workflow field is:
+
+- `allow_short_drama_editing`: true only for `decision.action == "PASS"`
+
+For failed videos, read the sidecar `审核说明.txt` or `.audit.json` under `没过` to see the failed timestamps and reasons.
 
 The cleavage hit is preserved as `乳沟` when Aliyun returns `sexual_cleavage` or a matching description such as `女性乳沟`.
 
