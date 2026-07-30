@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .usergrowth_tag_templates import DEFAULT_CUSTOM_TAG_TEMPLATE_NAME, default_custom_tag_template_tags
+
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi"}
 
@@ -21,6 +23,7 @@ class UserGrowthVideoItem:
     material_type: str
     song_name: str
     song_id: str = ""
+    song_match_message: str = ""
     order_id: str = ""
     custom_tags: list[str] = field(default_factory=list)
     classification_path: list[str] = field(default_factory=list)
@@ -39,6 +42,7 @@ class UserGrowthVideoItem:
             "material_type": self.material_type,
             "song_name": self.song_name,
             "song_id": self.song_id,
+            "song_match_message": self.song_match_message,
             "order_id": self.order_id,
             "custom_tags": self.custom_tags,
             "classification_path": self.classification_path,
@@ -111,6 +115,10 @@ class UserGrowthRunConfig:
     password: str
     order_id: str = ""
     task_name: str = "usergrowth_upload"
+    batch_name: str = ""
+    selected_video_paths: list[Path] = field(default_factory=list)
+    custom_tag_template_name: str = DEFAULT_CUSTOM_TAG_TEMPLATE_NAME
+    custom_tag_template_tags: list[str] = field(default_factory=default_custom_tag_template_tags)
     month_tag: str = ""
     recursive: bool = True
     dry_run: bool = True

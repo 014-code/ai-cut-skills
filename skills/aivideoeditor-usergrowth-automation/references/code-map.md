@@ -2,7 +2,7 @@
 
 The standalone runnable copy lives in this skill:
 
-- `scripts/usergrowth_upload.py`: CLI entry for dry-run, selected videos, manifests, and live upload.
+- `scripts/usergrowth_upload.py`: CLI entry for dry-run, selected videos, single-run manifests, multi-batch manifests/concurrency, and live upload.
 - `scripts/usergrowth_automation/`: vendored Python package copied from the desktop UserGrowth implementation.
 - `scripts/requirements.txt`: runtime dependencies for the standalone tool.
 

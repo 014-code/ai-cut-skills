@@ -4,6 +4,26 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import unicodedata
+
+from .usergrowth_tag_templates import default_custom_tag_template_tags, render_custom_tags_from_template
+
+TEXT_NORMALIZATION_MAP = str.maketrans({
+    "—": "-",
+    "–": "-",
+    "－": "-",
+    "‑": "-",
+    "‒": "-",
+    "―": "-",
+    "•": "·",
+    "・": "·",
+    "･": "·",
+    "＆": "&",
+    "“": '"',
+    "”": '"',
+    "‘": "'",
+    "’": "'",
+})
 
 MATERIAL_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("金币音乐新high", ("LUNA_金币音乐新high", "LUNA金币音乐新high", "金币音乐新high")),
@@ -136,7 +156,9 @@ def default_month_tag(now: datetime | None = None) -> str:
 
 def normalize_text(value: object) -> str:
     """归一化歌名文本，便于不同 Excel 列格式之间做匹配。"""
-    text = str(value or "").strip()
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
+    text = text.translate(TEXT_NORMALIZATION_MAP)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
     text = text.replace("《", "").replace("》", "")
     text = re.sub(r"\s+", "", text)
     text = text.replace("（", "(").replace("）", ")")
@@ -145,7 +167,9 @@ def normalize_text(value: object) -> str:
 
 def normalize_song_id(value: object) -> str:
     """把歌曲 ID 统一成 gd_数字 的格式。"""
-    text = str(value or "").strip()
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
+    text = text.translate(TEXT_NORMALIZATION_MAP)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
     if not text:
         return ""
     match = re.search(r"(?:gd|gq)[_-]?(\d{8,})", text, flags=re.IGNORECASE)
@@ -177,7 +201,7 @@ def detect_material_type(file_name: str) -> str:
 
 def extract_song_name(file_name: str, material_type: str) -> str:
     """从素材文件名中截取歌曲名，并去掉尾部序号等噪声。"""
-    stem = Path(file_name).stem
+    stem = _normalize_filename_fragment(Path(file_name).stem)
     marker_index = -1
     marker_len = 0
     candidates = [material_type, f"LUNA_{material_type}", f"LUNA{material_type}"] if material_type else []
@@ -195,10 +219,124 @@ def extract_song_name(file_name: str, material_type: str) -> str:
         tail = parts[-1] if parts else stem
 
     tail = tail.strip("-_ ")
-    tail = re.sub(r"^(\d+[-_]){1,3}", "", tail)
-    tail = re.sub(r"^\d+", "", tail).strip("-_ ")
+    stripped_tail = _strip_leading_batch_marker(tail)
+    if stripped_tail != tail:
+        tail = stripped_tail
+    else:
+        stripped_tail = _strip_single_sequence_marker(tail)
+        if stripped_tail != tail:
+            tail = stripped_tail
+        else:
+            tail = re.sub(r"^(\d+[-_]){1,3}", "", tail)
+    tail = tail.strip("-_ ")
     tail = re.sub(r"[-_]\d{1,3}$", "", tail).strip("-_ ")
+    tail = _strip_trailing_file_marker(tail)
+    tail = _strip_explicit_book_title_marker(tail)
     return tail or stem
+
+
+def _strip_leading_batch_marker(value: str) -> str:
+    """去掉歌名前的分组/序号前缀，例如：闭环音乐-10-1-Joker -> Joker。"""
+    text = _normalize_filename_fragment(value).strip("-_ ")
+    patterns = (
+        r"^.+?[-_]\s*\d{1,4}\s*[-_]\s*\d{1,4}(?:\s*[-_]\s*\d{1,4})?\s*[-_]\s*(.+)$",
+        r"^.+?[-_]?\s*第?\s*\d{1,4}\s*[批组轮次]\s*[-_]?\s*第?\s*\d{1,4}\s*[条个号款]?\s*[-_]\s*(.+)$",
+        r"^(?:.+?[-_])?(?:批次|批|组|轮次)\s*\d{1,4}\s*[-_]\s*(?:序号|第)?\s*\d{1,4}\s*[条个号款]?\s*[-_]\s*(.+)$",
+        r"^.+?(?:[\[(【]\s*\d{1,4}\s*[\])】]){2,}\s*[-_]\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if match:
+            song_name = match.group(1).strip("-_ ")
+            if song_name:
+                return song_name
+    return text
+
+
+def _strip_single_sequence_marker(value: str) -> str:
+    """处理 A-1-B 这类单个序号夹在两段文字之间的命名。"""
+    text = _normalize_filename_fragment(value).strip("-_ ")
+    parts = [part for part in re.split(r"[-_]+", text) if part]
+    numeric_indexes = [index for index, part in enumerate(parts) if re.fullmatch(r"\d{1,4}", part)]
+    if len(numeric_indexes) != 1:
+        return text
+
+    index = numeric_indexes[0]
+    left = "-".join(parts[:index]).strip("-_ ")
+    right = "-".join(parts[index + 1:]).strip("-_ ")
+    if not left or not right:
+        return text
+
+    left_score = _song_fragment_score(left)
+    right_score = _song_fragment_score(right)
+    if left_score == right_score:
+        return text
+    return left if left_score > right_score else right
+
+
+def _song_fragment_score(value: str) -> int:
+    """用字符信息量给序号两侧片段打分，不依赖具体模板词。"""
+    text = normalize_text(value)
+    return len(re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text))
+
+
+def _strip_explicit_book_title_marker(value: str) -> str:
+    """如果候选歌名显式写成《歌名》，优先取书名号里的内容。"""
+    text = str(value or "").strip("-_ ")
+    text = _strip_full_outer_wrapper(text)
+    if not text.startswith("《"):
+        return value
+    title = _extract_leading_book_title(text)
+    return title or value
+
+
+def _strip_full_outer_wrapper(value: str) -> str:
+    text = str(value or "").strip()
+    wrappers = (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"))
+    changed = True
+    while changed:
+        changed = False
+        for left, right in wrappers:
+            if text.startswith(left) and text.endswith(right):
+                text = text[len(left):-len(right)].strip()
+                changed = True
+                break
+    return text
+
+
+def _extract_leading_book_title(value: str) -> str:
+    text = str(value or "").strip()
+    if not text.startswith("《"):
+        return ""
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "《":
+            depth += 1
+        elif char == "》":
+            depth -= 1
+            if depth == 0:
+                return text[1:index].strip()
+    return ""
+
+
+def _strip_trailing_file_marker(value: str) -> str:
+    """去掉文件复制、导出、成片等非歌名后缀，保留 Live/伴奏版等歌曲版本名。"""
+    text = str(value or "").strip("-_ ")
+    marker = r"(?:\d{1,3}|副本|copy|拷贝|成片|最终版?|完成版?|已剪辑?|剪辑版|修正版?|导出版?|无水印)"
+    text = re.sub(rf"\s*[\(（\[]\s*{marker}\s*[\)）\]]\s*$", "", text, flags=re.IGNORECASE).strip("-_ ")
+    text = re.sub(rf"\s*【\s*{marker}\s*】\s*$", "", text, flags=re.IGNORECASE).strip("-_ ")
+    text = re.sub(rf"\s*[-_]\s*{marker}\s*$", "", text, flags=re.IGNORECASE).strip("-_ ")
+    return text
+
+
+def _normalize_filename_fragment(value: str) -> str:
+    """把文件名中的常见分隔符和全角字符先归一化，便于提取歌名。"""
+    text = unicodedata.normalize("NFKC", str(value or "").strip())
+    text = text.translate(TEXT_NORMALIZATION_MAP)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"\s*_\s*", "_", text)
+    return text
 
 
 def optional_tags_for_file(file_name: str) -> list[str]:
@@ -240,21 +378,16 @@ def custom_tags_for_material(
         file_name: str,
         *,
         month_tag: str | None = None,
+        template_tags: object = None,
 ) -> list[str]:
-    """按素材类型、歌曲 ID、文件名和月份标签生成自定义标签列表。"""
-    rule = CUSTOM_TAG_RULES.get(material_type, DEFAULT_CUSTOM_TAG_RULE)
-    tags = [
-        *BASE_CUSTOM_TAGS,
-        month_tag or default_month_tag(),
-        *rule.fixed_tags,
-    ]
-    if song_id:
-        tags.extend(rule.song_tags)
-        if rule.append_song_id:
-            tags.append(song_id)
-    tags.extend(file_custom_tags_for_name(file_name))
-    tags.extend(optional_tags_for_file(file_name))
-    return _dedupe_tags(tags)
+    """按当前模板生成自定义标签；素材类型/文件名规则暂不参与自定义标签匹配。"""
+    del material_type, file_name
+    tags = default_custom_tag_template_tags() if template_tags is None else template_tags
+    return render_custom_tags_from_template(
+        tags,
+        song_id=song_id,
+        month_tag=month_tag or default_month_tag(),
+    )
 
 
 def _best_keyword_match(source_text: str, keyword_specs) -> str:

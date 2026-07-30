@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 
 from .usergrowth_captcha import UserGrowthCaptchaSolver
 from .usergrowth_models import UserGrowthCancelled, UserGrowthOrderPlan, UserGrowthVideoItem
-from .usergrowth_rules import display_material_from_label
+from .usergrowth_rules import display_material_from_label, classification_path_for_material
 
 ProgressCallback = Callable[[str], None]
 OrderCompleteCallback = Callable[[UserGrowthOrderPlan], None]
@@ -24,14 +24,6 @@ def _compact_text(value: str) -> str:
 
 def _compact_cascader_text(value: str) -> str:
     return re.sub(r"[\s\u00a0_]+", "", value or "")
-
-
-def card_defaults_for_item(item: UserGrowthVideoItem) -> tuple[list[str], list[str]]:
-    """返回计划阶段确定的分类和标签，避免浏览器阶段按文件名重新推导。"""
-    classification_path = [str(value).strip() for value in item.classification_path if str(value).strip()]
-    if not classification_path:
-        raise RuntimeError(f"素材缺少已规划的分类标签：{item.file_name}")
-    return ["LUNA功能卖点", *classification_path], list(item.custom_tags)
 
 
 LOGIN_URL = "https://usergrowth.com.cn/open/login"
@@ -118,7 +110,11 @@ class UserGrowthBrowserClient:
                     if plan.status == "skipped":
                         continue
                     await self._process_order(page, plan, progress)
-                    if self.order_complete and plan.status == "success":
+                    if (
+                            self.order_complete
+                            and plan.status == "success"
+                            and not getattr(plan, "_pre_review_cid_backfilled", False)
+                    ):
                         self.order_complete(plan)
             except Exception as exc:
                 if self._cancel_requested():
@@ -194,7 +190,7 @@ class UserGrowthBrowserClient:
                 self.account,
             )
             await self._fill_first(page, ("input[type='password']", "input[placeholder*='密码']"), self.password)
-            await self._fill_captcha(page)
+            await self._fill_captcha_until_available(page, progress)
             await self._snapshot(page, f"login_attempt_{attempt}_filled")
             await self._click_first(page, ("button:has-text('登录')", "button:has-text('登 录')", "button"))
             await page.wait_for_timeout(5000)
@@ -205,6 +201,27 @@ class UserGrowthBrowserClient:
                 return
             await self._snapshot_error(page, f"login_failed_{attempt}")
         raise RuntimeError("UserGrowth 登录失败：验证码或账号密码未通过")
+
+    async def _fill_captcha_until_available(self, page, progress: ProgressCallback | None) -> None:
+        """验证码图片截图失败时刷新登录页，一直重试到成功或用户取消。"""
+        refresh_count = 0
+        while True:
+            self._raise_if_cancelled()
+            try:
+                await self._fill_captcha(page)
+                return
+            except RuntimeError as exc:
+                message = str(exc)
+                if not (message.startswith("验证码图片未找到") or message.startswith("验证码截图失败")):
+                    raise
+                refresh_count += 1
+                self._emit(progress, f"验证码截图失败，刷新登录页继续重试（第 {refresh_count} 次）")
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] captcha screenshot retry "
+                    f"{refresh_count}: {message}"
+                )
+                await self._safe_goto(page, LOGIN_URL)
+                await page.wait_for_timeout(2500)
 
     async def _enable_post_login_resource_blocking(self, context, progress: ProgressCallback | None = None) -> None:
         """登录后拦截非必要静态资源，降低后续页面加载成本。"""
@@ -249,8 +266,14 @@ class UserGrowthBrowserClient:
             return
 
         captcha_image = await self._find_captcha_image(page, captcha_input)
+        if not captcha_image:
+            raise RuntimeError("验证码图片未找到")
+        try:
+            image_bytes = await captcha_image.screenshot(timeout=8000)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"验证码截图失败：{exc}") from exc
         self._captcha_solver = self._captcha_solver or UserGrowthCaptchaSolver()
-        code = self._captcha_solver.solve(await captcha_image.screenshot())
+        code = self._captcha_solver.solve(image_bytes)
         await captcha_input.fill(code)
 
     async def _find_captcha_image(self, page, captcha_input=None):
@@ -324,7 +347,16 @@ class UserGrowthBrowserClient:
                 await self._snapshot_error(page, f"order_{plan.order_id}_task_id_not_found")
                 raise RuntimeError("未读取到当前任务ID")
 
-            await self._wait_task_success(page, progress, expected_attempts=max(len(active_items), 1))
+            wait_result = await self._wait_task_success(
+                page,
+                progress,
+                expected_attempts=max(len(active_items), 1),
+                plan=plan,
+                items=active_items,
+                task_id=plan.task_id,
+            )
+            if wait_result == "cid_backed_up":
+                return
             await self._submit_review(page)
             await self._fill_cids_for_task(page, active_items, plan.task_id, progress)
             plan.status = "success"
@@ -1351,8 +1383,10 @@ class UserGrowthBrowserClient:
         )
         await self._select_cascader(page, "LUNA素材来源", ["LUNA素材来源", "LUNA_千沧代理"])
 
-        path, tags = card_defaults_for_item(item)
-        print(f"计划中的分类标签{path}")
+        print(f"匹配到的类型{classification_path_for_material(item.file_name)}")
+        path = classification_path_for_material(item.file_name)
+        # 最前面的LUNA功能卖点点上
+        path.insert(0, "LUNA功能卖点")
         await self._select_cascader(
             page,
             "LUNA功能卖点",
@@ -1361,8 +1395,10 @@ class UserGrowthBrowserClient:
 
         await self._click_if_present(page, "确定")
 
-        # 填入自定义标签
-        print(f"计划中的自定义标签集合{tags}")
+        # 填入预检阶段按模板渲染好的自定义标签
+        tags = list(item.custom_tags)
+
+        print(f"自定义标签集合{tags}")
 
         for tag in tags:
             input_box = await self._inputtag_for_field(page, "自定义标签")
@@ -1840,28 +1876,88 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
             *,
             expected_attempts: int | None = None,
-    ) -> None:
-        """轮询任务状态，失败时尝试重试，直到全部成功或达到重试上限。
-
-        默认按视频数量走（与上传素材数相当），间隔减半，
-        只点一次"刷新列表"，避免短时间内连续点两次造成抖动。
-        """
-        max_attempts = max(
-            expected_attempts or self.max_status_retries,
-            1,
-        )
+            plan: UserGrowthOrderPlan | None = None,
+            items: list[UserGrowthVideoItem] | None = None,
+            task_id: str | None = None,
+    ) -> str:
+        """轮询任务状态，直到全部成功、明确失败或用户取消。"""
+        backup_after_attempts = max(expected_attempts or self.max_status_retries, 1) + 2
+        backup_attempted = False
         # 间隔减半，最小 3s，避免空转
         interval_ms = max(int(self.refresh_interval_seconds * 500), 3000)
-        for attempt in range(1, max_attempts + 3):
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
             body = await page.locator("body").inner_text(timeout=5000)
             if "全部成功" in body:
-                return
+                return "success"
             if "已失败" in body:
                 raise RuntimeError("任务执行失败")
-            self._emit(progress, f"刷新任务状态，第 {attempt}/{max_attempts} 次")
+            if (
+                    not backup_attempted
+                    and attempt >= backup_after_attempts
+                    and plan is not None
+                    and items
+                    and task_id
+            ):
+                backup_attempted = True
+                if await self._try_backup_cids_before_review(page, plan, items, task_id, progress):
+                    return "cid_backed_up"
+            self._emit(progress, f"刷新任务状态，第 {attempt} 次")
             await self._click_if_present(page, "刷新列表")
             await page.wait_for_timeout(interval_ms)
-        raise RuntimeError("任务状态未在重试次数内变为全部成功")
+
+    async def _try_backup_cids_before_review(
+            self,
+            page,
+            plan: UserGrowthOrderPlan,
+            items: list[UserGrowthVideoItem],
+            task_id: str,
+            progress: ProgressCallback | None,
+    ) -> bool:
+        """任务状态长时间未成功时，先从查看详情读取 CID 并写回，标记未送审。"""
+        original_state = [
+            (item, item.cid, item.cid_material_type, item.status, item.message)
+            for item in items
+        ]
+        detail_page = None
+        before_url = page.url
+        try:
+            self._emit(progress, f"任务 {task_id} 状态暂未全部成功，尝试先从查看详情备份 CID")
+            detail_page = await self._open_task_detail_without_wait(page, task_id)
+            await self._read_cids_from_task_detail_page(detail_page, items, "未送审")
+            plan.status = "success"
+            plan.message = "CID 已备份，未送审"
+            if self.order_complete:
+                self.order_complete(plan)
+                setattr(plan, "_pre_review_cid_backfilled", True)
+            self._emit(progress, f"任务 {task_id} CID 已先写回，备注：未送审")
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] task {task_id} cid backed up before review"
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            for item, cid, cid_material_type, status, message in original_state:
+                item.cid = cid
+                item.cid_material_type = cid_material_type
+                item.status = status
+                item.message = message
+            plan.status = "pending"
+            plan.message = ""
+            try:
+                if detail_page is not None and detail_page is not page:
+                    await detail_page.close()
+                elif page.url != before_url:
+                    await page.go_back(timeout=10000)
+                    await page.wait_for_timeout(1500)
+            except Exception:
+                pass
+            self._emit(progress, f"任务 {task_id} CID 备份暂未成功，继续刷新状态：{exc}")
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] task {task_id} cid backup skipped: {exc}"
+            )
+            return False
 
     async def _fill_cids_for_task(
             self,
@@ -1985,6 +2081,27 @@ class UserGrowthBrowserClient:
         await page.wait_for_timeout(2500)
         return page
 
+    async def _open_task_detail_without_wait(self, page, task_id: str):
+        """不等待任务成功，直接点击任务行旁边的查看详情。"""
+        await self._search_task_by_id(page, task_id)
+        row = await self._find_task_row(page, task_id)
+        if not row:
+            raise RuntimeError(f"未找到任务 {task_id} 对应行")
+        before_pages = list(page.context.pages)
+        before_url = page.url
+        if not await self._click_first_visible_locator(
+                row.get_by_text("查看详情", exact=True).first,
+                row.locator("a:has-text('查看详情')").first,
+                row.locator("button:has-text('查看详情')").first,
+        ):
+            raise RuntimeError(f"未打开任务 {task_id} 详情")
+        target_page = await self._wait_page_change_or_new_page(page, before_pages, before_url, timeout_ms=15000)
+        if target_page:
+            await target_page.wait_for_timeout(2500)
+            return target_page
+        await page.wait_for_timeout(2500)
+        return page
+
     async def _search_task_by_id(self, page, task_id: str) -> None:
         """在任务列表页用任务ID精确筛选当前任务。"""
         await self._click_if_present(page, "操作任务")
@@ -2054,27 +2171,23 @@ class UserGrowthBrowserClient:
             *,
             expected_attempts: int | None = None,
     ) -> None:
-        """轮询指定任务行状态直到全部成功。
-
-        默认按视频数量走，间隔减半，只点一次"刷新列表"避免连续两次抖动。
-        """
-        max_attempts = max(
-            expected_attempts or self.max_status_retries,
-            1,
-        )
+        """轮询指定任务行状态，直到全部成功、明确失败或用户取消。"""
+        _ = expected_attempts
         interval_ms = max(int(self.refresh_interval_seconds * 500), 3000)
-        for attempt in range(1, max_attempts + 3):
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
             row = await self._find_task_row(page, task_id)
             row_text = _compact_text(await self._locator_text(row, timeout_ms=3000)) if row else ""
             if "全部成功" in row_text:
                 return
             if "失败" in row_text:
                 raise RuntimeError(f"任务 {task_id} 执行失败")
-            self._emit(progress, f"等待任务 {task_id} 完成，第 {attempt}/{max_attempts} 次")
+            self._emit(progress, f"等待任务 {task_id} 完成，第 {attempt} 次")
             await self._click_if_present(page, "刷新列表")
             await page.wait_for_timeout(interval_ms)
             await self._search_task_by_id(page, task_id)
-        raise RuntimeError(f"任务 {task_id} 未在重试次数内变为全部成功")
 
     async def _open_material_list_page(self, page):
         """从任务详情中打开素材/文案列表页，兼容新标签页和当前页跳转。"""
@@ -2122,6 +2235,33 @@ class UserGrowthBrowserClient:
             item.cid_material_type = await self._read_material_type_by_cid(page, cid) or item.material_type
             item.status = "success"
             item.message = "上传并送审成功"
+
+    async def _read_cids_from_task_detail_page(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            message: str,
+    ) -> None:
+        """从任务详情页或素材列表页读取 CID，并按指定备注写入条目。"""
+        cids: list[str] = []
+        cid_page = page
+        try:
+            material_page = await self._open_material_list_page(page)
+            cids = await self._read_cids_from_search_input(material_page)
+            cid_page = material_page
+        except Exception:
+            cids = await self._copy_or_read_cids(page)
+
+        if not cids:
+            raise RuntimeError("未读取到 CID")
+        if len(cids) < len(items):
+            raise RuntimeError(f"读取到的 CID 数量不足：期望 {len(items)}，实际 {len(cids)}")
+
+        for item, cid in zip(items, cids):
+            item.cid = cid
+            item.cid_material_type = await self._read_material_type_by_cid(cid_page, cid) or item.material_type
+            item.status = "success"
+            item.message = message
 
     async def _copy_or_read_cids(self, page) -> list[str]:
         """优先使用一键复制对象 ID，失败时从页面文本中提取 CID。"""

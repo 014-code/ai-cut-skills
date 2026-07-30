@@ -50,6 +50,38 @@ Video selection supports:
 
 If a selector does not match, the script fails instead of silently uploading the wrong set.
 
+## Auto Split By Song
+
+Use `--split-by-song` when a folder or selected video set contains multiple songs. The CLI first groups videos with the same song into one batch per song, then runs those batches through the concurrent batch runner.
+
+```powershell
+& python 'C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\usergrowth_upload.py' `
+  --video-folder 'D:\path\videos' `
+  --all-videos `
+  --split-by-song `
+  --backfill-excel 'D:\path\backfill.xlsx' `
+  --song-excel 'D:\path\songs.xlsx' `
+  --output-root 'D:\path\outputs' `
+  --order-id '123456'
+```
+
+Manifest equivalent:
+
+```json
+{
+  "video_folder": "D:/path/videos",
+  "all_videos": true,
+  "split_by_song": true,
+  "backfill_excel": "D:/path/backfill.xlsx",
+  "song_excel": "D:/path/songs.xlsx",
+  "output_root": "D:/path/outputs",
+  "order_id": "123456",
+  "dry_run": true
+}
+```
+
+If `--split-by-song` is used without `--video`, `--video-glob`, `--video-list`, or `--all-videos`, it scans all videos in `video_folder`, matching the desktop auto-split behavior.
+
 ## Manifest
 
 For repeated tasks, create a JSON manifest:
@@ -67,6 +99,16 @@ For repeated tasks, create a JSON manifest:
   "order_id": "123456",
   "task_name": "usergrowth_selected",
   "month_tag": "26年7月dxqs",
+  "custom_tag_template_name": "单曲模板",
+  "custom_tag_template_fixed_tags": [
+    "未成年人已授权",
+    "影视版权已授权",
+    "dxzc",
+    "汽水音乐",
+    "{月份标签}",
+    "{歌曲ID}"
+  ],
+  "custom_tag_template_optional_tags": [],
   "recursive": true,
   "dry_run": true
 }
@@ -80,7 +122,55 @@ Run it:
 
 Do not put passwords in manifests unless the user explicitly asks for that storage pattern. Prefer environment variables.
 
-Manifest values such as `"live": true`, `"confirm_live": true`, or `"dry_run": false` never activate a real upload. Without both command-line flags in the current invocation, the CLI remains in dry-run mode.
+## Multi-Batch Manifest
+
+To run multiple independent batches like the desktop queue, put `batches` at the top level. Shared fields such as `backfill_excel`, `song_excel`, `output_root`, `month_tag`, custom tag template fields, `dry_run`, and retry/browser settings can live at the top level; each batch can override them.
+
+```json
+{
+  "backfill_excel": "D:/path/backfill.xlsx",
+  "song_excel": "D:/path/songs.xlsx",
+  "output_root": "D:/path/outputs",
+  "task_name": "usergrowth_batches",
+  "month_tag": "26年7月dxqs",
+  "custom_tag_template_name": "单曲模板",
+  "custom_tag_template_fixed_tags": ["未成年人已授权", "影视版权已授权", "dxzc", "汽水音乐", "{月份标签}", "{歌曲ID}"],
+  "custom_tag_template_optional_tags": [],
+  "dry_run": true,
+  "recursive": true,
+  "concurrency": 3,
+  "batches": [
+    {
+      "name": "order_a_selected",
+      "video_folder": "D:/path/videos_a",
+      "order_id": "OrderA",
+      "videos": [
+        "dxzc-001-汽水音乐-LUNA_单曲-歌曲A.mp4"
+      ]
+    },
+    {
+      "name": "order_b_folder",
+      "video_folder": "D:/path/videos_b",
+      "order_id": "OrderB",
+      "all_videos": true
+    }
+  ]
+}
+```
+
+Run it:
+
+```powershell
+& python 'C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\usergrowth_upload.py' `
+  --manifest 'D:\path\batch_manifest.json' `
+  --concurrency 3
+```
+
+Batch mode writes a total summary to `<output-root>/batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log`. Each child batch still writes its own `<output-root>/<timestamp>_<batch-task-name>/task.json`, `run.log`, `result.xlsx` in dry-run mode, and `debug/` in live mode.
+
+Multi-batch execution always runs in parallel when there is more than one batch. If `concurrency` is omitted, it defaults to the number of batches, capped at 10. Even if `concurrency` is set to `1`, a run with two or more batches is lifted to at least `2` workers.
+
+In the desktop app, the automatic song splitter produces the same shape conceptually: one batch per recognized song, with explicit selected video paths for that song. The browser layer still fills the first chameleon card and uses `一键复用`, so different songs should be split before live upload.
 
 ## Live Upload
 
@@ -94,5 +184,7 @@ $env:USERGROWTH_PASSWORD = '<password>'
   --live `
   --confirm-live
 ```
+
+For batch live upload, keep `confirm_live` at the top level or pass `--confirm-live`. Top-level `live=true` makes batches live unless a batch explicitly sets `dry_run=true`; command-line `--live` is a global override and makes every batch live.
 
 Use `--headless` only after visible browser mode has been validated.

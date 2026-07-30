@@ -118,7 +118,7 @@ def load_song_records(
             if not song_id:
                 skipped_missing_id += 1
                 continue
-            song_name = _extract_song_name_from_cell(raw_song)
+            song_name = _best_song_name_from_row(raw_song, raw_link)
             blocked = any("禁投" in _cell_text(sheet, row_number, col) for col in blocked_cols)
             records.append(
                 UserGrowthSongRecord(
@@ -144,7 +144,7 @@ def load_song_records(
     duplicate_name_count = len({record.song_name for record in duplicate_records})
     if duplicate_records:
         print(
-            f"[load_song_records] 跳过完全同名歌曲 {len(duplicate_records)} 条，"
+            f"[load_song_records] 跳过同名但歌曲ID不同的歌曲 {len(duplicate_records)} 条，"
             f"涉及 {duplicate_name_count} 个歌名"
         )
         if duplicate_output_path:
@@ -159,19 +159,27 @@ def load_song_records(
 def _split_duplicate_song_records(
         records: list[UserGrowthSongRecord],
 ) -> tuple[list[UserGrowthSongRecord], list[UserGrowthSongRecord]]:
-    """把完全同名歌曲从可用记录中剔除，并返回被剔除的重复记录。"""
+    """把同名且不同歌曲 ID 的歌曲从可用记录中剔除。"""
     grouped: dict[str, list[UserGrowthSongRecord]] = defaultdict(list)
     for record in records:
         grouped[record.song_name].append(record)
 
-    duplicate_ids = {
-        id(record)
-        for group in grouped.values()
-        if len(group) > 1
-        for record in group
-    }
-    unique_records = [record for record in records if id(record) not in duplicate_ids]
-    duplicate_records = [record for record in records if id(record) in duplicate_ids]
+    unique_records: list[UserGrowthSongRecord] = []
+    duplicate_records: list[UserGrowthSongRecord] = []
+    for group in grouped.values():
+        if len(group) == 1:
+            unique_records.extend(group)
+            continue
+
+        song_ids = {normalize_song_id(record.song_id) for record in group if normalize_song_id(record.song_id)}
+        if len(song_ids) == 1:
+            representative = group[0]
+            representative.song_id = next(iter(song_ids))
+            representative.blocked = any(record.blocked for record in group)
+            unique_records.append(representative)
+            continue
+
+        duplicate_records.extend(group)
     return unique_records, duplicate_records
 
 
@@ -185,7 +193,11 @@ def _filter_duplicate_song_records_for_export(
     wanted = {normalize_text(name) for name in song_names if normalize_text(name)}
     if not wanted:
         return []
-    return [record for record in records if normalize_text(record.song_name) in wanted]
+    return [
+        record
+        for record in records
+        if any(_song_name_matches_query(record.song_name, value) for value in wanted)
+    ]
 
 
 def write_duplicate_song_records(output_path: Path, records: list[UserGrowthSongRecord]) -> Path:
@@ -254,7 +266,10 @@ def match_song_record(
         song_name: str,
         records: Iterable[UserGrowthSongRecord]
 ) -> tuple[UserGrowthSongRecord | None, list[UserGrowthSongRecord]]:
-    """按歌曲名精确匹配歌曲记录，并返回候选项。"""
+    """按歌曲名匹配歌曲记录，并返回候选项。
+
+    先走精确匹配；精确失败时用歌曲库歌名在完整素材名中做唯一包含匹配。
+    """
 
     records = list(records)
 
@@ -266,11 +281,7 @@ def match_song_record(
     if not normalized:
         return None, []
 
-    exact_matches = [
-        item
-        for item in records
-        if normalize_text(item.song_name) == normalized
-    ]
+    exact_matches = _exact_song_matches(normalized, records)
 
     # 唯一匹配直接返回
     if len(exact_matches) == 1:
@@ -288,7 +299,64 @@ def match_song_record(
                 f"禁投: {item.blocked}"
             )
 
+    fuzzy_matches = _contained_song_matches(normalized, records)
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0], fuzzy_matches
+    if fuzzy_matches:
+        return None, fuzzy_matches
+
     return None, exact_matches
+
+
+def _exact_song_matches(
+        normalized_song_name: str,
+        records: Iterable[UserGrowthSongRecord],
+) -> list[UserGrowthSongRecord]:
+    return [
+        item
+        for item in records
+        if normalize_text(item.song_name) == normalized_song_name
+    ]
+
+
+def _contained_song_matches(
+        normalized_query: str,
+        records: Iterable[UserGrowthSongRecord],
+) -> list[UserGrowthSongRecord]:
+    matches_by_name: dict[str, UserGrowthSongRecord] = {}
+    for record in records:
+        normalized_song = normalize_text(record.song_name)
+        if not _song_name_matches_query(record.song_name, normalized_query):
+            continue
+        matches_by_name.setdefault(normalized_song, record)
+
+    if not matches_by_name:
+        return []
+
+    max_length = max(len(name) for name in matches_by_name)
+    return [
+        record
+        for name, record in matches_by_name.items()
+        if len(name) == max_length
+    ]
+
+
+def _song_name_matches_query(song_name: str, normalized_query: str) -> bool:
+    normalized_song = normalize_text(song_name)
+    if not normalized_song:
+        return False
+    if normalized_song == normalized_query:
+        return True
+    song_key = _song_match_key(normalized_song)
+    query_key = _song_match_key(normalized_query)
+    if len(song_key) < 2:
+        return False
+    return song_key in query_key
+
+
+def _song_match_key(value: str) -> str:
+    """把歌名压成更适合做包含匹配的比较键，去掉标点和连接符。"""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalize_text(value))
 
 
 def _extract_song_name_from_material(value: str) -> str:
@@ -455,7 +523,7 @@ def _write_backfill_row(sheet: Worksheet, row_number: int, columns: dict[str, in
         "type": "剪辑",
         "time": "",
         "order_id": item.order_id,
-        "song_name": item.song_name,
+        "song_name": item.file_name,
         "song_id": item.song_id,
         "file_name": item.file_name,
         "status": item.status,
@@ -692,14 +760,45 @@ def _song_link_from_row(sheet: Worksheet, row: int, link_col: int | None, song_c
 def _extract_song_name_from_cell(value: str) -> str:
     """从歌曲库的“歌名&链接”等混合文本中提取纯歌名。"""
     text = str(value or "").strip()
-    if "《" in text and "》" in text:
-        start = text.find("《") + 1
-        end = text.find("》", start)
-        if end > start:
-            return text[start:end].strip()
+    if not text:
+        return ""
+    title_text = re.sub(r"https?://\S+", "", text).strip()
+    if "@" in title_text:
+        title_text = title_text.split("@", 1)[0].strip()
+    outer_title = _extract_outer_book_title(title_text)
+    if outer_title:
+        return outer_title
     if "@" in text:
         text = text.split("@", 1)[0].strip()
     return text.strip("《》 ")
+
+
+def _extract_outer_book_title(value: str) -> str:
+    text = str(value or "").strip()
+    if not text.startswith("《"):
+        return ""
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "《":
+            depth += 1
+        elif char == "》":
+            depth -= 1
+            if depth == 0:
+                return text[1:index].strip()
+    return ""
+
+
+def _best_song_name_from_row(raw_song: str, raw_link: str) -> str:
+    song_name = _extract_song_name_from_cell(raw_song)
+    link_song_name = _extract_song_name_from_cell(raw_link)
+    if link_song_name and (not song_name or _has_unbalanced_brackets(song_name)):
+        return link_song_name
+    return song_name
+
+
+def _has_unbalanced_brackets(value: str) -> bool:
+    pairs = (("(", ")"), ("（", "）"), ("《", "》"))
+    return any(value.count(left) != value.count(right) for left, right in pairs)
 
 
 def _resolve_song_id_from_text(text: str, cache: dict[str, str] | None = None) -> str:
