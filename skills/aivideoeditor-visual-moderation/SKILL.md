@@ -1,6 +1,6 @@
 ---
 name: aivideoeditor-visual-moderation
-description: Aliyun Green CIP video violation reporting for AIVideoEditor. Use when Codex needs to submit videos to 阿里云视频审核增强版 / Green VideoModeration and return concrete violation labels, readable violation names, and hit timestamps for real political-sensitive, real military-sensitive, and NSFW risks.
+description: Aliyun Green CIP video violation reporting and result-based local routing for AIVideoEditor. Use when Codex needs to submit videos to 阿里云视频审核增强版 / Green VideoModeration, return concrete violation labels, readable violation names, and hit timestamps for real political-sensitive, real military-sensitive, and NSFW risks, and optionally copy or move reviewed local videos into pass/fail folders.
 ---
 
 # AIVideoEditor Violation Detection
@@ -11,13 +11,15 @@ Use this skill only for provider-backed violation detection reports. The current
 2. Wait for the provider result.
 3. Normalize Aliyun frame labels into the scoped categories: `political`, `military`, `nsfw`.
 4. Return concrete evidence with provider label, description, confidence, and timestamp.
-5. Stop after the report. Do not run any downstream processing unless the user explicitly asks for a separate workflow.
+5. If `--route-dir` is provided for a local video, place `PASS` videos under `过了` and non-pass videos under `没过`.
+6. Stop after the report and optional routing. Do not run any downstream processing unless the user explicitly asks for a separate workflow.
 
 ## Required Inputs
 
 - Aliyun video moderation credentials: `ALIBABA_CLOUD_ACCESS_KEY_ID` and `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
 - One input target: `--video` or `--url`
-- Optional runtime overrides only when the user explicitly wants them: `--region-id`, `--endpoint`, `--poll`, `--include-audio`
+- Optional routing target: `--route-dir`
+- Optional runtime overrides only when the user explicitly wants them: `--region-id`, `--endpoint`, `--poll`, `--include-audio`, `--route-mode`
 
 Do not ask for a multimodal model key for this skill. This workflow is provider-only and does not depend on DashScope/Qwen credentials.
 
@@ -48,6 +50,23 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
   --output D:\path\aliyun_green_report.json
 ```
 
+Run a local video review and route by result:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_video_moderation.py `
+  --video D:\path\input.mp4 `
+  --poll `
+  --output D:\path\aliyun_green_report.json `
+  --route-dir D:\path\reviewed
+```
+
+Routing defaults to copy mode. The script creates:
+
+- `D:\path\reviewed\过了`: `decision.action == "PASS"`
+- `D:\path\reviewed\没过`: `decision.action == "REVIEW"` or `decision.action == "BLOCK"`
+
+Use `--route-mode move` only when the original local video should be moved instead of copied.
+
 Run a URL review:
 
 ```powershell
@@ -69,6 +88,7 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
 - `violation_summary_text`: human-readable lines such as `乳沟命中时间点: 13.5 秒、14.5 秒`.
 - `evidence.provider_points`: same hit list for downstream audit.
 - `evidence.provider_unscoped_hits`: Aliyun labels that were not mapped to the current business scope.
+- `routing`: optional file routing result when `--route-dir` is provided.
 
 Example shape:
 

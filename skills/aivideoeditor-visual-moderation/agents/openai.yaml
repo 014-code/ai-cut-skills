@@ -1,4 +1,4 @@
 interface:
   display_name: "AIVideoEditor Visual Moderation"
-  short_description: "Aliyun video violation reporting"
-  default_prompt: "Use $aivideoeditor-visual-moderation to submit videos to Aliyun Green and return concrete military, political, and NSFW violation names with hit timestamps."
+  short_description: "Aliyun review reporting and routing"
+  default_prompt: "Use $aivideoeditor-visual-moderation to submit videos to Aliyun Green, return concrete military, political, and NSFW violation names with hit timestamps, and optionally route local videos into pass/fail folders."

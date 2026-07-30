@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -312,6 +313,65 @@ def build_violation_summary_text(groups: Iterable[Dict[str, Any]]) -> str:
             )
             lines.append(f"{name}命中时间段: {segments}")
     return "\n".join(lines)
+
+
+def unique_destination_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    index = 1
+    while True:
+        candidate = parent / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def route_reviewed_video(
+    video_path: Optional[str],
+    decision: Dict[str, Any],
+    route_dir: Optional[str],
+    route_mode: str,
+    passed_folder: str,
+    failed_folder: str,
+) -> Dict[str, Any]:
+    if not route_dir:
+        return {"enabled": False}
+    if not video_path:
+        return {
+            "enabled": False,
+            "reason": "Routing requires a local --video input. URL review has no local file to copy or move.",
+        }
+
+    source = Path(video_path)
+    if not source.exists():
+        return {
+            "enabled": False,
+            "reason": f"Local video does not exist: {source}",
+        }
+
+    passed = decision.get("action") == "PASS"
+    target_status = "passed" if passed else "failed"
+    folder_name = passed_folder if passed else failed_folder
+    target_dir = Path(route_dir) / folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = unique_destination_path(target_dir / source.name)
+
+    if route_mode == "move":
+        shutil.move(str(source), str(target_path))
+    else:
+        shutil.copy2(source, target_path)
+
+    return {
+        "enabled": True,
+        "mode": route_mode,
+        "target_status": target_status,
+        "source_path": str(source),
+        "target_path": str(target_path),
+        "decision_action": decision.get("action"),
+    }
 
 
 def iter_frame_hits(frame_result: Dict[str, Any]) -> Iterable[Tuple[float, str, str, str, float]]:
@@ -647,6 +707,13 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--is-vpc", action="store_true")
     parser.add_argument(
+        "--route-dir",
+        help="Copy or move a local --video into a review result folder after Aliyun returns. PASS goes to --passed-folder; REVIEW/BLOCK go to --failed-folder.",
+    )
+    parser.add_argument("--route-mode", choices=("copy", "move"), default="copy")
+    parser.add_argument("--passed-folder", default="过了")
+    parser.add_argument("--failed-folder", default="没过")
+    parser.add_argument(
         "--include-audio",
         action="store_true",
         help="Include Aliyun audio/dialogue hits in the normalized decision and redactions. Default is visual-only.",
@@ -681,6 +748,16 @@ def main() -> int:
         else:
             result_body = client.query(task_id, args.service)
 
+    decision = summarize_result(result_body or submit_body or {}, include_audio=args.include_audio)
+    routing = route_reviewed_video(
+        args.video,
+        decision,
+        args.route_dir,
+        args.route_mode,
+        args.passed_folder,
+        args.failed_folder,
+    )
+
     report = {
         "provider": "aliyun_green_cip",
         "region_id": args.region_id,
@@ -690,7 +767,8 @@ def main() -> int:
         "task_id": task_id,
         "submitted": scrub_sensitive_values(submit_body),
         "result": scrub_sensitive_values(result_body),
-        "decision": summarize_result(result_body or submit_body or {}, include_audio=args.include_audio),
+        "decision": decision,
+        "routing": routing,
     }
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -701,6 +779,7 @@ def main() -> int:
                 "action": report["decision"]["action"],
                 "categories": report["decision"]["categories"],
                 "violation_summary_text": report["decision"].get("violation_summary_text", ""),
+                "routing": report["routing"],
             },
             ensure_ascii=False,
         )

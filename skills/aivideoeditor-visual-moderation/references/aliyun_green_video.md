@@ -23,6 +23,7 @@ Required live-review inputs:
 - `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
 - one video source: `--video` or `--url`
 - `--output`
+- optional local-video routing root: `--route-dir`
 
 Do not require a DashScope/Qwen or other multimodal model key for this provider-only report flow.
 
@@ -56,6 +57,23 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
   --output D:\path\aliyun_green_report.json
 ```
 
+Review and route a local video by result:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_video_moderation.py `
+  --video D:\path\input.mp4 `
+  --poll `
+  --output D:\path\aliyun_green_report.json `
+  --route-dir D:\path\reviewed
+```
+
+Routing result:
+
+- `PASS` -> `D:\path\reviewed\过了`
+- `REVIEW` / `BLOCK` -> `D:\path\reviewed\没过`
+
+Default routing mode is `copy`. Add `--route-mode move` only when the original local video should be moved.
+
 Review from URL:
 
 ```powershell
@@ -74,6 +92,7 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
 - `task_id`
 - scrubbed `submitted` and `result`
 - normalized `decision`
+- `routing` when `--route-dir` is provided
 
 Inside `decision`, the important report fields are:
 

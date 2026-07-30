@@ -33,6 +33,11 @@ Use the strongest applicable action. `BLOCK` overrides `REVIEW`; `REVIEW` overri
 - `BLOCK` for explicit sexual dialogue or subtitles that describe sexual acts, pornographic services, sexual solicitation, or sexual content involving minors.
 - `REVIEW` for lingerie, underwear, sexualized posing, cleavage-heavy content, partial nudity, or ambiguous adult imagery.
 - `REVIEW` for suggestive dialogue, euphemisms, or borderline erotic marketing language.
+- Do not treat faces as NSFW redaction targets by default; face masking requires a separate privacy/identity policy, not the sexual-content policy.
+- Do not mask ordinary covered chest or shoulder/neck skin. Covered-breast or upper-chest candidates should be redacted only when cleavage is visually obvious, such as a clear central cleavage gap or heavy sexualized exposure.
+- Do not auto-mask ordinary belly exposure, covered buttocks, or other broad suggestive body regions.
+- For obvious cleavage, mask the central groove/gap only. If a detector returns a wide chest-spanning box, merge the same-frame chest hints first and use the box center as the groove line; if it returns a one-side breast box, shift the final mask toward the inner edge rather than covering the breast mass. Once the groove is confirmed, continue masking the same local same-shot track while the violation remains visible; stop at shot changes and re-detect if a later shot cuts back to the same kind of violation.
+- If the local crop looks like clothing texture, ornament texture, or another non-skin pattern and the central groove cannot be localized reliably, do not widen the mask. Emit `visual_localization_required` and route it to manual review or a better localizer.
 - Treat minor plus sexual evidence as severe and block immediately when such a signal exists.
 
 ### Military Rules
@@ -49,9 +54,21 @@ Treat OCR, burned-in subtitles, ASR transcript, title text, and overlay text as 
 
 - Normalize text into timestamped segments when possible.
 - Match risky text to the same `military`, `political`, and `nsfw` categories.
-- Keep visual and text evidence separate in logs.
+- Keep visual and text evidence separate in logs so redaction can target the right layer.
+- For hard hits, emit redaction targets for the visual region, subtitle region, audio segment, or text overlay.
 
 Do not over-trigger on generic words. For example, "女囚", "城墙", "开荒", "将军" in a fictional historical drama are not real-world military violations by themselves.
+
+## Redaction Rules
+
+When action is `REVIEW` or `BLOCK`, emit a `redactions` array:
+
+- `visual_mosaic`: blur or pixelate a sensitive visual region such as a political symbol, slogan, explicit body area, insignia, weapon detail, or military map.
+- `text_mosaic`: cover a subtitle/OCR text region that contains risky words or sensitive political text.
+- `audio_mute`: mute or replace dialogue audio for the timestamp span containing prohibited speech.
+- `subtitle_replace`: replace unsafe subtitle text with neutral masked text such as `[已处理]`.
+
+Full-frame masking is prohibited. Whole-person, broad torso, and other subject-sized boxes are also prohibited for visual safety masking. Visual masking must target a concrete local region with `bbox` or `bbox_keyframes`, such as the specific exposed/suggestive body part, political symbol, real military identifier, or risky text region. If no reliable local region is available, emit `visual_localization_required` evidence and route the item to a better localization step or manual review instead of masking the whole frame or the whole person.
 
 ## Suggested Thresholds
 
@@ -70,6 +87,7 @@ Each decision must keep:
 - subtitle/dialogue snippets used as evidence
 - VLM rationale when a VLM is used
 - final rule reason
+- redaction targets for non-pass decisions
 - policy version
 
 Never store secrets in skill fixtures. Mask sensitive OCR examples when fixtures are committed or shared.

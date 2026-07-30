@@ -61,7 +61,16 @@ All current implementations should return this decision shape.
     },
     "policy_hits": ["external.aliyun_green_video"]
   },
-  "policy_version": "visual-moderation-baseline-2026-07-29"
+  "redactions": [],
+  "policy_version": "visual-moderation-baseline-2026-07-29",
+  "routing": {
+    "enabled": true,
+    "mode": "copy",
+    "target_status": "failed",
+    "source_path": "D:\\path\\input.mp4",
+    "target_path": "D:\\path\\reviewed\\没过\\input.mp4",
+    "decision_action": "BLOCK"
+  }
 }
 ```
 
@@ -77,7 +86,9 @@ All current implementations should return this decision shape.
 - `evidence.labels`: provider labels used as evidence.
 - `evidence.provider_points`: same scoped hits as `violation_points`, kept for audit.
 - `evidence.provider_unscoped_hits`: provider labels that were not mapped into the current business scope.
+- `redactions`: retained as a compatibility field. This skill does not use it as the primary output.
 - `policy_version`: stable policy identifier.
+- `routing`: top-level optional object from `run_aliyun_video_moderation.py` when `--route-dir` is used. `PASS` routes to `过了`; `REVIEW` and `BLOCK` route to `没过`.
 
 Do not remove fields from this schema. Additive fields are allowed when they do not change existing semantics.
 
