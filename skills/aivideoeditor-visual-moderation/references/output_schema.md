@@ -61,7 +61,6 @@ All current implementations should return this decision shape.
     },
     "policy_hits": ["external.aliyun_green_video"]
   },
-  "redactions": [],
   "policy_version": "visual-moderation-baseline-2026-07-29"
 }
 ```
@@ -78,7 +77,6 @@ All current implementations should return this decision shape.
 - `evidence.labels`: provider labels used as evidence.
 - `evidence.provider_points`: same scoped hits as `violation_points`, kept for audit.
 - `evidence.provider_unscoped_hits`: provider labels that were not mapped into the current business scope.
-- `redactions`: retained as a compatibility field. This skill does not use it as the primary output.
 - `policy_version`: stable policy identifier.
 
 Do not remove fields from this schema. Additive fields are allowed when they do not change existing semantics.

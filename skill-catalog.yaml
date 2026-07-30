@@ -277,15 +277,13 @@
         "NSFW",
         "裸露",
         "军事敏感",
-        "遮罩",
-        "马赛克",
         "LangGraph"
       ],
       "when_to_use": [
         "需要审核图片 视频帧 OCR 字幕或 ASR 风险",
         "需要在短剧下载后进入包装前审核",
         "需要跑短剧从下载审核到包装的全流程中的审核阶段",
-        "需要识别或遮罩证件 军事敏感 NSFW 裸露 低俗等视觉对白风险"
+        "需要识别证件 军事敏感 NSFW 裸露 低俗等视觉对白风险"
       ],
       "when_not_use": [
         "短剧下载",
@@ -306,16 +304,16 @@
       "outputs": [
         "moderation_report",
         "decision_schema",
-        "redaction_targets",
-        "masked_preview"
+        "violation_points",
+        "violation_groups",
+        "violation_summary_text"
       ],
       "requires": [],
       "optional": [
         "setup-video-editing-environment"
       ],
       "next_stage": [
-        "edit-short-drama-packaging",
-        "aivideoeditor-video-fission"
+        "edit-short-drama-packaging"
       ]
     },
     "manage-visual-asset-library": {

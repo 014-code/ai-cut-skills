@@ -15,7 +15,7 @@
 - `douyin-video-toolkit`：抖音页面捕获、视频流采集、URL/GID/关键词批量下载和失败诊断。
 - `mogong-gid-retrieval`：消费通用抖音引用，执行魔工 GID 能力查询、业务过滤、结果导出和可选委托下载。
 - `adxray-playlet-crawler`：AdXRay/ADX Ray 抖音热播短剧素材采集与下载，支持短剧分类筛选、剧名搜索、详情页素材排序和 manifest/debug 产物。
-- `aivideoeditor-visual-moderation`：图片、视频帧、OCR、字幕、ASR 和遮罩产物审核，覆盖军事敏感、证件凭据和 NSFW 等视觉/对白风险。
+- `aivideoeditor-visual-moderation`：图片、视频帧、OCR、字幕、ASR 的阿里云审核，覆盖军事敏感、证件凭据和 NSFW 等视觉/对白风险。
 - `manage-visual-asset-library`：跨项目图片/视频入库、Read 内容理解、有效区域标注、Manifest 校验和语义候选报告。
 
 `douyin-video-toolkit` 负责通用素材解析与下载；`mogong-gid-retrieval` 只负责魔工业务查询、过滤和结果导出。魔工兼容入口通过统一引用契约调用 Toolkit，不再复制短链解析、GID 提取和万邦下载代码。
