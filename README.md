@@ -14,13 +14,13 @@
 
 - `douyin-video-toolkit`：抖音页面捕获、视频流采集、URL/GID/关键词批量下载和失败诊断。
 - `mogong-gid-retrieval`：消费通用抖音引用，执行魔工 GID 能力查询、业务过滤、结果导出和可选委托下载。
-- `adxray-playlet-crawler`：AdXRay/ADX Ray 抖音热播短剧素材采集与下载，支持短剧分类筛选、剧名搜索、详情页素材排序和 manifest/debug 产物。
-- `aivideoeditor-visual-moderation`：图片、视频帧、OCR、字幕、ASR 和遮罩产物审核，覆盖军事敏感、证件凭据和 NSFW 等视觉/对白风险。
+- `adxray-playlet-crawler`：AdXRay/ADX Ray 抖音热播短剧素材采集与下载，支持短剧分类筛选、剧名搜索、详情页素材排序和 manifest/debug 产物，下载后交给审核闸门。
+- `aivideoeditor-visual-moderation`：阿里云视频审核增强版，输出涉政、涉军和 NSFW 命中信息、时间点、过审路由与短剧剪辑闸门。
 - `manage-visual-asset-library`：跨项目图片/视频入库、Read 内容理解、有效区域标注、Manifest 校验和语义候选报告。
 
 `douyin-video-toolkit` 负责通用素材解析与下载；`mogong-gid-retrieval` 只负责魔工业务查询、过滤和结果导出。魔工兼容入口通过统一引用契约调用 Toolkit，不再复制短链解析、GID 提取和万邦下载代码。
 
-`adxray-playlet-crawler` 面向短剧热榜素材下载，下载结果可直接进入 `aivideoeditor-visual-moderation` 做视觉和对白审核，再进入后续包装、裂变或上传链路。
+`adxray-playlet-crawler` 面向短剧热榜素材下载，下载结果先进入 `aivideoeditor-visual-moderation` 做阿里云审核闸门，只让 `过了` 或 `allow_short_drama_editing=true` 的素材进入后续包装、裂变或上传链路。
 
 ### 3. 通用渲染组件
 
@@ -31,7 +31,7 @@
 
 - `aivideoeditor-pre-roll`：独立本地前贴视频渲染，覆盖资产清单、Logo 选择、字幕模式、免责声明和预检，不依赖远程服务。
 - `edit-soda-music-video`：汽水音乐竖屏数字人口播混剪，覆盖素材理解、去气口、Whisper 字幕、BGM、合规、品牌布局、导出和正式交付 QA。
-- `edit-short-drama-packaging`：短剧轻包装，覆盖剧名审查与补齐、利益点避让、风险/AI 提示去重、无背景提示语、原尾板替换和横竖屏尾板拼接。
+- `edit-short-drama-packaging`：只处理过审短剧的轻包装，覆盖剧名审查与补齐、利益点避让、风险/AI 提示去重、无背景提示语、原尾板替换和横竖屏尾板拼接。
 
 ### 5. 衍生加工
 

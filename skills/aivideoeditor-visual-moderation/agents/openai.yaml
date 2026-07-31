@@ -1,4 +1,4 @@
 interface:
   display_name: "AIVideoEditor Visual Moderation"
-  short_description: "Visual safety, masking, and Aliyun video review"
-  default_prompt: "Use $aivideoeditor-visual-moderation to run visual moderation, masking, or Aliyun Green video review for military, ID document, and NSFW risks."
+  short_description: "Aliyun review reporting, routing, and downstream edit gating"
+  default_prompt: "Use $aivideoeditor-visual-moderation to submit videos to Aliyun Green, return concrete military, political, and NSFW violation names with hit timestamps, route local videos into 过了/没过 folders, and expose allow_short_drama_editing so only passed videos enter later short-drama editing."

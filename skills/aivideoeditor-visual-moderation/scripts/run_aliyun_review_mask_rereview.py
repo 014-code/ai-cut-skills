@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the review -> mask/mute -> re-review loop for Aliyun Green CIP videos."""
+"""Run Aliyun gate -> VLM refinement -> mask/mute -> Aliyun re-review."""
 
 from __future__ import annotations
 
@@ -140,12 +140,11 @@ def build_provider_redactions(
     for item in merge_intervals(frame_intervals):
         redactions.append(
             {
-                "type": "visual_mosaic",
+                "type": "visual_localization_required",
                 "category": item["category"],
-                "reason": f"Aliyun first review failed; masking provider labels: {', '.join(item['labels'])}",
+                "reason": f"Aliyun first review failed; provider labels need local bbox before masking: {', '.join(item['labels'])}",
                 "start_time": round(item["start_time"], 3),
                 "end_time": round(item["end_time"], 3),
-                "region": "full_frame",
                 "source": "aliyun_green_rereview_loop",
                 "detector_labels": item["labels"],
                 "detector_score": round(float(item["confidence"]), 4),
@@ -182,18 +181,119 @@ def build_provider_redactions(
         )
 
     for item in scoped_decision.get("redactions") or []:
-        if item.get("type") in {"audio_mute", "subtitle_replace", "visual_mosaic", "visual_blur", "text_mosaic"}:
+        if item.get("type") in {"audio_mute", "subtitle_replace", "visual_mosaic", "visual_blur", "text_mosaic", "visual_localization_required"}:
             redactions.append(dict(item))
 
     return dedupe_redactions(redactions)
 
 
+def tail_text(value: str, max_chars: int = 4000) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[-max_chars:]
+
+
+def run_vlm_refinement(video_path: Path, output_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
+    report_path = output_dir / "vlm_refinement_report.json"
+    work_dir = Path(args.vlm_work_dir) if args.vlm_work_dir else output_dir / "vlm_work"
+    command = [
+        sys.executable,
+        str(HERE / "run_video_visual_moderation.py"),
+        str(video_path),
+        "--provider",
+        args.vlm_provider,
+        "--timeout",
+        str(args.vlm_timeout),
+        "--engine",
+        args.vlm_engine,
+        "--sample-count",
+        str(args.vlm_sample_count),
+        "--work-dir",
+        str(work_dir),
+        "--output",
+        str(report_path),
+        "--redaction-window",
+        str(args.vlm_redaction_window),
+    ]
+    if args.vlm_model:
+        command.extend(["--model", args.vlm_model])
+    if args.vlm_sample_interval is not None:
+        command.extend(["--sample-interval", str(args.vlm_sample_interval)])
+    if args.vlm_auto_nsfw_max_frames is not None:
+        command.extend(["--auto-nsfw-max-frames", str(args.vlm_auto_nsfw_max_frames)])
+    if args.vlm_auto_nsfw_shot_threshold is not None:
+        command.extend(["--auto-nsfw-shot-threshold", str(args.vlm_auto_nsfw_shot_threshold)])
+    if args.vlm_auto_nsfw_shot_min_gap is not None:
+        command.extend(["--auto-nsfw-shot-min-gap", str(args.vlm_auto_nsfw_shot_min_gap)])
+    if args.vlm_auto_nsfw_shot_scan_fps is not None:
+        command.extend(["--auto-nsfw-shot-scan-fps", str(args.vlm_auto_nsfw_shot_scan_fps)])
+
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    result: Dict[str, Any] = {
+        "enabled": True,
+        "provider": args.vlm_provider,
+        "model": args.vlm_model,
+        "returncode": completed.returncode,
+        "report_path": str(report_path),
+        "work_dir": str(work_dir),
+        "stdout_tail": tail_text(completed.stdout),
+        "stderr_tail": tail_text(completed.stderr),
+    }
+    if completed.returncode != 0:
+        result["status"] = "failed"
+        if not args.allow_vlm_failure_fallback:
+            raise RuntimeError(f"VLM refinement failed with exit code {completed.returncode}: {completed.stderr}")
+        return result
+    if report_path.exists():
+        result["status"] = "ok"
+        result["report"] = json.loads(report_path.read_text(encoding="utf-8"))
+    else:
+        result["status"] = "missing_report"
+    return result
+
+
+def refinement_redactions(refinement: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not refinement or refinement.get("status") != "ok":
+        return []
+    report = refinement.get("report") or {}
+    decision = report.get("decision") or {}
+    redactions = []
+    for item in decision.get("redactions") or []:
+        if not isinstance(item, dict):
+            continue
+        normalized = VISUAL_MOD.normalize_redaction_item(item)
+        normalized.setdefault("source", item.get("source") or "vlm_refinement")
+        redactions.append(normalized)
+    return dedupe_redactions(redactions)
+
+
+def combine_redactions(
+    refined: List[Dict[str, Any]],
+    provider: List[Dict[str, Any]],
+    fallback_mode: str,
+) -> List[Dict[str, Any]]:
+    if fallback_mode == "always":
+        return dedupe_redactions(refined + provider)
+    if fallback_mode == "when-empty" and not refined:
+        return dedupe_redactions(provider)
+    return dedupe_redactions(refined)
+
+
 def redaction_identity(item: Dict[str, Any]) -> Tuple[Any, ...]:
+    start = item.get("start_time")
+    end = item.get("end_time")
     return (
         item.get("type"),
         item.get("category"),
-        round(float(item.get("start_time", 0.0)), 3),
-        round(float(item.get("end_time", 0.0)), 3),
+        round(float(start), 3) if start is not None else None,
+        round(float(end), 3) if end is not None else None,
         item.get("region"),
         item.get("detector_label"),
         tuple(item.get("detector_labels") or []),
@@ -213,11 +313,16 @@ def dedupe_redactions(redactions: Iterable[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def visual_redactions(redactions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [item for item in redactions if item.get("type") in {"visual_mosaic", "visual_blur", "text_mosaic", "subtitle_replace"}]
+    return VISUAL_MOD.renderable_visual_redactions(redactions)
 
 
 def audio_mutes(redactions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [item for item in redactions if item.get("type") == "audio_mute"]
+
+
+def has_maskable_redactions(redactions: Iterable[Dict[str, Any]]) -> bool:
+    items = list(redactions)
+    return bool(visual_redactions(items) or audio_mutes(items))
 
 
 def escape_filter_time(value: Any) -> str:
@@ -378,15 +483,50 @@ def main() -> int:
         action="store_true",
         help="Process whenever Aliyun raw action is not PASS. Default triggers on scoped decision only.",
     )
+    parser.add_argument(
+        "--skip-vlm-refinement",
+        action="store_true",
+        help="Skip Qwen/VLM refinement after Aliyun fails and use provider-derived redactions only.",
+    )
+    parser.add_argument(
+        "--vlm-provider",
+        choices=("mock", "sidecar", "openai-compatible", "dashscope"),
+        default="dashscope",
+        help="Provider used only after Aliyun initial review fails.",
+    )
+    parser.add_argument("--vlm-model", default="qwen3-vl-flash", help="VLM model used only after Aliyun initial review fails.")
+    parser.add_argument("--vlm-timeout", type=int, default=60)
+    parser.add_argument("--vlm-engine", choices=("auto", "sequential", "langgraph"), default="auto")
+    parser.add_argument("--vlm-sample-count", type=int, default=20)
+    parser.add_argument("--vlm-sample-interval", type=float)
+    parser.add_argument("--vlm-work-dir")
+    parser.add_argument("--vlm-redaction-window", type=float, default=1.0)
+    parser.add_argument("--vlm-auto-nsfw-max-frames", type=int)
+    parser.add_argument("--vlm-auto-nsfw-shot-threshold", type=float)
+    parser.add_argument("--vlm-auto-nsfw-shot-min-gap", type=float)
+    parser.add_argument("--vlm-auto-nsfw-shot-scan-fps", type=float)
+    parser.add_argument(
+        "--provider-redaction-fallback",
+        choices=("off", "when-empty", "always"),
+        default="when-empty",
+        help="Keep Aliyun time-window localization hints when VLM/local detectors do not return bbox targets.",
+    )
+    parser.add_argument(
+        "--allow-vlm-failure-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If VLM refinement fails, fall back to provider redactions instead of aborting.",
+    )
+    parser.add_argument(
+        "--skip-rereview",
+        action="store_true",
+        help="Create the processed video and report, but do not submit the processed video to Aliyun again.",
+    )
     args = parser.parse_args()
 
     video_path = Path(args.video)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    ffmpeg = Path(args.ffmpeg) if args.ffmpeg else find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("ffmpeg not found. Pass --ffmpeg or run from the backend repo with material_remix_desktop_source/bin/ffmpeg.exe.")
 
     if args.initial_report:
         initial = load_initial_report(Path(args.initial_report), args.include_audio)
@@ -398,32 +538,60 @@ def main() -> int:
         initial_source = "live_review"
 
     redactions = []
+    provider_redactions = []
+    refined_redactions = []
+    refinement: Optional[Dict[str, Any]] = None
     processed: Optional[Dict[str, Any]] = None
     rereview: Optional[Dict[str, Any]] = None
     processed_video = output_dir / "processed_for_rereview.mp4"
 
     should_process = initial["raw_action"] != "PASS" if args.trigger_on_raw else initial["decision"]["action"] != "PASS"
     if should_process:
-        redactions = build_provider_redactions(
+        ffmpeg = Path(args.ffmpeg) if args.ffmpeg else find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg not found. Pass --ffmpeg or run from the backend repo with material_remix_desktop_source/bin/ffmpeg.exe.")
+
+        provider_redactions = build_provider_redactions(
             initial.get("result") or {},
             initial.get("decision") or {},
             args.visual_window,
             args.include_audio,
         )
+        if not args.skip_vlm_refinement:
+            refinement = run_vlm_refinement(video_path, output_dir, args)
+            refined_redactions = refinement_redactions(refinement)
+        redactions = combine_redactions(refined_redactions, provider_redactions, args.provider_redaction_fallback)
         redactions_path = output_dir / "redactions_for_rereview.json"
         redactions_path.write_text(json.dumps({"redactions": redactions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        processed = apply_redactions(video_path, processed_video, redactions, ffmpeg)
-        if client is None:
-            client = GREEN_MOD.AliyunGreenVideoClient(args.region_id, args.endpoint, args.is_vpc)
-        rereview = audit_video(client, processed_video, args.service, args.poll_interval, args.poll_timeout, args.include_audio)
+        if has_maskable_redactions(redactions):
+            processed = apply_redactions(video_path, processed_video, redactions, ffmpeg)
+            if client is None and not args.skip_rereview:
+                client = GREEN_MOD.AliyunGreenVideoClient(args.region_id, args.endpoint, args.is_vpc)
+            if client is not None and not args.skip_rereview:
+                rereview = audit_video(client, processed_video, args.service, args.poll_interval, args.poll_timeout, args.include_audio)
+        else:
+            processed = {
+                "status": "skipped_no_localized_redactions",
+                "reason": "No bbox/keyframe/audio/subtitle redactions were available. Full-frame masking is prohibited.",
+            }
 
     report = {
-        "flow": "review_mask_rereview",
+        "flow": "aliyun_gate_vlm_mask_rereview",
         "video": str(video_path),
         "audio_policy": "included" if args.include_audio else "ignored_visual_only",
         "trigger_policy": "raw_provider_action" if args.trigger_on_raw else "scoped_business_action",
+        "cost_gate": {
+            "initial_provider": "aliyun_green_cip",
+            "expensive_vlm_runs_only_after_initial_fail": True,
+            "should_process": should_process,
+            "vlm_refinement_skipped": bool(args.skip_vlm_refinement or not should_process),
+            "provider_redaction_fallback": args.provider_redaction_fallback,
+        },
         "initial_source": initial_source,
         "initial": initial,
+        "refinement": refinement,
+        "refined_redactions": refined_redactions,
+        "provider_redactions": provider_redactions,
         "redactions": redactions,
         "processed": processed,
         "rereview": rereview,
@@ -434,6 +602,9 @@ def main() -> int:
             {
                 "initial_raw_action": initial["raw_action"],
                 "initial_scoped_action": initial["decision"]["action"],
+                "vlm_refinement": refinement.get("status") if refinement else None,
+                "refined_redactions": len(refined_redactions),
+                "provider_redactions": len(provider_redactions),
                 "redactions": len(redactions),
                 "processed_video": processed["output"] if processed else None,
                 "rereview_raw_action": rereview["raw_action"] if rereview else None,

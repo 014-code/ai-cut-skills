@@ -2,10 +2,9 @@
 
 Use this reference for 阿里云视频审核增强版 / Green CIP video review.
 
-## Entrypoints
+## Entrypoint
 
-- `scripts/run_aliyun_video_moderation.py`: submit/query a local video or URL and normalize Aliyun result into the skill decision schema.
-- `scripts/run_aliyun_review_mask_rereview.py`: run `review -> scoped redactions -> masked video -> re-review`.
+- `scripts/run_aliyun_video_moderation.py`: submit/query a local video or URL and normalize Aliyun result into the violation report schema.
 
 ## Credentials
 
@@ -18,6 +17,16 @@ $env:ALIBABA_CLOUD_ACCESS_KEY_SECRET = "..."
 
 Never hardcode credentials in skill files, manifests, reports, or backend code.
 
+Required live-review inputs:
+
+- `ALIBABA_CLOUD_ACCESS_KEY_ID`
+- `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
+- one video source: `--video` or `--url`
+- `--output`
+- optional local-video routing root: `--route-dir`
+
+Do not require a DashScope/Qwen or other multimodal model key for this provider-only report flow.
+
 ## Dependencies
 
 Aliyun live calls need:
@@ -27,17 +36,15 @@ Aliyun live calls need:
 - `alibabacloud_tea_util`
 - `oss2`
 
-The review-mask-rereview script also needs `ffmpeg`. It auto-detects `ffmpeg` from `PATH` or `material_remix_desktop_source/bin/ffmpeg.exe` when run from the backend repo. Pass `--ffmpeg` if needed.
+## Scope
 
-## Visual-Only Default
+The normalized report keeps only the current business scope:
 
-Both scripts default to business-scoped visual-only normalization:
+- `military`
+- `political`
+- `nsfw`
 
-- Aliyun frame/video labels are mapped into `military`, `id_document`, and `nsfw`.
-- Aliyun audio/dialogue hits are ignored unless `--include-audio` is provided.
-- The rereview loop triggers on the scoped business decision by default, not raw Aliyun provider action.
-
-Use `--include-audio` only when the user asks for audio mute/subtitle replacement. Use `--trigger-on-raw` only when the user wants to process every raw Aliyun non-PASS result.
+Visual-only is the default. Audio/dialogue is not included unless the user explicitly asks for it.
 
 ## Commands
 
@@ -50,6 +57,30 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
   --output D:\path\aliyun_green_report.json
 ```
 
+Review and route a local video by result:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_video_moderation.py `
+  --video D:\path\input.mp4 `
+  --poll `
+  --output D:\path\aliyun_green_report.json `
+  --route-dir D:\path\reviewed
+```
+
+Routing result:
+
+- `PASS` -> `D:\path\reviewed\过了`
+- `REVIEW` / `BLOCK` -> `D:\path\reviewed\没过`
+- every routed video gets sidecar logs: `<video-stem>.audit.json` and `审核说明.txt`
+
+Default routing mode is `copy`. Add `--route-mode move` only when the original local video should be moved.
+
+Downstream short-drama editing gate:
+
+- only `downstream_gate.allow_short_drama_editing == true` may enter later packaging/editing
+- with local routing, this means use only files under `D:\path\reviewed\过了`
+- never use files under `D:\path\reviewed\没过`; their audit logs are for failure explanation and manual review only
+
 Review from URL:
 
 ```powershell
@@ -57,25 +88,6 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
   --url "https://example.com/input.mp4" `
   --poll `
   --output D:\path\aliyun_green_report.json
-```
-
-Review-mask-rereview:
-
-```powershell
-python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_review_mask_rereview.py `
-  --video D:\path\input.mp4 `
-  --output-dir D:\path\aliyun_rereview `
-  --output D:\path\aliyun_rereview\flow_report.json
-```
-
-Reuse an existing first review:
-
-```powershell
-python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_aliyun_review_mask_rereview.py `
-  --video D:\path\input.mp4 `
-  --initial-report D:\path\aliyun_green_report.json `
-  --output-dir D:\path\aliyun_rereview `
-  --output D:\path\aliyun_rereview\flow_report.json
 ```
 
 ## Output Notes
@@ -87,13 +99,22 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
 - `task_id`
 - scrubbed `submitted` and `result`
 - normalized `decision`
+- `routing` when `--route-dir` is provided
+- `downstream_gate` on every report
+- `gate_log` paths when local routing writes sidecar logs
 
-`run_aliyun_review_mask_rereview.py` writes:
+Inside `decision`, the important report fields are:
 
-- `initial` review
-- scoped `redactions`
-- optional `processed` video paths
-- optional `rereview`
-- `trigger_policy`
+- `violation_points`
+- `violation_groups`
+- `violation_summary_text`
+
+Inside `downstream_gate`, the important workflow field is:
+
+- `allow_short_drama_editing`: true only for `decision.action == "PASS"`
+
+For failed videos, read the sidecar `审核说明.txt` or `.audit.json` under `没过` to see the failed timestamps and reasons.
+
+The cleavage hit is preserved as `乳沟` when Aliyun returns `sexual_cleavage` or a matching description such as `女性乳沟`.
 
 Temporary Aliyun upload URLs and tokens are scrubbed from reports.
