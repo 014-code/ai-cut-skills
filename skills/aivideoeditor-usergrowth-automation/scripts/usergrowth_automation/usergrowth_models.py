@@ -22,12 +22,16 @@ class UserGrowthVideoItem:
     file_name: str
     material_type: str
     song_name: str
+    workflow: str = "soda_music"
     song_id: str = ""
     song_match_message: str = ""
     order_id: str = ""
     custom_tags: list[str] = field(default_factory=list)
     classification_path: list[str] = field(default_factory=list)
+    classification_paths: list[list[str]] = field(default_factory=list)
+    post_review_classification_paths: list[list[str]] = field(default_factory=list)
     optional_tags: list[str] = field(default_factory=list)
+    workflow_metadata: dict[str, Any] = field(default_factory=dict)
     blocked: bool = False
     status: str = "pending"
     message: str = ""
@@ -39,6 +43,7 @@ class UserGrowthVideoItem:
         return {
             "path": str(self.path),
             "file_name": self.file_name,
+            "workflow": self.workflow,
             "material_type": self.material_type,
             "song_name": self.song_name,
             "song_id": self.song_id,
@@ -46,7 +51,10 @@ class UserGrowthVideoItem:
             "order_id": self.order_id,
             "custom_tags": self.custom_tags,
             "classification_path": self.classification_path,
+            "classification_paths": self.classification_paths,
+            "post_review_classification_paths": self.post_review_classification_paths,
             "optional_tags": self.optional_tags,
+            "workflow_metadata": self.workflow_metadata,
             "blocked": self.blocked,
             "status": self.status,
             "message": self.message,
@@ -108,8 +116,8 @@ class UserGrowthRunConfig:
     """客户端发起一次 UserGrowth 预检或上传任务所需的配置。"""
 
     video_folder: Path
-    order_excel: Path
-    song_excel: Path
+    order_excel: Path | None
+    song_excel: Path | None
     output_root: Path
     account: str
     password: str
@@ -117,6 +125,15 @@ class UserGrowthRunConfig:
     task_name: str = "usergrowth_upload"
     batch_name: str = ""
     selected_video_paths: list[Path] = field(default_factory=list)
+    workflow: str = "soda_music"
+    delivery_products: list[str] = field(default_factory=list)
+    delivery_platforms: list[str] = field(default_factory=list)
+    delivery_platform_all: bool | None = None
+    arlp_products: list[str] = field(default_factory=list)
+    arlp_platforms: list[str] = field(default_factory=list)
+    arlp_platform_all: bool | None = None
+    redfruit_default_genre: str = ""
+    redfruit_bid_map: dict[str, str] = field(default_factory=dict)
     custom_tag_template_name: str = DEFAULT_CUSTOM_TAG_TEMPLATE_NAME
     custom_tag_template_tags: list[str] = field(default_factory=default_custom_tag_template_tags)
     month_tag: str = ""

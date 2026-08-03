@@ -11,6 +11,7 @@ from typing import Callable, Iterable
 
 from .usergrowth_captcha import UserGrowthCaptchaSolver
 from .usergrowth_models import UserGrowthCancelled, UserGrowthOrderPlan, UserGrowthVideoItem
+from .usergrowth_redfruit import is_redfruit_workflow
 from .usergrowth_rules import display_material_from_label, classification_path_for_material
 
 ProgressCallback = Callable[[str], None]
@@ -23,11 +24,12 @@ def _compact_text(value: str) -> str:
 
 
 def _compact_cascader_text(value: str) -> str:
-    return re.sub(r"[\s\u00a0_]+", "", value or "")
+    return re.sub(r"[\s\u00a0_/\-－—–、，,（）()\[\]【】《》]+", "", value or "")
 
 
 LOGIN_URL = "https://usergrowth.com.cn/open/login"
 HOME_URL = "https://usergrowth.com.cn/home"
+WORK_ORDER_URL = "https://usergrowth.com.cn/aigc/manage/order"
 
 # 操作速度
 USERGROWTH_OPERATION_SPEED_FACTOR = 1.0
@@ -60,7 +62,7 @@ class UserGrowthBrowserClient:
             timeout_ms: int = 45000,
             refresh_interval_seconds: float = 12.0,
             max_status_retries: int = 3,
-            browser_slow_mo_ms: int = 600,
+            browser_slow_mo_ms: int = 120,
             order_complete: OrderCompleteCallback | None = None,
             cancel_event: threading.Event | None = None,
     ) -> None:
@@ -347,18 +349,22 @@ class UserGrowthBrowserClient:
                 await self._snapshot_error(page, f"order_{plan.order_id}_task_id_not_found")
                 raise RuntimeError("未读取到当前任务ID")
 
+            redfruit_flow = self._is_redfruit_items(active_items)
             wait_result = await self._wait_task_success(
                 page,
                 progress,
                 expected_attempts=max(len(active_items), 1),
-                plan=plan,
-                items=active_items,
-                task_id=plan.task_id,
+                plan=None if redfruit_flow else plan,
+                items=[] if redfruit_flow else active_items,
+                task_id="" if redfruit_flow else plan.task_id,
             )
             if wait_result == "cid_backed_up":
                 return
             await self._submit_review(page)
-            await self._fill_cids_for_task(page, active_items, plan.task_id, progress)
+            if redfruit_flow:
+                await self._process_redfruit_after_review(page, plan, active_items, plan.task_id, progress)
+            else:
+                await self._fill_cids_for_task(page, active_items, plan.task_id, progress)
             plan.status = "success"
             plan.message = "处理完成"
         except UserGrowthCancelled as exc:
@@ -438,6 +444,12 @@ class UserGrowthBrowserClient:
         """从首页点墨攻AI进入，再点菜单栏的工单管理。"""
         self._emit(progress, "进入工单管理")
 
+        try:
+            await self._safe_goto(page, HOME_URL)
+            await page.wait_for_timeout(2500)
+        except Exception:
+            pass
+
         # 1. 等"墨攻AI"出现；不设总超时，页面短暂白屏或接口慢时持续等待。
         while True:
             try:
@@ -448,21 +460,35 @@ class UserGrowthBrowserClient:
                 )
                 break
             except Exception:
-                # 沿用之前的刷新逻辑：safe_goto HOME_URL
                 try:
-                    await self._safe_goto(page, HOME_URL)
+                    await page.reload(wait_until="domcontentloaded")
                 except Exception:
                     pass
                 self._emit(progress, "等待墨攻AI入口加载，继续重试")
                 await page.wait_for_timeout(2000)
         await self._click_text(page, "墨攻AI")
 
-        # 2. 等墨攻AI加载（出现工单管理/素材管理菜单就算成功），不设总超时。
-        await self._wait_for_page_text(
-            page, ("工单管理", "素材管理"),
-            timeout_ms=None,
-            raise_on_timeout=True,
-        )
+        # 2. 等墨攻AI加载（出现工单管理/素材管理菜单就算成功）。若入口点击没有展开，
+        # 则继续点入口或回首页重试，避免无日志地卡在菜单等待。
+        menu_retry = 0
+        while True:
+            if await self._wait_for_page_text(
+                    page,
+                    ("工单管理", "素材管理"),
+                    timeout_ms=12000,
+                    raise_on_timeout=False,
+            ):
+                break
+            menu_retry += 1
+            self._emit(progress, f"等待墨攻AI菜单加载，继续重试（第 {menu_retry} 次）")
+            try:
+                await self._click_text(page, "墨攻AI")
+            except RuntimeError:
+                try:
+                    await self._safe_goto(page, HOME_URL)
+                except Exception:
+                    pass
+            await page.wait_for_timeout(1800)
 
         # 3. 点工单管理
         try:
@@ -878,7 +904,7 @@ class UserGrowthBrowserClient:
             raise RuntimeError(f"新标签页加载失败: {exc}, url={page.url}")
         _log(f"new tab loaded, url={page.url}")
         await self._wait_creative_unit_table_ready(page, timeout_ms=None)
-        await self._click_creative_unit_select_all_checkbox(page)
+        await self._select_creative_units_for_items(page, items)
         # "录入素材"点击后可能打开新标签页，也可能当前页跳转；不设总超时等待目标页出现。
         entry_page = await self._click_text_and_wait_page(page, "录入素材", timeout_ms=None)
         self._wrap_page_speed(entry_page)
@@ -895,9 +921,9 @@ class UserGrowthBrowserClient:
                 break
             await page.wait_for_timeout(500)
         await self._snapshot(page, "after_enter_chameleon")
-        await self._ensure_chameleon_modal(page)
+        await self._ensure_chameleon_modal(page, items[0])
         await self._click_chameleon_modal_confirm(page)
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(350)
         # todo 是否每次上传都是同一批的，如果是的话就不用循环了
         await self._fill_card_defaults(page, items[0])
         return page
@@ -935,7 +961,7 @@ class UserGrowthBrowserClient:
         body = await self._body_text(page, timeout_ms=2000)
         if not body.strip():
             return False
-        return any(text in body for text in ("投放平台", "汽水音乐"))
+        return "投放平台" in body and any(text in body for text in ("投放产品", "汽水音乐", "红果免费短剧", "红果免费漫剧"))
 
     async def _wait_upload_cards_ready(self, page, items: list[UserGrowthVideoItem]) -> None:
         """等待选中文件后页面生成对应数量的待提交创意设置卡片，不设总超时。"""
@@ -1008,16 +1034,18 @@ class UserGrowthBrowserClient:
             return False
         return all(item.file_name in body for item in items)
 
-    async def _ensure_chameleon_modal(self, page) -> None:
+    async def _ensure_chameleon_modal(self, page, item: UserGrowthVideoItem | None = None) -> None:
         """检查录入弹窗里的投放产品和投放平台是否符合预期。"""
         await self._snapshot(page, "chameleon_delivery_before_check")
-        expected_fields = (
-            ("投放产品", "汽水音乐"),
-        )
+        expected_fields, platform_all = self._workflow_delivery_expectations(item)
         for field_text, value_text in expected_fields:
             if not await self._ensure_delivery_field_value(page, field_text, value_text):
                 await self._snapshot_error(page, f"chameleon_delivery_{field_text}_not_selected")
-        if not await self._ensure_delivery_platform_all(page):
+        if platform_all:
+            platform_ok = await self._ensure_delivery_platform_all(page)
+        else:
+            platform_ok = await self._ensure_delivery_platforms(page, item)
+        if not platform_ok:
             await self._snapshot_error(page, "chameleon_delivery_platform_not_selected")
 
         missing = [
@@ -1026,31 +1054,119 @@ class UserGrowthBrowserClient:
             if not await self._delivery_field_has_value(page, label, value)
         ]
         if not await self._delivery_platform_has_selection(page):
-            missing.append("投放平台:全部下拉选项")
+            missing.append("投放平台")
         if missing:
             await self._snapshot_error(page, "chameleon_delivery_check_failed")
             raise RuntimeError(f"录入弹窗内容不符合预期：缺少 {', '.join(missing)}")
 
-    async def _ensure_delivery_field_value(self, page, field_text: str, value_text: str) -> bool:
+    def _workflow_delivery_expectations(self, item: UserGrowthVideoItem | None) -> tuple[tuple[tuple[str, str], ...], bool]:
+        """按工作流返回投放产品与平台全选策略。"""
+        if self._is_redfruit_item(item):
+            metadata = self._workflow_metadata(item)
+            products = tuple((("投放产品", value) for value in (metadata.get("delivery_products") or ["红果免费短剧(8662)"])))
+            return products, bool(metadata.get("delivery_platform_all"))
+        return (("投放产品", "汽水音乐"),), True
+
+    def _is_redfruit_item(self, item: UserGrowthVideoItem | None) -> bool:
+        return bool(item and is_redfruit_workflow(getattr(item, "workflow", "")))
+
+    def _is_redfruit_items(self, items: Iterable[UserGrowthVideoItem]) -> bool:
+        return any(self._is_redfruit_item(item) for item in items)
+
+    def _workflow_metadata(self, item: UserGrowthVideoItem | None) -> dict:
+        if not item:
+            return {}
+        metadata = getattr(item, "workflow_metadata", None)
+        return metadata if isinstance(metadata, dict) else {}
+
+    async def _ensure_delivery_platforms(self, page, item: UserGrowthVideoItem | None = None) -> bool:
+        """把投放平台按指定列表逐个选中。"""
+        metadata = self._workflow_metadata(item)
+        platform_values = list(metadata.get("delivery_platforms") or [])
+        if not platform_values:
+            return await self._ensure_delivery_platform_all(page)
+        return await self._ensure_delivery_field_values(page, "投放平台", platform_values)
+
+    async def _ensure_delivery_field_values(self, page, field_text: str, value_texts: Iterable[str]) -> bool:
+        """快速选择一个多选投放字段里的多个值，并逐个校验是否保留。"""
+        values = [str(value or "").strip() for value in value_texts if str(value or "").strip()]
+        if not values:
+            return True
+        selected = True
+        keep_dropdown_open = field_text == "投放平台"
+        for value_text in values:
+            if await self._delivery_field_has_value(page, field_text, value_text):
+                continue
+
+            success = await self._ensure_delivery_field_value(
+                page,
+                field_text,
+                value_text,
+                keep_dropdown_open=keep_dropdown_open,
+            )
+            selected = selected and success
+        await self._close_open_delivery_dropdown_if_needed(page)
+        return selected
+
+    async def _type_open_dropdown_value(self, page, value_text: str) -> None:
+        """在当前展开的下拉搜索框里快速写入一个值。"""
+        root = await self._open_dropdown_root(page)
+        input_box = root.locator("input").first if root else None
+        try:
+            if input_box and await input_box.count() and await input_box.is_visible():
+                await input_box.fill(value_text, timeout=3000)
+                return
+        except Exception:
+            pass
+        await self._keyboard_type(page, value_text, delay_ms=20)
+
+    async def _ensure_delivery_field_value(
+            self,
+            page,
+            field_text: str,
+            value_text: str,
+            *,
+            keep_dropdown_open: bool = False,
+    ) -> bool:
         """确保录入投放信息中的指定字段选择到目标值。"""
         if await self._delivery_field_has_value(page, field_text, value_text):
             return True
-        for attempt in range(3):
-            if not await self._open_delivery_dropdown_by_label(page, field_text):
-                await page.wait_for_timeout(800)
-                continue
-            await page.wait_for_timeout(900)
-            if field_text == "投放平台":
-                await self._snapshot(page, f"chameleon_delivery_platform_dropdown_{attempt + 1}")
-                await self._type_into_open_dropdown(page, value_text)
-                await self._snapshot(page, f"chameleon_delivery_platform_after_type_{attempt + 1}")
-            await self._click_dropdown_option(page, value_text)
-            await page.wait_for_timeout(900)
-            # 只按当前字段校验，避免页面其他位置的相同文案造成误判。
-            if await self._delivery_field_has_value(page, field_text, value_text):
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            if keep_dropdown_open:
+                if not await self._delivery_dropdown_opened(page):
+                    if not await self._open_delivery_dropdown_by_label(page, field_text):
+                        await page.wait_for_timeout(120)
+                        continue
+                await page.wait_for_timeout(120)
+            else:
                 await self._close_open_delivery_dropdown_if_needed(page)
+                if not await self._open_delivery_dropdown_by_label(page, field_text):
+                    await page.wait_for_timeout(200)
+                    continue
+                await page.wait_for_timeout(220)
+            if field_text == "投放平台":
+                await self._snapshot(page, f"chameleon_delivery_platform_dropdown_{attempt}")
+                await self._type_into_open_dropdown(page, value_text)
+                await self._snapshot(page, f"chameleon_delivery_platform_after_type_{attempt}")
+            clicked = await self._click_dropdown_option(page, value_text)
+            if not clicked:
+                await page.wait_for_timeout(120 if keep_dropdown_open else 200)
+                continue
+
+            async def value_selected() -> bool:
+                return await self._delivery_field_has_value(page, field_text, value_text)
+
+            if await self._wait_for_result(value_selected, timeout_ms=None, interval_ms=400):
+                if not keep_dropdown_open:
+                    await self._close_open_delivery_dropdown_if_needed(page)
                 return True
-        return False
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] delivery field waiting "
+                f"field={field_text}, value={value_text}, attempt={attempt}"
+            )
 
     async def _open_delivery_dropdown_by_label(self, page, field_text: str) -> bool:
         """在录入确认框中，按字段标签打开对应下拉控件。"""
@@ -1068,7 +1184,7 @@ class UserGrowthBrowserClient:
         # Arco 下拉有时不响应 dispatchEvent，所以这里用真实鼠标点击并确认浮层真的展开。
         for locator in candidates[:4]:
             if await self._click_locator_center(page, locator):
-                await page.wait_for_timeout(250)
+                await page.wait_for_timeout(120)
                 if await self._delivery_dropdown_opened(page):
                     return True
         return False
@@ -1138,7 +1254,7 @@ class UserGrowthBrowserClient:
     async def _field_label(self, root, field_text: str):
         """返回字段标签元素。"""
         wanted = _compact_text(field_text)
-        labels = await self._visible_locators(root.locator("label, .arco-form-item-label, div, span"), limit=120)
+        labels = await self._visible_locators(root.locator("label, .arco-form-item-label, div, span"), limit=300)
         for label in labels:
             text = _compact_text(await self._locator_text(label, timeout_ms=1000))
             # 限制长度，避免把包含大量子控件文本的容器误判成标签。
@@ -1236,7 +1352,10 @@ class UserGrowthBrowserClient:
                 continue
             await page.wait_for_timeout(100)
             await self._snapshot(page, f"chameleon_delivery_platform_dropdown_{attempt + 1}")
-            await self._select_all_open_dropdown_options(page)
+            await self._set_open_dropdown_page_size_max(page)
+            clicked_table_all = await self._click_open_dropdown_table_select_all(page)
+            if not clicked_table_all:
+                await self._select_all_open_dropdown_options(page)
             await self._snapshot(page, f"chameleon_delivery_platform_all_clicked_{attempt + 1}")
             # 选完不等待，直接点"投放平台"标题收回下拉
             await self._click_text(page, "投放平台")
@@ -1244,10 +1363,79 @@ class UserGrowthBrowserClient:
             return True
         return False
 
+    async def _set_open_dropdown_page_size_max(self, page) -> None:
+        """如果打开的下拉里有分页条数选择，先切到最大条数。"""
+        root = await self._open_dropdown_root(page)
+        if not root:
+            return
+        try:
+            controls = await self._visible_locators(
+                root.locator(".arco-pagination-options-size-changer, .arco-select-view, [class*='size-changer']"),
+                limit=20,
+            )
+            target = None
+            for control in controls:
+                text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+                if "条/页" in text or "条每页" in text:
+                    target = control
+                    break
+            if not target:
+                return
+            if not (await self._click_locator_center(page, target) or await self._click_locator(target)):
+                return
+            await page.wait_for_timeout(500)
+            for value in ("100条/页", "100 条/页", "50条/页", "50 条/页", "30条/页", "30 条/页", "20条/页", "20 条/页"):
+                if await self._click_visible_dropdown_option(page, value):
+                    await page.wait_for_timeout(1200)
+                    return
+        except Exception:
+            return
+
+    async def _click_open_dropdown_table_select_all(self, page) -> bool:
+        """点击当前下拉浮层内的表格全选框。"""
+        root = await self._open_dropdown_root(page)
+        if not root:
+            return False
+        candidates = (
+            root.locator(".arco-table thead .arco-checkbox-mask").first,
+            root.locator(".arco-table thead .arco-checkbox-mask-wrapper").first,
+            root.locator(".arco-table thead label.arco-checkbox").first,
+            root.locator(".arco-table thead .arco-checkbox").first,
+            root.get_by_text("全选", exact=True).first,
+        )
+        for checkbox in candidates:
+            try:
+                if not await checkbox.count() or not await checkbox.is_visible():
+                    continue
+                if await self._checkbox_box_is_checked(checkbox):
+                    return True
+                if await self._click_locator(checkbox):
+                    await page.wait_for_timeout(900)
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _close_open_delivery_dropdown_if_needed(self, page) -> None:
         """仅在投放信息弹窗下拉仍然展开时尝试收起，避免遮挡确认按钮。"""
-        if await self._delivery_dropdown_opened(page):
-            await self._click_text(page, "上传素材")
+        for _ in range(4):
+            if not await self._delivery_dropdown_opened(page):
+                return
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(250)
+            except Exception:
+                pass
+            if not await self._delivery_dropdown_opened(page):
+                return
+            try:
+                root = await self._delivery_modal_root(page)
+                box = await root.bounding_box(timeout=2000) if root else None
+                if box and box["width"] < 1200 and box["height"] < 900:
+                    await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + 20)
+                    await page.wait_for_timeout(120)
+            except Exception:
+                pass
 
     async def _select_all_open_dropdown_options(self, page) -> int:
         """逐屏逐个点击当前打开下拉框里的未选中选项，直到滚动到底。"""
@@ -1268,7 +1456,7 @@ class UserGrowthBrowserClient:
                     await option.click(timeout=3000)
                     clicked_this_round += 1
                     total_clicked += 1
-                    await page.wait_for_timeout(220)
+                    await page.wait_for_timeout(80)
                 except Exception:
                     continue
             if await self._dropdown_at_bottom(root):
@@ -1282,7 +1470,7 @@ class UserGrowthBrowserClient:
             last_visible_text = visible_text
             if stagnant_rounds >= 3:
                 break
-            await page.wait_for_timeout(450)
+            await page.wait_for_timeout(150)
         return total_clicked
 
     async def _delivery_field_has_value(self, page, field_text: str, value_text: str) -> bool:
@@ -1315,7 +1503,7 @@ class UserGrowthBrowserClient:
             else:
                 # 部分 Arco 组件 input 不在浮层内，退回键盘输入给当前焦点。
                 await self._keyboard_type(page, keyword)
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(200)
         except Exception:
             return
 
@@ -1326,7 +1514,7 @@ class UserGrowthBrowserClient:
             if await self._click_visible_dropdown_option(page, option_text):
                 return True
             await self._scroll_open_dropdown(page)
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(120)
         return False
 
     async def _click_visible_dropdown_option(self, page, option_text: str) -> bool:
@@ -1365,10 +1553,14 @@ class UserGrowthBrowserClient:
     @staticmethod
     def _delivery_value_visible(body: str, value_text: str) -> bool:
         """判断投放信息目标值是否已显示。"""
-        return value_text in body
+        return _compact_text(value_text) in _compact_text(body)
 
     async def _fill_card_defaults(self, page, item: UserGrowthVideoItem) -> None:
         """为素材卡片填写制作团队、授权、分类标签和自定义标签。"""
+        if self._is_redfruit_item(item):
+            await self._fill_redfruit_card_defaults(page, item)
+            return
+
         await self._select_dropdown_value(page, "请选择UGC内容", "不包含")
         await self._select_dropdown_value(page, "分类标签")
         # 进入到弹窗进行级联选择
@@ -1383,7 +1575,6 @@ class UserGrowthBrowserClient:
         )
         await self._select_cascader(page, "LUNA素材来源", ["LUNA素材来源", "LUNA_千沧代理"])
 
-        print(f"匹配到的类型{classification_path_for_material(item.file_name)}")
         path = classification_path_for_material(item.file_name)
         # 最前面的LUNA功能卖点点上
         path.insert(0, "LUNA功能卖点")
@@ -1397,8 +1588,6 @@ class UserGrowthBrowserClient:
 
         # 填入预检阶段按模板渲染好的自定义标签
         tags = list(item.custom_tags)
-
-        print(f"自定义标签集合{tags}")
 
         for tag in tags:
             input_box = await self._inputtag_for_field(page, "自定义标签")
@@ -1422,12 +1611,126 @@ class UserGrowthBrowserClient:
         # 提交后平台生成任务详情入口可能较慢，不设总超时等待。
         await self._wait_and_click_text(page, "查看任务详情", timeout_ms=None)
 
+    async def _fill_redfruit_card_defaults(self, page, item: UserGrowthVideoItem) -> None:
+        """填写红果短剧素材卡片。"""
+        if not await self._ensure_dropdown_value(page, "UGC内容", "不包含"):
+            await self._snapshot_error(page, "redfruit_ugc_select_failed")
+            raise RuntimeError("红果短剧 UGC 内容选择失败")
+        if not await self._ensure_dropdown_value(page, "制作团队", "素材供应商/千沧"):
+            await self._snapshot_error(page, "redfruit_team_select_failed")
+            raise RuntimeError("红果短剧制作团队选择失败")
+        if not await self._ensure_dropdown_value(page, "创意源", "原创"):
+            await self._snapshot_error(page, "redfruit_creative_source_select_failed")
+            raise RuntimeError("红果短剧创意源选择失败")
+        if not await self._select_dropdown_value(page, "分类标签"):
+            await self._snapshot_error(page, "redfruit_label_panel_open_failed")
+            raise RuntimeError("红果短剧分类标签入口打开失败")
+
+        for path in item.classification_paths or item.workflow_metadata.get("classification_paths", []):
+            if not path:
+                continue
+            if not await self._select_cascader(page, str(path[0]), list(path)):
+                raise RuntimeError(f"红果分类标签选择失败：{path[0]}")
+        await self._click_if_present(page, "确定")
+
+        for tag in item.custom_tags:
+            input_box = await self._inputtag_for_field(page, "自定义标签")
+            await input_box.fill(tag, timeout=5000)
+            await page.keyboard.press("Enter")
+
+        await self._click_radio_near_text(page, "未成年人内容", "已授权")
+        await self._click_radio_near_text(page, "影视内容", "已授权")
+        await self._reuse_all_submit_and_open_task_detail(page)
+
+    async def _ensure_dropdown_value(self, page, field_text: str, value_text: str) -> bool:
+        """普通下拉字段已是目标值时跳过，否则选择目标值。"""
+        if await self._dropdown_field_has_value(page, field_text, value_text):
+            return True
+        return await self._select_dropdown_value(page, field_text, value_text)
+
+    async def _select_redfruit_required_cascader(
+            self,
+            page,
+            field_name: str,
+            paths: Iterable[list[str]],
+    ) -> None:
+        """尝试多种红果级联路径，全部失败时抛出明确错误。"""
+        last_error: Exception | None = None
+        for path in paths:
+            try:
+                await self._select_cascader(page, field_name, list(path))
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
+        await self._snapshot_error(page, f"redfruit_{field_name}_select_failed", exc=last_error)
+        raise RuntimeError(f"红果分类标签选择失败：{field_name}") from last_error
+
+    async def _cascader_trigger_for_field(
+            self,
+            page,
+            field_name: str,
+            *,
+            prefer_modal_bottom: bool = False,
+    ):
+        """按字段名定位真正的级联触发控件，优先同一表单项，避免点到邻近字段。"""
+        root = await self._active_modal_root(page)
+        if root and prefer_modal_bottom:
+            await self._scroll_root(page, root, to_bottom=True)
+
+        if root:
+            for item in await self._visible_locators(root.locator(FORM_ITEM_SELECTOR), limit=120):
+                label = await self._field_label(item, field_name)
+                if not label:
+                    continue
+                controls = await self._nearby_select_controls(item, field_name)
+                if controls:
+                    return controls[0]
+                controls = await self._select_controls(item)
+                if controls:
+                    return controls[0]
+
+            label = await self._field_label(root, field_name)
+            if label:
+                controls = await self._nearby_select_controls(root, field_name)
+                if controls:
+                    return controls[0]
+                form_item = label.locator(
+                    "xpath=ancestor::*[contains(@class,'arco-form-item') or contains(@class,'form-item')][1]"
+                ).first
+                if await form_item.count():
+                    controls = await self._select_controls(form_item)
+                    if controls:
+                        return controls[0]
+
+        body = page.locator("body").first
+        for control in await self._visible_locators(body.locator(SELECT_CONTROL_SELECTOR), limit=120):
+            text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+            if _compact_text(field_name) and _compact_text(field_name) in text:
+                return control
+        return None
+
+    async def _reuse_all_submit_and_open_task_detail(self, page) -> None:
+        """复用首卡标签，提交并进入任务详情。"""
+        await self._click_if_present(page, "一键复用")
+        await page.wait_for_timeout(200)
+        await self._select_all_visible_pages(page)
+        await page.wait_for_timeout(800)
+        await self._click_if_present(page, "一键复用")
+        await page.wait_for_timeout(1000)
+        await self._click_if_present(page, "提交")
+        await page.wait_for_timeout(1500)
+        await self._wait_and_click_text(page, "查看任务详情", timeout_ms=None)
+
     async def _select_cascader(
             self,
             page,
             field_name: str,
-            path: list[str]
-    ) -> None:
+            path: list[str],
+            *,
+            field_timeout_ms: int | None = 10000,
+            prefer_modal_bottom: bool = False,
+    ) -> bool:
         """
         通用级联选择
 
@@ -1438,108 +1741,159 @@ class UserGrowthBrowserClient:
             "LUNA_自产"
         ]
         """
-
-        title = page.get_by_text(
+        trigger = await self._cascader_trigger_for_field(
+            page,
             field_name,
-            exact=True
-        ).first
-
-        await title.wait_for(
-            state="visible",
-            timeout=10000
+            prefer_modal_bottom=prefer_modal_bottom,
         )
+        if not trigger:
+            title = await self._wait_cascader_field_label(
+                page,
+                field_name,
+                timeout_ms=field_timeout_ms,
+                prefer_modal_bottom=prefer_modal_bottom,
+            )
+            if not title:
+                raise RuntimeError(f"未找到级联字段：{field_name}")
 
-        cascader = title.locator(
-            "xpath=following::div[contains(@class,'arco-cascader')][1]"
-        )
+            form_item = title.locator(
+                "xpath=ancestor::*[contains(@class,'arco-form-item') or contains(@class,'form-item')][1]"
+            ).first
+            if await form_item.count():
+                trigger = form_item.locator("div[class*='arco-cascader'], .arco-cascader-view").first
+            else:
+                trigger = title.locator(
+                    "xpath=following::div[contains(@class,'arco-cascader')][1]"
+                )
 
-        await cascader.wait_for(
-            state="visible",
-            timeout=10000
-        )
+        await trigger.wait_for(state="visible", timeout=10000)
 
-        print(
-            f"[cascader] 打开字段: {field_name}"
-        )
-
-        input_box = cascader.locator("input")
+        input_box = trigger.locator("input")
 
         if await input_box.count():
-
-            print(
-                "[cascader] 点击 input"
-            )
-
             await input_box.click()
 
         else:
-
-            print(
-                "[cascader] 未找到input，点击容器"
-            )
-
-            await cascader.click(
-                force=True
-            )
+            await trigger.click(force=True)
 
         await page.wait_for_timeout(1000)
 
-        popup = page.locator(
-            ".arco-cascader-popup"
-        ).last
-
-        popup_count = await page.locator(
-            ".arco-cascader-popup"
-        ).count()
-
-        print(
-            f"[cascader] popup数量={popup_count}"
-        )
-
+        popup_count = await page.locator(".arco-cascader-popup").count()
         if popup_count == 0:
-            raise RuntimeError(
-                f"级联弹窗打开失败: {field_name}"
-            )
+            raise RuntimeError(f"级联弹窗打开失败: {field_name}")
 
-        # 打印真实DOM
-        try:
-
-            html = await popup.inner_html()
-
-            print(
-                "[cascader html]",
-                html[:2000]
-            )
-
-        except Exception as e:
-
-            print(
-                "[cascader] 获取html失败:",
-                e
-            )
-
-        # 逐级点击
+        # 逐级点击。部分字段打开后第一列直接是子级，不再展示与字段同名的根节点。
         for index, value in enumerate(path):
-
-            print(
-                f"[cascader] 选择第{index + 1}级: {value}"
-            )
-
-            success = await self._click_cascader_option(
-                page,
-                value
-            )
+            success = await self._click_cascader_option(page, value)
 
             if not success:
-                raise RuntimeError(
-                    f"级联选择失败: {value}"
-                )
+                if (
+                        index == 0
+                        and len(path) > 1
+                        and _compact_cascader_text(value) == _compact_cascader_text(field_name)
+                ):
+                    self._write_run_log(
+                        f"[{datetime.now().isoformat(timespec='seconds')}] cascader root skipped: "
+                        f"field={field_name}, root={value}"
+                    )
+                    continue
+                raise RuntimeError(f"级联选择失败: {value}")
 
             # 等待下一列展开
             if index < len(path) - 1:
-                await page.wait_for_timeout(
-                    800
+                await page.wait_for_timeout(200)
+
+        return True
+
+    async def _wait_cascader_field_label(
+            self,
+            page,
+            field_name: str,
+            *,
+            timeout_ms: int | None = 10000,
+            prefer_modal_bottom: bool = False,
+    ):
+        """在当前页面或弹窗中找到级联字段标签，必要时滚动弹窗到底部。"""
+        if prefer_modal_bottom:
+            root = await self._active_modal_root(page)
+            if root:
+                await self._scroll_root(page, root, to_bottom=True)
+
+        async def find_label():
+            root = await self._active_modal_root(page)
+            if root:
+                label = await self._field_label(root, field_name)
+                if label:
+                    await self._scroll_locator_into_view(label)
+                    return label
+                await self._scroll_root(page, root)
+                label = await self._field_label(root, field_name)
+                if label:
+                    await self._scroll_locator_into_view(label)
+                    return label
+
+            for label in await self._visible_locators(page.get_by_text(field_name, exact=True), limit=30):
+                await self._scroll_locator_into_view(label)
+                return label
+            return None
+
+        return await self._wait_for_result(find_label, timeout_ms=timeout_ms, interval_ms=500)
+
+    async def _active_modal_root(self, page):
+        """返回当前最上层可见弹窗/抽屉根节点。"""
+        roots = await self._visible_locators(page.locator(DELIVERY_MODAL_SELECTOR), limit=40)
+        for root in reversed(roots):
+            text = _compact_text(await self._locator_text(root, timeout_ms=1000))
+            if text:
+                return root
+        return roots[-1] if roots else None
+
+    async def _scroll_locator_into_view(self, locator) -> None:
+        """滚动元素进入可点击视野。"""
+        try:
+            await locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            return
+
+    async def _scroll_root(self, page, root, *, to_bottom: bool = False) -> bool:
+        """滚动弹窗/抽屉中的可滚动区域，兼容内部内容区。"""
+        try:
+            box = await root.bounding_box(timeout=1500)
+            if box:
+                await page.mouse.move(
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
                 )
+                await page.mouse.wheel(0, max(int(box["height"] * 0.85), 260))
+        except Exception:
+            pass
+        changed = False
+        try:
+            changed = bool(
+                await root.evaluate(
+                    """(node, toBottom) => {
+                        const nodes = [node, ...Array.from(node.querySelectorAll('*'))];
+                        const scrollables = nodes.filter(el => el.scrollHeight > el.clientHeight + 8);
+                        let moved = false;
+                        for (const el of scrollables) {
+                            const before = el.scrollTop;
+                            const delta = Math.max(el.clientHeight * 0.85, 220);
+                            el.scrollTop = toBottom
+                                ? el.scrollHeight
+                                : Math.min(el.scrollTop + delta, el.scrollHeight);
+                            if (Math.abs(el.scrollTop - before) > 1) {
+                                moved = true;
+                            }
+                        }
+                        return moved;
+                    }""",
+                    to_bottom,
+                )
+            )
+        except Exception:
+            changed = False
+        await page.wait_for_timeout(350)
+        return changed
 
     async def _wait_next_cascader_column(
             self,
@@ -1626,9 +1980,6 @@ class UserGrowthBrowserClient:
         ).last
 
         if not await popup.count():
-            print(
-                "[cascader] popup不存在"
-            )
             return False
 
         # 当前弹窗所有节点
@@ -1637,10 +1988,6 @@ class UserGrowthBrowserClient:
         )
 
         count = await nodes.count()
-
-        print(
-            f"[cascader] 当前可匹配节点数量={count}, target={value}"
-        )
 
         for i in range(count):
 
@@ -1656,16 +2003,8 @@ class UserGrowthBrowserClient:
 
                 continue
 
-            print(
-                f"[cascader] 节点[{i}]: {text}"
-            )
-
             if text != wanted:
                 continue
-
-            print(
-                f"[cascader] 匹配成功: {text}"
-            )
 
             try:
 
@@ -1675,57 +2014,19 @@ class UserGrowthBrowserClient:
                 ).first
 
                 if await item.count():
-
-                    print(
-                        "[cascader] 点击li节点"
-                    )
-
-                    await item.click(
-                        force=True
-                    )
-
+                    await item.click(force=True)
                 else:
-
-                    print(
-                        "[cascader] 未找到li，点击label"
-                    )
-
-                    await node.click(
-                        force=True
-                    )
+                    await node.click(force=True)
 
                 await page.wait_for_timeout(
-                    800
-                )
-
-                # 判断是否展开下一列
-                columns = page.locator(
-                    ".arco-cascader-list-column"
-                )
-
-                print(
-                    "[cascader] 当前列数量:",
-                    await columns.count()
-                )
-
-                print(
-                    f"[cascader] 点击完成: {value}"
+                    180
                 )
 
                 return True
 
 
             except Exception as e:
-
-                print(
-                    f"[cascader] 点击失败 {value}: {e}"
-                )
-
                 return False
-
-        print(
-            f"[cascader] 未找到: {value}"
-        )
 
         return False
 
@@ -1734,7 +2035,7 @@ class UserGrowthBrowserClient:
             page,
             field_text: str,
             value_text: str | None = None
-    ) -> None:
+    ) -> bool:
         """
         点击下拉框并选择值。
         field_text 支持:
@@ -1749,23 +2050,87 @@ class UserGrowthBrowserClient:
                         raise RuntimeError(f"未点击到下拉控件: {field_text}")
             elif not value_text and field_text in {"分类标签", "选择分类标签"}:
                 await self._open_label_selector(page)
-                return
+                return True
             else:
                 # 最后兜底才点击文案本身，避免误点到左侧 label
                 await self._click_text(page, field_text)
-            await page.wait_for_timeout(700)
+            await page.wait_for_timeout(200)
             if not value_text:
-                return
-            # 选择下拉选项
-            await self._click_text(page, value_text)
+                return True
+
+            if await self._dropdown_field_has_value(page, field_text, value_text, trigger):
+                return True
+            for _ in range(3):
+                if await self._click_visible_dropdown_option(page, value_text):
+                    await page.wait_for_timeout(120)
+                    if await self._dropdown_field_has_value(page, field_text, value_text, trigger):
+                        return True
+                if not await self._delivery_dropdown_opened(page):
+                    trigger = await self._dropdown_trigger_for_field(page, field_text)
+                    if trigger:
+                        if not await self._click_locator_center(page, trigger):
+                            await self._click_locator(trigger)
+                    await page.wait_for_timeout(120)
+                root = await self._open_dropdown_root(page)
+                input_box = root.locator("input").first if root else None
+                if input_box and await input_box.count() and await input_box.is_visible():
+                    try:
+                        await input_box.fill(value_text, timeout=3000)
+                    except Exception:
+                        await self._keyboard_type(page, value_text)
+                else:
+                    await self._keyboard_type(page, value_text)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(120)
+                if await self._dropdown_field_has_value(page, field_text, value_text, trigger):
+                    return True
+                if await self._click_visible_dropdown_option(page, value_text):
+                    await page.wait_for_timeout(120)
+                    if await self._dropdown_field_has_value(page, field_text, value_text, trigger):
+                        return True
+
+            if await self._click_dropdown_option(page, value_text):
+                await page.wait_for_timeout(120)
+                if await self._dropdown_field_has_value(page, field_text, value_text, trigger):
+                    return True
+            return False
 
         except Exception:
-            return
+            return False
+
+    async def _dropdown_field_has_value(self, page, field_text: str, value_text: str, trigger=None) -> bool:
+        """判断普通下拉字段是否已经显示目标值。"""
+        wanted = _compact_text(value_text)
+        if not wanted:
+            return True
+        candidates = []
+        if trigger:
+            candidates.append(trigger)
+        latest_trigger = await self._dropdown_trigger_for_field(page, field_text)
+        if latest_trigger:
+            candidates.append(latest_trigger)
+        seen: set[int] = set()
+        for locator in candidates:
+            key = id(locator)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                text = _compact_text(await self._locator_text(locator, timeout_ms=1000))
+                if wanted in text:
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _dropdown_trigger_for_field(self, page, field_text: str):
         """按字段名或 placeholder 找到真正的下拉触发控件，避免误点左侧标题。"""
         wanted = _compact_text(field_text)
         body = page.locator("body").first
+
+        nearby_controls = await self._nearby_select_controls(body, field_text)
+        if nearby_controls:
+            return nearby_controls[0]
 
         for item in await self._visible_locators(body.locator(FORM_ITEM_SELECTOR), limit=120):
             item_text = _compact_text(await self._locator_text(item, timeout_ms=1000))
@@ -1810,10 +2175,6 @@ class UserGrowthBrowserClient:
                 except Exception:
                     continue
 
-        nearby_controls = await self._nearby_select_controls(body, field_text)
-        if nearby_controls:
-            return nearby_controls[0]
-
         return None
 
     async def _click_radio_near_text(self, page, field_text: str, value_text: str) -> None:
@@ -1830,12 +2191,12 @@ class UserGrowthBrowserClient:
             trigger = await self._dropdown_trigger_for_field(page, field_text)
             if trigger:
                 if await self._click_locator_center(page, trigger) or await self._click_locator(trigger):
-                    await page.wait_for_timeout(1200)
+                    await page.wait_for_timeout(250)
                     return
         for text in ("选择分类标签", "分类标签"):
             try:
                 await self._click_text(page, text)
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(250)
                 return
             except RuntimeError:
                 continue
@@ -2006,6 +2367,752 @@ class UserGrowthBrowserClient:
             item.cid_material_type = await self._read_material_type_by_cid(material_page, cid) or item.material_type
             item.status = "success"
             item.message = "上传并送审成功"
+
+    async def _process_redfruit_after_review(
+            self,
+            page,
+            plan: UserGrowthOrderPlan,
+            items: list[UserGrowthVideoItem],
+            task_id: str,
+            progress: ProgressCallback | None,
+    ) -> None:
+        """红果短剧送审后追加 ARLP，并修改素材分类标签。"""
+        self._emit(progress, f"红果短剧任务 {task_id}：进入素材/文案列表处理 ARLP")
+        detail_page = await self._open_task_detail_for_task_id(
+            page,
+            task_id,
+            progress,
+            expected_attempts=max(len(items), 1),
+        )
+        cid_page = await self._open_material_list_page(detail_page)
+        cids = await self._read_cids_from_search_input(cid_page)
+        if cids:
+            for item, cid in zip(items, cids):
+                item.cid = cid
+        else:
+            self._emit(progress, f"红果短剧任务 {task_id}：未读取到 CID，继续执行 ARLP 和分类标签修改")
+
+        material_page = cid_page
+        await self._wait_material_items_ready(material_page, items)
+        await self._select_all_materials(material_page, items)
+        await self._run_material_edit_action(material_page, "增加ARLP")
+        await self._ensure_redfruit_arlp_modal(material_page, items[0])
+        await self._click_redfruit_modal_action(material_page, ("保存并送审", "保存"))
+        await self._wait_redfruit_arlp_complete(material_page, progress)
+
+        await self._refresh_material_list_page(material_page)
+        await self._select_all_materials(material_page, items)
+        await self._run_material_edit_action(material_page, "修改分类标签")
+        await self._fill_redfruit_post_review_classifications(material_page, items, progress)
+        await self._click_redfruit_modal_action(material_page, ("保存", "确定", "确认"))
+
+        plan.status = "success"
+        plan.message = "红果短剧送审、ARLP 和分类标签修改完成"
+        for item in items:
+            item.status = "success"
+            item.cid_material_type = item.cid_material_type or item.material_type
+            item.message = "红果短剧上传、送审、ARLP 和分类标签修改完成"
+
+    async def _ensure_redfruit_arlp_modal(self, page, item: UserGrowthVideoItem) -> None:
+        """填写红果增加 ARLP 弹窗中的投放产品和平台。"""
+        metadata = self._workflow_metadata(item)
+        products = list(metadata.get("arlp_products") or ["红果免费漫剧(8704)", "番茄免费小说(1967)"])
+        if not await self._ensure_delivery_field_values(page, "投放产品", products):
+            await self._snapshot_error(page, "redfruit_arlp_product_not_selected")
+            raise RuntimeError(f"增加 ARLP 未选中投放产品：{'、'.join(products)}")
+        platform_values = list(metadata.get("arlp_platforms") or metadata.get("delivery_platforms") or [])
+        platform_ok = await self._ensure_delivery_field_values(page, "投放平台", platform_values)
+        if not platform_ok:
+            await self._snapshot_error(page, "redfruit_arlp_platform_not_selected")
+            raise RuntimeError("增加 ARLP 未选中投放平台")
+
+    async def _fill_redfruit_post_review_classifications(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None = None,
+    ) -> None:
+        """填写红果 ARLP 后需要补充的素材分类标签，失败时刷新并指数退避重试。"""
+        if not items:
+            return
+
+        item = items[0]
+        paths = [
+            list(path)
+            for path in (item.post_review_classification_paths or item.workflow_metadata.get("post_review_classification_paths", []))
+            if path
+        ]
+        if not paths:
+            return
+
+        attempt = 0
+        pending_refresh_delay = 0.0
+        next_backoff_seconds = 1.0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            try:
+                if pending_refresh_delay > 0:
+                    self._emit(
+                        progress,
+                        f"红果短剧修改分类标签未命中，{pending_refresh_delay:.1f}s 后刷新重试，第 {attempt} 次",
+                    )
+                    await self._refresh_material_list_page(
+                        page,
+                        settle_delay_seconds=pending_refresh_delay,
+                        force_reload=True,
+                    )
+                    await self._select_all_materials(page, items)
+                    await self._run_material_edit_action(page, "修改分类标签")
+                    pending_refresh_delay = 0.0
+
+                await self._fill_redfruit_post_review_classifications_once(page, paths)
+                return
+            except Exception as exc:  # noqa: BLE001
+                if self._is_target_closed_exception(exc):
+                    raise
+                self._emit(
+                    progress,
+                    f"红果短剧修改分类标签失败，第 {attempt} 次：{exc}",
+                )
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] redfruit post-review classification retry "
+                    f"attempt={attempt}, next_backoff={next_backoff_seconds:.1f}s, error={exc}"
+                )
+                if attempt <= 2 or attempt % 3 == 0:
+                    await self._snapshot_error(
+                        page,
+                        f"redfruit_post_review_classification_retry_{attempt}",
+                        exc=exc,
+                    )
+                pending_refresh_delay = next_backoff_seconds
+                next_backoff_seconds = min(next_backoff_seconds * 2, 30.0)
+
+    async def _fill_redfruit_post_review_classifications_once(
+            self,
+            page,
+            paths: list[list[str]],
+    ) -> None:
+        """在已打开的修改分类标签弹窗中填写一次红果后审分类标签。"""
+        for path in paths:
+            if not path:
+                continue
+            await self._select_cascader(
+                page,
+                str(path[0]),
+                list(path),
+                field_timeout_ms=12000,
+                prefer_modal_bottom=True,
+            )
+
+    async def _select_all_materials(self, page, items: list[UserGrowthVideoItem]) -> None:
+        """红果素材管理页先点一条素材进入选择模式，再全选全部素材。"""
+        await self._wait_material_items_ready(page, items)
+        if not await self._click_first_material_card(page, items):
+            await self._snapshot_error(page, "redfruit_material_first_card_not_selected")
+            raise RuntimeError("未选中素材列表中的第一条素材")
+        await self._wait_redfruit_material_selection_bar_visible(page)
+        if not await self._select_redfruit_all_materials(page, len(items)):
+            await self._snapshot_error(page, "redfruit_material_select_all_failed")
+            raise RuntimeError("红果素材列表全选失败")
+
+        async def selected_enough() -> bool:
+            return await self._selected_count(page) >= len(items)
+
+        await self._wait_for_result(
+            selected_enough,
+            timeout_ms=None,
+            interval_ms=500,
+        )
+        await page.wait_for_timeout(1200)
+
+    async def _wait_material_items_ready(self, page, items: list[UserGrowthVideoItem]) -> None:
+        """等待素材/文案列表里出现本批次素材卡片。"""
+        tokens = self._material_card_tokens(items)
+
+        async def material_ready() -> bool:
+            body = await self._body_text(page, timeout_ms=2000)
+            compact_body = _compact_text(body)
+            if any(token and token in compact_body for token in tokens):
+                return True
+            card_count = await page.locator(
+                ".arco-card:visible, [class*='material-card']:visible, [class*='material-item']:visible, "
+                "[class*='creative-card']:visible, img:visible, video:visible"
+            ).count()
+            return card_count > 0 and "暂无数据" not in compact_body
+
+        while not await material_ready():
+            self._raise_if_cancelled()
+            await page.wait_for_timeout(1500)
+
+    @staticmethod
+    def _material_card_tokens(items: list[UserGrowthVideoItem]) -> list[str]:
+        """生成素材卡片可见文件名 token。"""
+        tokens: list[str] = []
+        for item in items:
+            file_name = str(item.file_name or "").strip()
+            stem = Path(file_name).stem.strip()
+            for token in (file_name, stem, stem[:32], stem[:22], stem[:14]):
+                compact = _compact_text(token)
+                if len(compact) >= 4 and compact not in tokens:
+                    tokens.append(compact)
+        return tokens
+
+    async def _select_all_visible_pages(self, page) -> None:
+        """把当前页及后续分页里的所有可选项都选上。"""
+        await self._set_page_size_max(page)
+        selected_any = False
+        seen_pages: set[str] = set()
+        while True:
+            if await self._click_table_select_all_now(page):
+                selected_any = True
+            elif await self._click_text_or_locator(page, "全选"):
+                selected_any = True
+            await page.wait_for_timeout(600)
+            page_signature = await self._material_page_signature(page)
+            if page_signature and page_signature in seen_pages:
+                break
+            if page_signature:
+                seen_pages.add(page_signature)
+            if not await self._click_pagination_next(page):
+                break
+            await page.wait_for_timeout(1000)
+        if not selected_any:
+            raise RuntimeError("未找到可全选的列表项")
+
+    async def _wait_redfruit_material_drawer_visible(self, page) -> bool:
+        """等待红果素材列表右侧抽屉出现。"""
+        async def drawer_visible() -> bool:
+            drawer = page.locator(".arco-drawer").first
+            try:
+                return bool(await drawer.count() and await drawer.is_visible())
+            except Exception:
+                return False
+
+        return bool(await self._wait_for_result(drawer_visible, timeout_ms=None, interval_ms=400))
+
+    async def _material_page_signature(self, page) -> str:
+        """读取素材管理页可见内容签名，用于避免分页重复循环。"""
+        rows = page.locator(
+            ".arco-table-tbody tr, .arco-table-tr, [role='row'], "
+            ".arco-card, [class*='material-card'], [class*='material-item']"
+        )
+        texts: list[str] = []
+        for row in await self._visible_locators(rows, limit=80):
+            text = _compact_text(await self._locator_text(row, timeout_ms=1000))
+            if text:
+                texts.append(text[:80])
+        return "|".join(texts)
+
+    async def _open_material_management_page(self, page):
+        """从任务详情侧栏打开素材管理页。"""
+        await self._click_text(page, "素材管理")
+
+        async def material_page_ready():
+            for candidate in reversed(page.context.pages):
+                if candidate.is_closed():
+                    continue
+                try:
+                    await candidate.wait_for_load_state("domcontentloaded", timeout=1000)
+                except Exception:
+                    pass
+                body = await self._body_text(candidate, timeout_ms=2000)
+                if "素材管理" in body and "全部素材" in body and ("全局搜索" in body or "上传素材" in body):
+                    self._wrap_page_speed(candidate)
+                    return candidate
+            return None
+
+        return await self._wait_for_result(material_page_ready, timeout_ms=None, interval_ms=800)
+
+    async def _close_redfruit_material_drawer(self, page) -> bool:
+        """关闭红果素材列表右侧抽屉，避免遮挡全选与分页控件。"""
+        drawer = page.locator(".arco-drawer").first
+        try:
+            if not await drawer.count() or not await drawer.is_visible():
+                return False
+        except Exception:
+            return False
+
+        candidates = (
+            page.locator(".arco-drawer .arco-drawer-close-btn").first,
+            page.locator(".arco-drawer .arco-drawer-header button").first,
+            page.locator(".arco-drawer .arco-icon-close").first,
+            page.locator(".arco-drawer [aria-label*='close']").first,
+            page.locator(".arco-drawer button[aria-label*='close']").first,
+            page.locator(".arco-drawer button:has-text('关闭')").first,
+            page.locator(".arco-drawer [role='button']:has-text('关闭')").first,
+        )
+        for locator in candidates:
+            try:
+                if not await locator.count() or not await locator.is_visible():
+                    continue
+                if await self._click_locator(locator) or await self._click_locator_center(page, locator):
+                    await page.wait_for_timeout(600)
+                    return True
+            except Exception:
+                continue
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(600)
+        except Exception:
+            pass
+        try:
+            return not await drawer.is_visible()
+        except Exception:
+            return False
+
+    async def _select_creative_units_for_items(self, page, items: list[UserGrowthVideoItem]) -> None:
+        """上传后在创意单元列表跨页全选本次生成的所有单元。"""
+        expected_count = len(items)
+        if expected_count <= 0:
+            return
+        selected_count = await self._select_creative_unit_rows_across_pages(page, items)
+        if selected_count >= expected_count:
+            return
+        await self._snapshot_error(
+            page,
+            "creative_unit_selection_incomplete",
+            extra=f"expected={expected_count}, selected_count={selected_count}",
+        )
+        raise RuntimeError(
+            f"创意单元未全选完成：期望 {expected_count} 个，页面已选择 {selected_count} 个"
+        )
+
+    async def _select_creative_unit_rows_across_pages(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+    ) -> int:
+        """创意单元列表页先全选当前页，再跨页补选到总数达标。"""
+        await self._set_page_size_max(page)
+        expected_count = len(items)
+        seen_pages: set[str] = set()
+        selected_count = await self._selected_count(page)
+
+        for page_index in range(1, 101):
+            self._raise_if_cancelled()
+            await self._wait_creative_unit_table_ready(page, timeout_ms=None)
+            page_signature = await self._creative_unit_page_signature(page)
+            if page_signature and page_signature in seen_pages:
+                break
+            if page_signature:
+                seen_pages.add(page_signature)
+
+            before_count = await self._selected_count(page)
+            await self._wait_and_click_table_select_all(page, timeout_ms=None)
+            await self._wait_selected_count(page, max(before_count + 1, 1), timeout_ms=None)
+            selected_count = await self._selected_count(page)
+            if selected_count <= before_count:
+                targets = self._creative_unit_target_tokens(items)
+                matched = await self._select_creative_unit_rows_on_current_page(page, targets)
+                if matched:
+                    await self._wait_selected_count(page, max(before_count + 1, 1), timeout_ms=None)
+                    selected_count = await self._selected_count(page)
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] creative unit page {page_index}: "
+                f"selected_count={selected_count}, before_count={before_count}"
+            )
+            if selected_count >= expected_count:
+                return selected_count
+            if not await self._click_pagination_next(page):
+                break
+            await page.wait_for_timeout(1200)
+
+        return selected_count
+
+    @staticmethod
+    def _creative_unit_target_tokens(items: list[UserGrowthVideoItem]) -> dict[str, list[str]]:
+        """生成创意单元列表行文本可匹配的文件名 token。"""
+        targets: dict[str, list[str]] = {}
+        for item in items:
+            file_name = str(item.file_name or "")
+            stem = Path(file_name).stem
+            compact_stem = _compact_text(stem).lower()
+            compact_name = _compact_text(file_name).lower()
+            tokens = [token for token in (compact_stem, compact_name) if token]
+            if tokens:
+                targets[compact_stem or compact_name] = tokens
+        return targets
+
+    async def _select_creative_unit_rows_on_current_page(
+            self,
+            page,
+            targets: dict[str, list[str]],
+    ) -> set[str]:
+        """选择当前页中属于本次上传文件的创意单元行。"""
+        matched: set[str] = set()
+        rows = page.locator(
+            ".arco-table-tbody tr, .arco-table-tr:not(.arco-table-tr-th), "
+            "[class*='arco-table-row']:not([class*='header']), tr, [role='row']"
+        )
+        for row in await self._visible_locators(rows, limit=200):
+            row_text = _compact_text(await self._locator_text(row, timeout_ms=1000)).lower()
+            if not row_text:
+                continue
+            matched_key = ""
+            for key, tokens in targets.items():
+                if key in matched:
+                    continue
+                if any(token and token in row_text for token in tokens):
+                    matched_key = key
+                    break
+            if not matched_key:
+                continue
+            if await self._click_visible_checkbox_box(
+                    row,
+                    "label.arco-checkbox, .arco-checkbox-mask-wrapper, .arco-checkbox-mask, .arco-checkbox, label",
+            ):
+                matched.add(matched_key)
+        return matched
+
+    async def _creative_unit_page_signature(self, page) -> str:
+        """读取当前创意单元表格可见行签名，用于避免分页循环。"""
+        rows = page.locator(".arco-table-tbody tr, .arco-table-tr, [role='row']")
+        texts: list[str] = []
+        for row in await self._visible_locators(rows, limit=60):
+            text = _compact_text(await self._locator_text(row, timeout_ms=1000))
+            if text:
+                texts.append(text[:80])
+        return "|".join(texts)
+
+    async def _click_table_select_all_now(self, page) -> bool:
+        """尝试点击当前页表头全选，不等待超时。"""
+        candidates = (
+            page.locator(".arco-table thead input[type='checkbox']").first,
+            page.locator(".arco-table thead .arco-checkbox-mask").first,
+            page.locator(".arco-table thead .arco-checkbox-mask-wrapper").first,
+            page.locator(".arco-table thead label.arco-checkbox").first,
+            page.locator(".arco-table thead .arco-checkbox").first,
+            page.locator(".arco-table-header input[type='checkbox']").first,
+            page.locator(".arco-table-header .arco-checkbox").first,
+            page.locator(".arco-table-th input[type='checkbox']").first,
+            page.locator(".arco-table-th .arco-checkbox").first,
+            page.get_by_role("button", name="全选").first,
+            page.locator("button:has-text('全选')").first,
+        )
+        for checkbox in candidates:
+            try:
+                if not await checkbox.count() or not await checkbox.is_visible():
+                    continue
+                await checkbox.scroll_into_view_if_needed(timeout=3000)
+                if await self._checkbox_box_is_checked(checkbox):
+                    return True
+                if await self._click_locator(checkbox):
+                    await page.wait_for_timeout(800)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _set_page_size_max(self, page) -> None:
+        """把当前表格/列表的分页条数尽量切到最大。"""
+        try:
+            controls = await self._visible_locators(
+                page.locator(
+                    ".arco-pagination .arco-pagination-options-size-changer, "
+                    ".arco-pagination .arco-select-view, "
+                    ".arco-pagination [class*='size-changer'], "
+                    ".arco-pagination [class*='pagination-options']"
+                ),
+                limit=30,
+            )
+            target = None
+            for control in controls:
+                text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+                if "条/页" in text or "条每页" in text or "/page" in text.lower():
+                    target = control
+                    break
+            if not target:
+                for control in (
+                        page.get_by_text(re.compile(r"\d+\s*条\s*/\s*页"), exact=False).first,
+                        page.get_by_text(re.compile(r"\d+\s*条每页"), exact=False).first,
+                ):
+                    try:
+                        if await control.count() and await control.is_visible():
+                            target = control
+                            break
+                    except Exception:
+                        continue
+            if not target:
+                return
+            if not (await self._click_locator_center(page, target) or await self._click_locator(target)):
+                return
+            await page.wait_for_timeout(500)
+            if await self._click_largest_open_dropdown_option(page):
+                await page.wait_for_timeout(1000)
+        except Exception:
+            return
+
+    async def _click_largest_open_dropdown_option(self, page) -> bool:
+        """在当前展开的下拉里点击数值最大的页大小选项。"""
+        root = await self._open_dropdown_root(page)
+        if not root:
+            return False
+        best_option = None
+        best_value = -1
+        options = await self._visible_locators(root.locator(DROPDOWN_OPTION_SELECTOR), limit=80)
+        for option in options:
+            try:
+                text = _compact_text(await self._locator_text(option, timeout_ms=1000))
+            except Exception:
+                continue
+            match = re.search(r"(\d{1,4})", text)
+            if not match:
+                continue
+            value = int(match.group(1))
+            if value > best_value:
+                best_value = value
+                best_option = option
+        if best_option and best_value > 0:
+            return await self._click_locator(best_option)
+        return False
+
+    async def _click_pagination_next(self, page) -> bool:
+        """点击列表/表格的下一页。"""
+        selectors = (
+            ".arco-pagination-item-next",
+            ".arco-pagination-next",
+            "[aria-label*='next']",
+            "button:has-text('下一页')",
+            "[role='button']:has-text('下一页')",
+        )
+        for selector in selectors:
+            buttons = page.locator(selector)
+            try:
+                count = min(await buttons.count(), 20)
+            except Exception:
+                continue
+            for index in range(count):
+                button = buttons.nth(index)
+                try:
+                    if not await button.is_visible():
+                        continue
+                    class_name = str(await button.get_attribute("class") or "")
+                    aria_disabled = str(await button.get_attribute("aria-disabled") or "").lower()
+                    disabled = aria_disabled == "true" or "disabled" in class_name or await button.is_disabled()
+                    if disabled:
+                        continue
+                    if await self._click_locator_center(page, button) or await self._click_locator(button):
+                        return True
+                except Exception:
+                    continue
+        try:
+            clicked = await page.evaluate(
+                """() => {
+                    const isVisible = el => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                    };
+                    const candidates = Array.from(document.querySelectorAll('.arco-pagination-item-next, .arco-pagination-next, button[aria-label*="next"], [role="button"][aria-label*="next"], .arco-pagination button, .arco-pagination [role="button"]'));
+                    const button = candidates.find(el => isVisible(el) && !el.className.includes('disabled') && el.getAttribute('aria-disabled') !== 'true' && !el.disabled);
+                    if (!button) return false;
+                    button.scrollIntoView({ block: 'center', inline: 'center' });
+                    button.click();
+                    return true;
+                }"""
+            )
+            return bool(clicked)
+        except Exception:
+            return False
+
+    async def _click_first_material_card(self, page, items: list[UserGrowthVideoItem]) -> bool:
+        """尽量稳定地点击红果素材列表第一张卡片的选择角标。"""
+        selectors = (
+            ".waterfall-item",
+            ".common-card-item-eVVh45",
+            "[class*='waterfall-item']",
+            "[class*='common-card-item']",
+        )
+        for selector in selectors:
+            try:
+                cards = page.locator(selector)
+                for card in await self._visible_locators(cards, limit=20):
+                    if await self._click_redfruit_material_card_select_hotspot(page, card):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    async def _click_redfruit_material_card_select_hotspot(self, page, card) -> bool:
+        """点击红果素材卡右上角的选择角标，进入批量选择模式。"""
+        try:
+            if not await card.count() or not await card.is_visible():
+                return False
+            await card.scroll_into_view_if_needed(timeout=3000)
+            try:
+                await card.hover()
+                await page.wait_for_timeout(250)
+            except Exception:
+                pass
+            box = await card.bounding_box()
+            if not box:
+                return False
+            before = await self._selected_count(page)
+            points = (
+                (box["x"] + box["width"] - 20, box["y"] + 20),
+                (box["x"] + box["width"] - 28, box["y"] + 24),
+                (box["x"] + box["width"] - 16, box["y"] + 16),
+            )
+            for x, y in points:
+                try:
+                    await page.mouse.click(x, y)
+                    await page.wait_for_timeout(800)
+                    if await self._selected_count(page) > before:
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    async def _wait_redfruit_material_selection_bar_visible(self, page) -> bool:
+        """等待红果素材列表底部批量操作条出现。"""
+        async def bar_visible() -> bool:
+            bar = page.locator(".operation-bar-BFu2RW, [class*='operation-bar']").first
+            try:
+                return bool(await bar.count() and await bar.is_visible())
+            except Exception:
+                return False
+
+        return bool(await self._wait_for_result(bar_visible, timeout_ms=None, interval_ms=400))
+
+    async def _select_redfruit_all_materials(self, page, expected_count: int) -> bool:
+        """红果素材页通过「全选 -> 全选所有」菜单全选所有素材。"""
+        if expected_count <= 0:
+            return True
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            if await self._selected_count(page) >= expected_count:
+                return True
+            attempt += 1
+            if not await self._click_redfruit_select_all_button(page):
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] redfruit select-all button not found, "
+                    f"attempt={attempt}, expected={expected_count}"
+                )
+                await page.wait_for_timeout(800)
+                continue
+
+            option = await self._wait_redfruit_select_all_menu_option(page)
+            if not option:
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] redfruit select-all menu not ready, "
+                    f"attempt={attempt}, expected={expected_count}"
+                )
+                await page.wait_for_timeout(800)
+                continue
+
+            if await self._click_locator(option) or await self._click_locator_center(page, option):
+                await self._wait_selected_count(page, expected_count, timeout_ms=None)
+                return True
+            await page.wait_for_timeout(800)
+
+    async def _click_redfruit_select_all_button(self, page) -> bool:
+        """点击红果素材底部操作条里的「全选」下拉按钮。"""
+        locators = (
+            page.locator("[class*='operation-bar'] button:has-text('全选')").first,
+            page.locator("button[class*='operation-btn']:has-text('全选')").first,
+            page.locator("button:has-text('全选')").first,
+            page.get_by_role("button", name=re.compile(r"^全选")).first,
+        )
+        for locator in locators:
+            if await self._click_locator_center(page, locator) or await self._click_locator(locator):
+                return True
+        return await self._click_text_or_locator(page, "全选")
+
+    async def _wait_redfruit_select_all_menu_option(self, page):
+        """等待「全选」下拉菜单项出现，优先点全选所有。"""
+
+        async def find_option():
+            for text in ("全选所有", "全选当前页"):
+                locators = (
+                    page.locator(f".arco-dropdown-menu-item:has-text('{text}')").first,
+                    page.locator(f"[role='menuitem']:has-text('{text}')").first,
+                    page.get_by_text(text, exact=True).first,
+                )
+                for locator in locators:
+                    try:
+                        if await locator.count() and await locator.is_visible():
+                            return locator
+                    except Exception:
+                        continue
+            return None
+
+        return await self._wait_for_result(find_option, timeout_ms=8000, interval_ms=300)
+
+    async def _run_material_edit_action(self, page, action_text: str) -> None:
+        """打开素材列表底部编辑菜单并点击指定操作。"""
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            await self._click_if_present(page, "编辑")
+            await page.wait_for_timeout(500)
+            if await self._click_text_or_locator(page, action_text):
+                await page.wait_for_timeout(1200)
+                return
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] wait material edit action "
+                f"attempt={attempt}, action={action_text}"
+            )
+            await page.wait_for_timeout(800)
+
+    async def _click_redfruit_modal_action(self, page, texts: tuple[str, ...]) -> None:
+        """点击红果弹窗保存按钮，兼容不同按钮文案。"""
+        locators = []
+        for text in texts:
+            locators.extend(
+                (
+                    page.get_by_text(text, exact=True).first,
+                    page.locator(f"button:has-text('{text}')").first,
+                )
+            )
+        if await self._click_first_visible_locator(*locators):
+            await page.wait_for_timeout(2000)
+            return
+        raise RuntimeError(f"未找到弹窗操作按钮：{'/'.join(texts)}")
+
+    async def _wait_redfruit_arlp_complete(self, page, progress: ProgressCallback | None) -> None:
+        """等待增加 ARLP 弹窗关闭并给平台处理留出刷新窗口。"""
+        for attempt in range(1, 21):
+            body = await self._body_text(page, timeout_ms=3000)
+            compact = _compact_text(body)
+            if "保存并送审" not in compact and ("增加ARLP" not in compact or "成功" in compact):
+                await page.wait_for_timeout(3000)
+                return
+            self._emit(progress, f"等待增加 ARLP 处理完成，第 {attempt} 次")
+            await page.wait_for_timeout(3000)
+        self._emit(progress, "增加 ARLP 未观察到明确完成提示，继续尝试后续分类标签修改")
+
+    async def _refresh_material_list_page(
+            self,
+            page,
+            *,
+            settle_delay_seconds: float = 0.0,
+            force_reload: bool = False,
+    ) -> None:
+        """回到素材详情页并刷新列表。"""
+        if settle_delay_seconds > 0:
+            await self._sleep(settle_delay_seconds)
+        if not force_reload:
+            for text in ("刷新列表", "刷新"):
+                if await self._click_text_or_locator(page, text):
+                    await page.wait_for_timeout(2500)
+                    return
+        try:
+            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
+        except Exception:
+            await page.wait_for_timeout(2500)
+
+    @staticmethod
+    def _is_target_closed_exception(exc: Exception) -> bool:
+        """判断是否属于 Playwright 目标已关闭异常。"""
+        message = f"{type(exc).__name__}: {exc}"
+        return "TargetClosedError" in message or "Target page, context or browser has been closed" in message
 
     async def _read_current_task_id(self, page) -> str:
         """从当前任务列表首条数据读取任务ID。"""
@@ -2305,7 +3412,7 @@ class UserGrowthBrowserClient:
     async def _selected_count(self, page) -> int:
         """从页面文本中读取当前已选中的行数。"""
         body = await self._body_text(page, timeout_ms=2000)
-        match = re.search(r"已选中\s*(\d+)", body)
+        match = re.search(r"已(?:选中|选择)\s*(\d+)", body)
         if match:
             return int(match.group(1))
         return 0
@@ -2658,7 +3765,7 @@ class UserGrowthBrowserClient:
                     await candidate.wait_for_load_state("domcontentloaded", timeout=1000)
                 except Exception:
                     pass
-                is_new_page = id(candidate) not in before_ids and candidate.url not in {"about:blank", before_url}
+                is_new_page = id(candidate) not in before_ids and candidate.url != "about:blank"
                 if is_new_page:
                     self._wrap_page_speed(candidate)
                     return candidate
@@ -2821,10 +3928,15 @@ class UserGrowthBrowserClient:
         """等待表格表头全选复选框出现并点击；默认不设总超时。"""
 
         candidates = (
+            page.locator(".arco-table thead input[type='checkbox']").first,
             page.locator(".arco-table thead .arco-checkbox-mask").first,
             page.locator(".arco-table thead .arco-checkbox-mask-wrapper").first,
             page.locator(".arco-table thead label.arco-checkbox").first,
             page.locator(".arco-table thead .arco-checkbox").first,
+            page.locator(".arco-table-header input[type='checkbox']").first,
+            page.locator(".arco-table-header .arco-checkbox").first,
+            page.locator(".arco-table-th input[type='checkbox']").first,
+            page.locator(".arco-table-th .arco-checkbox").first,
             # 兜底：弹层里也可能直接放一个「全选」按钮
             page.get_by_role("button", name="全选").first,
             page.locator("button:has-text('全选')").first,
