@@ -7,6 +7,12 @@ from typing import Callable, Iterable
 
 from .usergrowth_excel import load_song_records, match_song_record
 from .usergrowth_models import UserGrowthOrderPlan, UserGrowthRunConfig, UserGrowthVideoItem, VIDEO_SUFFIXES
+from .usergrowth_redfruit import (
+    build_redfruit_metadata,
+    is_redfruit_workflow,
+    redfruit_batch_label,
+    redfruit_batch_signature,
+)
 from .usergrowth_rules import (
     classification_path_for_material,
     custom_tags_for_material,
@@ -50,6 +56,9 @@ def build_song_batches_from_paths(
         song_records=None,
 ) -> list[UserGrowthRunConfig]:
     """按歌曲名把视频路径拆成多个单曲批次。"""
+    if is_redfruit_workflow(config.workflow):
+        return build_redfruit_batches_from_paths(config, video_paths)
+
     grouped: dict[str, tuple[str, list[Path]]] = {}
     for path_value in video_paths:
         path = Path(path_value)
@@ -67,13 +76,38 @@ def build_song_batches_from_paths(
     return _configs_from_song_groups(config, grouped.values())
 
 
+def build_redfruit_batches_from_paths(
+        config: UserGrowthRunConfig,
+        video_paths: Iterable[Path],
+) -> list[UserGrowthRunConfig]:
+    """按红果短剧的分类标签/自定义标签签名拆批，保证一键复用不会跨剧目串标签。"""
+    grouped: dict[str, tuple[str, list[Path]]] = {}
+    default_genre = config.redfruit_default_genre or ""
+    for path_value in video_paths:
+        path = Path(path_value)
+        signature = redfruit_batch_signature(path.name, default_genre=default_genre, bid_map=config.redfruit_bid_map)
+        if signature not in grouped:
+            grouped[signature] = (
+                redfruit_batch_label(path.name, default_genre=default_genre, bid_map=config.redfruit_bid_map),
+                [],
+            )
+        label, paths = grouped[signature]
+        paths.append(path.resolve())
+        grouped[signature] = (label, paths)
+    return _configs_from_song_groups(config, grouped.values())
+
+
 def build_song_batches_from_items(
         config: UserGrowthRunConfig,
         items: Iterable[UserGrowthVideoItem],
 ) -> list[UserGrowthRunConfig]:
     """把预检出的可上传素材按歌曲名拆成多个单曲批次。"""
+    item_list = list(items)
+    if item_list and any(is_redfruit_workflow(item.workflow) for item in item_list):
+        return build_redfruit_batches_from_items(config, item_list)
+
     grouped: dict[str, tuple[str, list[UserGrowthVideoItem]]] = {}
-    for item in items:
+    for item in item_list:
         if item.status == "skipped" or not item.order_id:
             continue
         song_name = (item.song_name or Path(item.file_name).stem).strip() or "未识别歌曲"
@@ -100,6 +134,37 @@ def build_song_batches_from_items(
             )
         )
     return batches
+
+
+def build_redfruit_batches_from_items(
+        config: UserGrowthRunConfig,
+        items: Iterable[UserGrowthVideoItem],
+) -> list[UserGrowthRunConfig]:
+    """按红果短剧标签签名把预检结果拆成多个可并行批次。"""
+    grouped: dict[str, tuple[str, list[Path]]] = {}
+    default_genre = config.redfruit_default_genre or ""
+    for item in items:
+        if item.status == "skipped" or not item.order_id:
+            continue
+        signature = redfruit_batch_signature(
+            item.file_name,
+            default_genre=default_genre,
+            bid_map=config.redfruit_bid_map,
+        )
+        label = redfruit_batch_label(
+            item.file_name,
+            default_genre=default_genre,
+            bid_map=config.redfruit_bid_map,
+        )
+        if signature not in grouped:
+            grouped[signature] = (label, [])
+        current_label, paths = grouped[signature]
+        if not current_label:
+            current_label = label
+        paths.append(Path(item.path).resolve())
+        grouped[signature] = (current_label, paths)
+
+    return _configs_from_song_groups(config, grouped.values())
 
 
 def song_name_for_split(path: Path, material_type: str, song_records) -> str:
@@ -183,6 +248,9 @@ def build_usergrowth_plan(
         duplicate_song_output_path: Path | None = None,
 ) -> tuple[list[UserGrowthOrderPlan], list[UserGrowthVideoItem]]:
     """根据视频文件、歌曲库和订单 ID 生成上传计划。"""
+    if is_redfruit_workflow(config.workflow):
+        return build_redfruit_plan(config)
+
     scanned_videos = [
         (path, detect_material_type(path.name))
         for path in _scan_config_video_files(config)
@@ -228,6 +296,80 @@ def build_usergrowth_plan(
     if skipped_items:
         plans.append(UserGrowthOrderPlan(order_id="未分配/跳过", items=skipped_items, status="skipped", message="这些素材不会进入上传流程"))
     return plans, items
+
+
+def build_redfruit_plan(config: UserGrowthRunConfig) -> tuple[list[UserGrowthOrderPlan], list[UserGrowthVideoItem]]:
+    """红果短剧不走歌单/回填，直接按文件名构建上传与送审计划。"""
+    scanned_videos = _scan_config_video_files(config)
+    default_order_id = config.order_id.strip()
+    if not default_order_id:
+        raise ValueError("请填写订单ID。")
+
+    items: list[UserGrowthVideoItem] = []
+    for path in scanned_videos:
+        metadata = _redfruit_metadata_for_config(config, path)
+        item = UserGrowthVideoItem(
+            path=path,
+            file_name=path.name,
+            material_type=metadata["material_mode"],
+            song_name=metadata["drama_title"] or path.stem,
+            workflow=config.workflow,
+            song_id=metadata["bid"],
+            song_match_message="已识别红果短剧元数据",
+            classification_path=list(metadata.get("genre_path") or []),
+            classification_paths=list(metadata["classification_paths"]),
+            post_review_classification_paths=list(metadata["post_review_classification_paths"]),
+            custom_tags=list(metadata["custom_tags"]),
+            optional_tags=[],
+            workflow_metadata=metadata,
+        )
+        _attach_order(item, default_order_id)
+        item.song_match_message = _redfruit_match_message(item)
+        item.message = _redfruit_warning_message(metadata)
+        items.append(item)
+
+    grouped: dict[str, list[UserGrowthVideoItem]] = defaultdict(list)
+    for item in items:
+        if item.status == "skipped" or not item.order_id:
+            continue
+        grouped[item.order_id].append(item)
+
+    plans = [UserGrowthOrderPlan(order_id=order_id, items=group_items) for order_id, group_items in grouped.items()]
+    return plans, items
+
+
+def _redfruit_metadata_for_config(config: UserGrowthRunConfig, path: Path) -> dict:
+    metadata = build_redfruit_metadata(
+        path,
+        default_genre=config.redfruit_default_genre or "",
+        bid_map=config.redfruit_bid_map,
+    )
+    if config.delivery_products:
+        metadata["delivery_products"] = list(config.delivery_products)
+    if config.delivery_platforms:
+        metadata["delivery_platforms"] = list(config.delivery_platforms)
+    if config.delivery_platform_all is not None:
+        metadata["delivery_platform_all"] = bool(config.delivery_platform_all)
+    if config.arlp_products:
+        metadata["arlp_products"] = list(config.arlp_products)
+    if config.arlp_platforms:
+        metadata["arlp_platforms"] = list(config.arlp_platforms)
+    if config.arlp_platform_all is not None:
+        metadata["arlp_platform_all"] = bool(config.arlp_platform_all)
+    return metadata
+
+
+def _redfruit_match_message(item: UserGrowthVideoItem) -> str:
+    bid = item.song_id or "未识别BID"
+    return (
+        f"红果短剧：剧名={item.song_name or '-'} | BID={bid} | "
+        f"类型={item.workflow_metadata.get('drama_type', '-')}/{item.material_type}"
+    )
+
+
+def _redfruit_warning_message(metadata: dict) -> str:
+    warnings = [str(item) for item in metadata.get("warnings", []) if str(item).strip()]
+    return "；".join(warnings)
 
 
 def _attach_song(item: UserGrowthVideoItem, song_records, month_tag: str, template_tags: object = None) -> None:

@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import fnmatch
 import json
@@ -26,6 +26,7 @@ from usergrowth_automation.usergrowth_planner import (
     _attach_order,
     _attach_song,
     build_song_batches_from_paths,
+    build_redfruit_plan,
     load_song_records_for_split,
     scan_video_files,
 )
@@ -35,6 +36,7 @@ from usergrowth_automation.usergrowth_rules import (
     extract_song_name,
     optional_tags_for_file,
 )
+from usergrowth_automation.usergrowth_redfruit import is_redfruit_workflow, normalise_workflow
 from usergrowth_automation.usergrowth_tag_templates import (
     DEFAULT_CUSTOM_TAG_TEMPLATE_NAME,
     combine_template_tags,
@@ -162,6 +164,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--live", action="store_true", help="Run real browser upload. Omit for dry-run.")
     parser.add_argument("--confirm-live", action="store_true", help="Required with --live to allow real upload/review/backfill.")
     parser.add_argument("--headless", action="store_true", help="Run browser headless in live mode.")
+    parser.add_argument("--workflow", help="Workflow name such as soda_music or redfruit_short_drama.")
+    parser.add_argument("--redfruit-default-genre", help="Default redfruit genre used when file names do not specify one.")
+    parser.add_argument("--redfruit-bid-map", help="JSON string mapping drama titles to bid_... values.")
     parser.add_argument("--split-by-song", action="store_true", help="Auto-split selected videos into one batch per song before running.")
     parser.add_argument("--concurrency", type=int, default=None, help="Batch concurrency. Defaults to batch count, clamped to 1..10; multi-batch runs use at least 2.")
     parser.add_argument("--account", help="UserGrowth account. Prefer USERGROWTH_ACCOUNT env var.")
@@ -394,13 +399,20 @@ def _manifest_output_root(args: argparse.Namespace, manifest: dict[str, Any], ba
 
 def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_dir: Path) -> UserGrowthRunConfig:
     video_folder = _required_path(_pick(args.video_folder, manifest, "video_folder"), base_dir, "video_folder")
-    backfill_excel = _required_path(
-        _pick(args.backfill_excel, manifest, "backfill_excel", "order_excel"),
+    output_root = _required_path(_pick(args.output_root, manifest, "output_root"), base_dir, "output_root")
+    workflow = normalise_workflow(_pick(args.workflow, manifest, "workflow") or "soda_music")
+    backfill_value = _pick(args.backfill_excel, manifest, "backfill_excel", "order_excel")
+    song_value = _pick(args.song_excel, manifest, "song_excel")
+    backfill_excel = None if is_redfruit_workflow(workflow) and backfill_value in (None, "") else _required_path(
+        backfill_value,
         base_dir,
         "backfill_excel",
     )
-    song_excel = _required_path(_pick(args.song_excel, manifest, "song_excel"), base_dir, "song_excel")
-    output_root = _required_path(_pick(args.output_root, manifest, "output_root"), base_dir, "output_root")
+    song_excel = None if is_redfruit_workflow(workflow) and song_value in (None, "") else _required_path(
+        song_value,
+        base_dir,
+        "song_excel",
+    )
     dry_run = not bool(args.live or manifest.get("live") or manifest.get("dry_run") is False)
     recursive = args.recursive if args.recursive is not None else bool(manifest.get("recursive", True))
     return UserGrowthRunConfig(
@@ -413,6 +425,9 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
         order_id=str(_pick(args.order_id, manifest, "order_id") or "").strip(),
         task_name=str(_pick(args.task_name, manifest, "task_name") or "usergrowth_upload").strip() or "usergrowth_upload",
         batch_name=str(_pick(None, manifest, "batch_name", "name", "label") or "").strip(),
+        workflow=workflow,
+        redfruit_default_genre=str(_pick(args.redfruit_default_genre, manifest, "redfruit_default_genre") or "").strip(),
+        redfruit_bid_map=_parse_redfruit_bid_map(_pick(args.redfruit_bid_map, manifest, "redfruit_bid_map")),
         custom_tag_template_name=str(
             _pick(args.custom_tag_template_name, manifest, "custom_tag_template_name", "tag_template_name")
             or DEFAULT_CUSTOM_TAG_TEMPLATE_NAME
@@ -454,6 +469,20 @@ def _custom_tag_template_tags_from_args(args: argparse.Namespace, manifest: dict
         payload = normalise_template_payload(template_payload)
         return combine_template_tags(payload["fixed_tags"], payload["optional_tags"])
     return default_custom_tag_template_tags()
+
+
+def _parse_redfruit_bid_map(value: Any) -> dict[str, str]:
+    if value in (None, ""):
+        return {}
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items() if str(key).strip() and str(val).strip()}
+    try:
+        payload = json.loads(str(value))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(val) for key, val in payload.items() if str(key).strip() and str(val).strip()}
 
 
 def _required_path(value: Any, base_dir: Path, name: str) -> Path:
@@ -599,6 +628,7 @@ def run_selected_usergrowth_task(
     debug_dir = task_root / "debug"
     duplicate_song_excel = task_root / "duplicate_songs.xlsx"
     task_root.mkdir(parents=True, exist_ok=True)
+    supports_backfill = bool(config.order_excel) and not is_redfruit_workflow(config.workflow)
 
     try:
         _emit(progress, f"已选中 {len(video_paths)} 个视频，开始读取歌曲库和回填模板")
@@ -620,13 +650,19 @@ def run_selected_usergrowth_task(
                 if item.status == "pending":
                     item.status = "ready"
                     item.message = "预检通过，未执行上传"
-            result_excel = task_root / "result.xlsx"
-            write_back_results(config.order_excel, result_excel, items, include_ready=True)
-            _emit(progress, f"预检结果已写入：{result_excel}")
+            result_excel = None
+            if supports_backfill and config.order_excel:
+                result_excel = task_root / "result.xlsx"
+                write_back_results(config.order_excel, result_excel, items, include_ready=True)
+                _emit(progress, f"预检结果已写入：{result_excel}")
+            else:
+                _emit(progress, "预检完成，红果短剧流程不生成回填 Excel")
         else:
             active_plans = [plan for plan in plans if plan.status != "skipped"]
 
             def write_order_backfill(plan: UserGrowthOrderPlan) -> None:
+                if not supports_backfill or not config.order_excel:
+                    return
                 with _backfill_lock(config.order_excel):
                     write_back_results(config.order_excel, config.order_excel, plan.items, include_ready=False)
                 _emit(progress, f"订单 {plan.order_id} 已写回回填 Excel")
@@ -639,11 +675,14 @@ def run_selected_usergrowth_task(
                 refresh_interval_seconds=config.refresh_interval_seconds,
                 max_status_retries=config.max_status_retries,
                 browser_slow_mo_ms=config.browser_slow_mo_ms,
-                order_complete=write_order_backfill,
+                order_complete=write_order_backfill if supports_backfill else None,
             )
             asyncio.run(browser.run(active_plans, progress))
-            result_excel = config.order_excel
-            _emit(progress, f"正式上传完成，CID 已写回：{result_excel}")
+            result_excel = config.order_excel if supports_backfill else None
+            if result_excel:
+                _emit(progress, f"正式上传完成，CID 已写回：{result_excel}")
+            else:
+                _emit(progress, "正式上传完成，红果短剧流程已结束")
 
         payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
         payload["selected_videos"] = [str(path) for path in video_paths]
@@ -807,6 +846,10 @@ def build_selected_usergrowth_plan(
     *,
     duplicate_song_output_path: Path | None = None,
 ) -> tuple[list[UserGrowthOrderPlan], list[UserGrowthVideoItem]]:
+    if is_redfruit_workflow(config.workflow):
+        redfruit_config = replace(config, selected_video_paths=list(video_paths))
+        return build_redfruit_plan(redfruit_config)
+
     scanned_videos = [
         (path, detect_material_type(path.name))
         for path in _dedupe_paths(video_paths)
@@ -935,12 +978,13 @@ def _write_cli_error(output_root: Path | None, exc: BaseException) -> None:
 def _safe_config_dict(config: UserGrowthRunConfig) -> dict[str, Any]:
     return {
         "video_folder": str(config.video_folder),
-        "backfill_excel": str(config.order_excel),
-        "song_excel": str(config.song_excel),
+        "backfill_excel": str(config.order_excel) if config.order_excel else "",
+        "song_excel": str(config.song_excel) if config.song_excel else "",
         "output_root": str(config.output_root),
         "order_id": config.order_id,
         "task_name": config.task_name,
         "batch_name": config.batch_name,
+        "workflow": config.workflow,
         "selected_videos": [str(path) for path in config.selected_video_paths],
         "custom_tag_template_name": config.custom_tag_template_name,
         "custom_tag_template_tags": list(config.custom_tag_template_tags),
@@ -948,6 +992,8 @@ def _safe_config_dict(config: UserGrowthRunConfig) -> dict[str, Any]:
         "recursive": config.recursive,
         "dry_run": config.dry_run,
         "headless": config.headless,
+        "redfruit_default_genre": config.redfruit_default_genre,
+        "redfruit_bid_map": dict(config.redfruit_bid_map),
         "refresh_interval_seconds": config.refresh_interval_seconds,
         "browser_slow_mo_ms": config.browser_slow_mo_ms,
     }

@@ -18,6 +18,7 @@ from .usergrowth_models import (
     UserGrowthVideoItem,
 )
 from .usergrowth_planner import build_usergrowth_plan
+from .usergrowth_redfruit import is_redfruit_workflow
 
 
 ProgressCallback = Callable[[str], None]
@@ -127,6 +128,7 @@ def run_usergrowth_task(
     debug_dir = task_root / "debug"
     duplicate_song_excel = task_root / "duplicate_songs.xlsx"
     task_root.mkdir(parents=True, exist_ok=True)
+    supports_backfill = bool(config.order_excel) and not is_redfruit_workflow(config.workflow)
 
     if config.selected_video_paths:
         _emit(progress, f"正在读取已拆分批次：{len(config.selected_video_paths)} 个视频")
@@ -153,6 +155,8 @@ def run_usergrowth_task(
     else:
         active_plans = [plan for plan in plans if plan.status != "skipped"]
         def write_order_backfill(plan: UserGrowthOrderPlan) -> None:
+            if not supports_backfill or not config.order_excel:
+                return
             with _backfill_lock(config.order_excel):
                 write_back_results(config.order_excel, config.order_excel, plan.items, include_ready=False)
             _emit(progress, f"订单 {plan.order_id} 已写回回填 Excel")
@@ -165,24 +169,35 @@ def run_usergrowth_task(
             refresh_interval_seconds=config.refresh_interval_seconds,
             max_status_retries=config.max_status_retries,
             browser_slow_mo_ms=config.browser_slow_mo_ms,
-            order_complete=write_order_backfill,
+            order_complete=write_order_backfill if supports_backfill else None,
             cancel_event=cancel_event,
         )
         _raise_if_cancelled(cancel_event)
         asyncio.run(browser.run(active_plans, progress))
 
-    if config.dry_run:
+    overall_failed = any(plan.status == "failed" for plan in plans) or any(item.status == "failed" for item in items)
+    failure_message = next((plan.message for plan in plans if plan.status == "failed" and plan.message), "")
+    result_excel: Path | None = None
+    if config.dry_run and supports_backfill and config.order_excel:
         result_excel = task_root / "result.xlsx"
         write_back_results(config.order_excel, result_excel, items, include_ready=True)
-    else:
+    elif (not config.dry_run) and supports_backfill and config.order_excel:
         result_excel = config.order_excel
     payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
     (task_root / "task.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _write_log(task_root, payload)
     if config.dry_run:
-        _emit(progress, f"任务完成，预检结果已保存：{result_excel}")
+        if result_excel:
+            _emit(progress, f"任务完成，预检结果已保存：{result_excel}")
+        else:
+            _emit(progress, "任务完成，未生成回填 Excel")
     else:
-        _emit(progress, f"任务完成，CID 已写回：{result_excel}")
+        if result_excel:
+            _emit(progress, f"任务完成，CID 已写回：{result_excel}")
+        else:
+            _emit(progress, "任务完成，红果短剧流程已结束")
+    if overall_failed:
+        raise RuntimeError(failure_message or "任务执行失败")
     return payload
 
 
@@ -201,7 +216,7 @@ def _build_payload(
     task_root: Path,
     plans: list[UserGrowthOrderPlan],
     items: list[UserGrowthVideoItem],
-    result_excel: Path,
+    result_excel: Path | None,
     duplicate_song_excel: Path,
 ) -> dict:
     """组装 task.json 中保存的任务配置、统计和明细。"""
@@ -210,14 +225,23 @@ def _build_payload(
         "task_root": str(task_root),
         "mode": "dry_run" if config.dry_run else "browser_upload",
         "config": {
+            "workflow": config.workflow,
             "video_folder": str(config.video_folder),
             "batch_name": config.batch_name,
             "selected_videos": [str(path) for path in config.selected_video_paths],
-            "backfill_excel": str(config.order_excel),
-            "song_excel": str(config.song_excel),
+            "backfill_excel": _path_text(config.order_excel),
+            "song_excel": _path_text(config.song_excel),
             "output_root": str(config.output_root),
             "order_id": config.order_id,
             "task_name": config.task_name,
+            "delivery_products": list(config.delivery_products),
+            "delivery_platforms": list(config.delivery_platforms),
+            "delivery_platform_all": config.delivery_platform_all,
+            "arlp_products": list(config.arlp_products),
+            "arlp_platforms": list(config.arlp_platforms),
+            "arlp_platform_all": config.arlp_platform_all,
+            "redfruit_default_genre": config.redfruit_default_genre,
+            "redfruit_bid_map": dict(config.redfruit_bid_map),
             "custom_tag_template_name": config.custom_tag_template_name,
             "custom_tag_template_tags": list(config.custom_tag_template_tags),
             "month_tag": config.month_tag,
@@ -234,10 +258,14 @@ def _build_payload(
             "skipped": sum(1 for item in items if item.status == "skipped"),
             "failed": sum(1 for item in items if item.status == "failed"),
         },
-        "result_excel": str(result_excel),
+        "result_excel": _path_text(result_excel),
         "duplicate_song_excel": str(duplicate_song_excel),
         "plans": [plan.to_dict() for plan in plans],
     }
+
+
+def _path_text(path: Path | None) -> str:
+    return str(path) if path else ""
 
 
 def _write_log(task_root: Path, payload: dict) -> None:
@@ -245,6 +273,7 @@ def _write_log(task_root: Path, payload: dict) -> None:
     lines = [
         f"task_id: {payload['task_id']}",
         f"mode: {payload['mode']}",
+        f"workflow: {payload['config'].get('workflow', '')}",
         f"video_folder: {payload['config']['video_folder']}",
         f"batch_name: {payload['config'].get('batch_name', '')}",
         f"backfill_excel: {payload['config']['backfill_excel']}",
@@ -293,10 +322,13 @@ def _emit_song_match_logs(progress: ProgressCallback | None, items: list[UserGro
 def _song_match_log_line(item: UserGrowthVideoItem | dict[str, Any]) -> str:
     """格式化单个素材的歌曲 ID 匹配结果。"""
     file_name = str(_item_value(item, "file_name"))
+    workflow = str(_item_value(item, "workflow"))
     material_type = str(_item_value(item, "material_type"))
     song_name = str(_item_value(item, "song_name"))
     song_id = str(_item_value(item, "song_id"))
     message = str(_item_value(item, "song_match_message") or _item_value(item, "message"))
+    if is_redfruit_workflow(workflow):
+        return f"红果短剧识别：{file_name} | 剧名={song_name or '-'} | BID={song_id or '-'} | 类型={material_type or '-'} | {message or '已识别'}"
     if material_type in {"金币VIP", "金币SVIP"}:
         return f"歌曲匹配跳过：{file_name} | 素材类型={material_type} | {message or '不需要歌曲 ID'}"
     if song_id:
