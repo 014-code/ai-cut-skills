@@ -66,6 +66,9 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - Chameleon modal validation fails
   Inspect `chameleon_delivery_*` snapshots. Check `投放产品`, `汽水音乐`, and `投放平台` dropdown behavior.
 
+- Redfruit preflight fails
+  Inspect `redfruit_preflight_*` snapshots and `debug/run.log`. Check the user-specified order ID, the work-order title, the short-drama search result, the card title-label line, and the expanded `BID`. If the message says `用户指定订单与这批素材不符` or `用户指定订单与墨攻短剧选剧不符`, the order chosen by the user does not match the batch and should be corrected before upload. Common snapshots include `redfruit_preflight_order_title_missing_*`, `redfruit_preflight_order_kind_missing_*`, `redfruit_preflight_mixed_item_kinds_*`, and `redfruit_preflight_failed_*`.
+
 - Cascader selection fails
   Inspect console/debug output around `级联选择失败`. Confirm `LUNA_` labels and field names: `汽水音乐-素材类型`, `LUNA素材来源`, `LUNA功能卖点`.
 
@@ -91,3 +94,4 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - Existing CID rows are intentionally preserved; new rows start at the first empty CID row.
 - Multi-batch live mode can open multiple browser instances. Keep `concurrency` conservative if the machine or platform session is unstable.
 - Browser tag fill uses each item's planner values. It only uses one-click reuse when tags are identical or when non-song-ID tags are identical and `gq_id` is appended per card afterward.
+- Redfruit runs a hard preflight gate before upload. If the gate fails, fix the work-order kind, the filename kind, or the BID mapping before retrying.

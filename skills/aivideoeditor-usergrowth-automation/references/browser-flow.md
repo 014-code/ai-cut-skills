@@ -13,13 +13,14 @@ Login uses `https://usergrowth.com.cn/open/login`, then navigates/checks `https:
 1. Filter out skipped items.
 2. Enter `墨攻AI` and then `工单管理`.
 3. Search by `订单名称或ID`.
-4. Open `新建创意单元` for the searched order, with scoped, exact-text, nearby, and coordinate click fallbacks.
-5. Read upload limit from text such as `最多上传 N`, `最多 N 个`, or `上限 N`; skip plan if active items exceed the limit.
-6. Upload files and enter 录入变色龙 with retry.
-7. Read current task ID from a task input.
-8. Wait for `全部成功`, fail on `已失败`.
-9. Submit review.
-10. Open material list/detail, read CIDs, read material type by CID, and mark items success.
+4. For redfruit workflow, run preflight checks before opening `新建创意单元`.
+5. Open `新建创意单元` for the searched order, with scoped, exact-text, nearby, and coordinate click fallbacks.
+6. Read upload limit from text such as `最多上传 N`, `最多 N 个`, or `上限 N`; skip plan if active items exceed the limit.
+7. Upload files and enter 录入变色龙 with retry.
+8. Read current task ID from a task input.
+9. Wait for `全部成功`, fail on `已失败`.
+10. Submit review.
+11. Open material list/detail, read CIDs, read material type by CID, and mark items success.
 
 ## Upload
 
@@ -62,6 +63,21 @@ Default form choices:
 `_fill_cids_for_task` searches the task by ID, waits for row success, opens `素材/文案列表查看` or related text, reads CIDs from the global search input, and requires at least as many CIDs as items. It zips item order with CID order.
 
 If task status keeps refreshing for a long time without reaching `全部成功`, the browser can first open `查看详情`, read CIDs, write them back to Excel, and mark the row note as `未送审`. This is a backup path, not the normal success path.
+
+## Redfruit Preflight
+
+Redfruit runs a blocking preflight after the work-order search and before `新建创意单元`:
+
+1. Read the order title from the search result row and normalize it to `动态漫` or `仿真人`.
+2. Compare that against the file-derived kind from the selected videos.
+3. Open the short-drama insight page at `https://usergrowth.com.cn/aigc/insight/business/playlet?source=13`.
+4. Search each drama title by name, not BID.
+5. Read the title-label line from the card, such as `女频 / - / - / 3D动画漫剧`.
+6. Compare the card label kind against the file-derived kind.
+7. Click the card `ID` button when needed and compare the expanded `BID` against the expected BID.
+8. If the user-specified order does not match the selected batch, report it explicitly as `用户指定订单与这批素材不符` or `用户指定订单与墨攻短剧选剧不符`.
+
+Any mismatch raises a loud failure and stops the run before upload.
 
 Fallback CID reading clicks `查看详情`, tries `一键复制对象id`, then extracts CIDs from body text. `_read_material_type_by_cid` opens `查看素材` for the CID row and extracts `分类标签` for backfill material type.
 

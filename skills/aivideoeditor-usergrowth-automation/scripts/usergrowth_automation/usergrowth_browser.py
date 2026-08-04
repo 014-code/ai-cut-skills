@@ -11,7 +11,14 @@ from typing import Callable, Iterable
 
 from .usergrowth_captcha import UserGrowthCaptchaSolver
 from .usergrowth_models import UserGrowthCancelled, UserGrowthOrderPlan, UserGrowthVideoItem
-from .usergrowth_redfruit import is_redfruit_workflow
+from .usergrowth_redfruit import (
+    REDFRUIT_PLAYLET_URL,
+    redfruit_content_kind,
+    redfruit_extract_order_title,
+    redfruit_extract_playlet_card,
+    redfruit_format_preflight_failure,
+    is_redfruit_workflow,
+)
 from .usergrowth_rules import display_material_from_label, classification_path_for_material
 
 ProgressCallback = Callable[[str], None]
@@ -59,7 +66,7 @@ class UserGrowthBrowserClient:
             *,
             headless: bool = False,
             debug_dir: Path | None = None,
-            timeout_ms: int = 45000,
+            timeout_ms: int = 180000,
             refresh_interval_seconds: float = 12.0,
             max_status_retries: int = 3,
             browser_slow_mo_ms: int = 120,
@@ -101,6 +108,7 @@ class UserGrowthBrowserClient:
             page = await context.new_page()
             self._wrap_page_speed(page)
             page.set_default_timeout(self.timeout_ms)
+            page.set_default_navigation_timeout(self.timeout_ms)
             try:
                 self._raise_if_cancelled()
                 await self._snapshot(page, "00_browser_created")
@@ -332,6 +340,8 @@ class UserGrowthBrowserClient:
             self._raise_if_cancelled()
             await self._open_work_order_management(page, progress)
             await self._search_order(page, plan.order_id)
+            if self._is_redfruit_items(active_items):
+                await self._run_redfruit_preflight_checks(page, plan, active_items, progress)
             page = await self._open_create_creative_unit(page, plan.order_id)
             await self._snapshot(page, f"order_{plan.order_id}_after_create")
             limit = await self._read_upload_limit(page)
@@ -538,6 +548,199 @@ class UserGrowthBrowserClient:
         if not await self._order_visible(page, order_id):
             await self._snapshot_error(page, f"order_{order_id}_not_found")
             raise RuntimeError(f"查询结果中未找到订单 {order_id}")
+
+    async def _run_redfruit_preflight_checks(
+            self,
+            page,
+            plan: UserGrowthOrderPlan,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None = None,
+    ) -> None:
+        """红果短剧正式上传前的工单/剧名标签/BID 前置校验。"""
+        order_body = await self._body_text(page, timeout_ms=5000)
+        order_title = redfruit_extract_order_title(order_body, plan.order_id)
+        order_kind = redfruit_content_kind(order_title)
+        item_kinds = {
+            redfruit_content_kind(item.workflow_metadata.get("drama_type") or item.file_name or item.song_name)
+            for item in items
+            if item.status != "skipped"
+        }
+        item_kinds.discard("")
+        item_titles = sorted(
+            {
+                str(item.workflow_metadata.get("drama_title") or item.song_name or Path(item.file_name).stem).strip()
+                for item in items
+                if item.status != "skipped"
+            }
+        )
+        if not order_title:
+            await self._snapshot_error(page, f"redfruit_preflight_order_title_missing_{plan.order_id}")
+            raise RuntimeError(
+                redfruit_format_preflight_failure([
+                    f"工单【{plan.order_id}】未能识别出订单名称，无法继续校验！！",
+                ])
+            )
+        if not order_kind:
+            await self._snapshot_error(page, f"redfruit_preflight_order_kind_missing_{plan.order_id}")
+            raise RuntimeError(
+                redfruit_format_preflight_failure([
+                    f"工单【{plan.order_id}】名称【{order_title}】未识别到动态漫/仿真人分类，无法继续！！",
+                ])
+            )
+        if len(item_kinds) > 1:
+            await self._snapshot_error(page, f"redfruit_preflight_mixed_item_kinds_{plan.order_id}")
+            raise RuntimeError(
+                redfruit_format_preflight_failure([
+                    f"同一批素材里检测到多个剧目类型：{'、'.join(sorted(item_kinds))}，请先拆批！！",
+                ])
+            )
+        item_kind = next(iter(item_kinds), "")
+        errors: list[str] = []
+        warnings: list[str] = []
+        if item_kind and item_kind != order_kind:
+            errors.append(
+                f"**用户指定订单与这批素材不符！！** 用户指定订单【{plan.order_id}】名称【{order_title}】分类为【{order_kind}】，"
+                f"但这批文件名识别为【{item_kind}】！！"
+            )
+        elif not item_kind:
+            warnings.append("文件名未识别到明确的动态漫/仿真人类型，已跳过工单分类对照！！")
+        if not item_titles:
+            errors.append("未读取到任何剧名，无法执行红果前置校验！！")
+        self._emit(
+            progress,
+            f"红果前置校验：工单【{plan.order_id}】=【{order_title}】；文件分类=【{item_kind or '未识别'}】；"
+            f"工单分类=【{order_kind}】；剧目数={len(item_titles)}",
+        )
+
+        playlet_page = await page.context.new_page()
+        self._wrap_page_speed(playlet_page)
+        playlet_page.set_default_timeout(self.timeout_ms)
+        playlet_page.set_default_navigation_timeout(self.timeout_ms)
+        try:
+            await self._safe_goto(playlet_page, REDFRUIT_PLAYLET_URL)
+            search_input = await self._wait_first_existing(
+                playlet_page,
+                ("input[placeholder*='短剧名']", "input[placeholder*='搜索']"),
+                timeout_ms=30000,
+            )
+            if not search_input:
+                errors.append("短剧选剧页未找到剧名搜索框！！")
+            for title in item_titles:
+                if not search_input:
+                    break
+                title_error_count = len(errors)
+                await self._type_into_locator(search_input, playlet_page, title)
+                await playlet_page.keyboard.press("Enter")
+                card = {}
+                card_body = ""
+                for _ in range(12):
+                    await playlet_page.wait_for_timeout(1000)
+                    card_body = await self._body_text(playlet_page, timeout_ms=5000)
+                    card = redfruit_extract_playlet_card(card_body, title)
+                    if card.get("found") == "true":
+                        break
+                if card.get("found") != "true":
+                    errors.append(f"墨攻短剧选剧中未找到剧名【{title}】！！")
+                    continue
+                card_title = str(card.get("title") or "").strip()
+                card_label = str(card.get("title_label") or "").strip()
+                card_kind = str(card.get("title_kind") or "").strip()
+                card_bid = str(card.get("bid") or "").strip()
+                expected_item = next(
+                    (
+                        item for item in items
+                        if str(item.workflow_metadata.get("drama_title") or item.song_name or Path(item.file_name).stem).strip() == title
+                    ),
+                    items[0],
+                )
+                expected_bid = str(expected_item.workflow_metadata.get("bid") or expected_item.song_id or "").strip()
+                expected_kind = redfruit_content_kind(expected_item.workflow_metadata.get("drama_type") or expected_item.file_name)
+                if card_title and card_title != title:
+                    errors.append(f"剧名搜索命中结果不一致：文件名剧名【{title}】，墨攻结果【{card_title}】！！")
+                if expected_bid:
+                    if not card_bid:
+                        if await self._click_redfruit_card_id_button(playlet_page, title):
+                            for _ in range(6):
+                                await playlet_page.wait_for_timeout(800)
+                                card_body = await self._body_text(playlet_page, timeout_ms=5000)
+                                card = redfruit_extract_playlet_card(card_body, title)
+                                card_bid = str(card.get("bid") or "").strip()
+                                if card_bid:
+                                    break
+                    if not card_bid:
+                        errors.append(f"剧名【{title}】未读取到 BID，无法校验员工提供的 BID！！")
+                    elif expected_bid != card_bid:
+                        errors.append(
+                            f"剧名【{title}】的 BID 不一致：文件/映射期望【{expected_bid}】，墨攻命中【{card_bid}】！！"
+                        )
+                if card_kind and expected_kind and card_kind != expected_kind:
+                    errors.append(
+                        f"剧名【{title}】的短剧标签不一致：文件名类型【{expected_kind}】，墨攻标签【{card_label or card_kind}】！！"
+                    )
+                if card_kind and order_kind and card_kind != order_kind:
+                    errors.append(
+                        f"**用户指定订单与墨攻短剧选剧不符！！** 用户指定订单【{plan.order_id}】分类为【{order_kind}】，"
+                        f"剧名【{title}】在墨攻短剧选剧中的标签为【{card_label or card_kind}】！！"
+                    )
+                elif not card_kind:
+                    warnings.append(f"剧名【{title}】的墨攻剧名标签未更新或未识别，已仅保留工单分类对照！！")
+                status_text = "通过" if len(errors) == title_error_count else "发现异常"
+                self._emit(
+                    progress,
+                    f"红果前置校验{status_text}：剧名【{title}】；墨攻标签【{card_label or '未识别'}】；BID【{card_bid or '未读取'}】",
+                )
+                await playlet_page.wait_for_timeout(800)
+            if errors:
+                await self._snapshot_error(playlet_page, f"redfruit_preflight_failed_{plan.order_id}")
+                raise RuntimeError(redfruit_format_preflight_failure(errors, warnings))
+            if warnings:
+                self._emit(progress, "红果前置校验提醒：" + "；".join(warnings))
+        finally:
+            try:
+                await playlet_page.close()
+            except Exception:
+                pass
+
+    async def _click_redfruit_card_id_button(self, page, drama_title: str) -> bool:
+        """点击红果短剧卡片右侧的 ID 按钮，尽量让 BID 展开到正文里。"""
+        title_locator = page.get_by_text(drama_title, exact=True).first
+        try:
+            title_box = await title_locator.bounding_box(timeout=5000)
+        except Exception:
+            title_box = None
+        id_locators = page.get_by_text("ID", exact=True)
+        try:
+            count = await id_locators.count()
+        except Exception:
+            count = 0
+        candidates = []
+        for index in range(count):
+            locator = id_locators.nth(index)
+            try:
+                if not await locator.is_visible():
+                    continue
+                box = await locator.bounding_box(timeout=2000)
+                if not box:
+                    continue
+                score = 0.0
+                if title_box:
+                    score = abs((box["y"] + box["height"] / 2) - (title_box["y"] + title_box["height"] / 2))
+                candidates.append((score, locator))
+            except Exception:
+                continue
+        for _, locator in sorted(candidates, key=lambda item: item[0]):
+            try:
+                await locator.click(timeout=5000)
+                return True
+            except Exception:
+                continue
+        try:
+            if count:
+                await id_locators.first.click(timeout=5000)
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _order_visible(self, page, order_id: str) -> bool:
         """判断当前页面文本中是否能看到订单 ID。"""
@@ -3514,7 +3717,7 @@ class UserGrowthBrowserClient:
         last_error: Exception | None = None
         for _ in range(3):
             try:
-                await page.goto(url, wait_until="domcontentloaded")
+                await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 return
             except Exception as exc:
                 last_error = exc

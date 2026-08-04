@@ -112,6 +112,127 @@ REDFRUIT_FIXED_CUSTOM_TAGS = [
     "dxcz-番茄测试",
     "AI文生视频，无真人肖像输入",
 ]
+REDFRUIT_REAL_PERSON_TITLE_LABELS = (
+    "仿真人动态解说剧",
+    "仿真人剧",
+)
+REDFRUIT_DYNAMIC_TITLE_LABELS = (
+    "2D动态解说剧",
+    "3D动态解说剧",
+    "3D动画漫剧",
+    "2D动画漫剧",
+    "表情包漫剧",
+    "逆水寒漫剧",
+    "静态解说漫剧",
+)
+REDFRUIT_PLAYLET_URL = "https://usergrowth.com.cn/aigc/insight/business/playlet?source=13"
+
+
+def redfruit_content_kind(value: object) -> str:
+    """把文件名、工单名或短剧选剧剧名标签归一到“动态漫/仿真人”两类。"""
+    compact = _normalise_key(value)
+    if not compact:
+        return ""
+    if "仿真人" in compact or any(_normalise_key(label) in compact for label in REDFRUIT_REAL_PERSON_TITLE_LABELS):
+        return "仿真人"
+    if (
+        "动态漫" in compact
+        or "动画漫剧" in compact
+        or "动态解说剧" in compact
+        or any(_normalise_key(label) in compact for label in REDFRUIT_DYNAMIC_TITLE_LABELS)
+    ):
+        return "动态漫"
+    return ""
+
+
+def redfruit_extract_order_title(body_text: str, order_id: str) -> str:
+    """从工单搜索结果正文中提取当前订单标题。"""
+    wanted = str(order_id or "").strip()
+    if not wanted:
+        return ""
+    lines = [line.strip() for line in re.split(r"\r?\n", str(body_text or "")) if line.strip()]
+    id_pattern = re.compile(rf"^ID\s*[:：]\s*{re.escape(wanted)}\s*$", flags=re.IGNORECASE)
+    for index, line in enumerate(lines):
+        if not id_pattern.search(line):
+            continue
+        for prev_index in range(index - 1, -1, -1):
+            candidate = lines[prev_index].strip()
+            if candidate and candidate not in {"订单名称", "订单", "操作"}:
+                return candidate
+    match = re.search(rf"([^\n\r]+)\s*\n\s*ID\s*[:：]\s*{re.escape(wanted)}\b", str(body_text or ""), flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def redfruit_extract_playlet_card(body_text: str, drama_title: str) -> dict[str, str]:
+    """从短剧选剧搜索结果正文中提取剧名标签、题材分类和 BID。"""
+    title = str(drama_title or "").strip()
+    title_key = _normalise_key(title)
+    lines = [line.strip() for line in re.split(r"\r?\n", str(body_text or "")) if line.strip()]
+    for index, line in enumerate(lines):
+        line_key = _normalise_key(line)
+        if not title_key or not (line_key == title_key or title_key in line_key):
+            continue
+        label_line = ""
+        genre = ""
+        for next_index in range(index + 1, min(len(lines), index + 18)):
+            candidate = lines[next_index].strip()
+            if not candidate:
+                continue
+            if candidate.startswith(("分类：", "分类:")):
+                if candidate in {"分类：", "分类:"} and next_index + 1 < len(lines):
+                    genre = lines[next_index + 1].strip()
+                else:
+                    genre = re.sub(r"^分类[:：]\s*", "", candidate).strip()
+                break
+            if "/" in candidate and not label_line:
+                label_line = candidate
+        bid = redfruit_extract_bid(str(body_text or ""))
+        return {
+            "found": "true",
+            "title": line,
+            "label_line": label_line,
+            "title_label": _playlet_title_label_from_line(label_line),
+            "title_kind": redfruit_content_kind(label_line),
+            "genre": genre,
+            "bid": bid,
+        }
+    return {
+        "found": "false",
+        "title": "",
+        "label_line": "",
+        "title_label": "",
+        "title_kind": "",
+        "genre": "",
+        "bid": redfruit_extract_bid(str(body_text or "")),
+    }
+
+
+def redfruit_extract_bid(text: str) -> str:
+    """从页面正文或文件名片段中提取红果 BID 并统一成 bid_数字。"""
+    match = re.search(r"(?i)\bBID\b\s*[:：]\s*(\d{8,})", str(text or ""))
+    if match:
+        return f"bid_{match.group(1)}"
+    return redfruit_bid(str(text or ""))
+
+
+def redfruit_format_preflight_failure(errors: list[str], warnings: list[str] | None = None) -> str:
+    """把红果前置校验结果格式化成醒目的阻断信息。"""
+    lines = [
+        "**红果短剧前置校验失败！！**",
+        "**已停止后续上传流程！！请先核对工单、文件名分类和 BID！！**",
+    ]
+    for message in errors:
+        lines.append(f"!! {message}")
+    for message in warnings or []:
+        lines.append(f"! {message}")
+    return "\n".join(lines)
+
+
+def _playlet_title_label_from_line(label_line: str) -> str:
+    if not label_line:
+        return ""
+    parts = [part.strip() for part in label_line.split("/") if part.strip()]
+    return parts[-1] if parts else ""
 
 
 def normalise_workflow(value: object) -> str:
