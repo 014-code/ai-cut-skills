@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -219,6 +220,165 @@ def fit_font_size(text: str, requested_size: int, width: int) -> int:
     return min(requested_size, fitted_maximum)
 
 
+def parse_box(value: str) -> dict[str, int]:
+    """Parse an audited source-pixel rectangle expressed as x,y,w,h."""
+    try:
+        parts = [int(part.strip()) for part in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid box {value!r}; expected integer x,y,w,h"
+        ) from exc
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            f"Invalid box {value!r}; expected exactly x,y,w,h"
+        )
+    x, y, box_width, box_height = parts
+    if x < 0 or y < 0 or box_width <= 0 or box_height <= 0:
+        raise argparse.ArgumentTypeError(
+            f"Invalid box {value!r}; x/y must be non-negative and w/h must be positive"
+        )
+    return {"x": x, "y": y, "width": box_width, "height": box_height}
+
+
+def audited_boxes(
+    boxes: list[dict[str, int]],
+    *,
+    kind: str,
+    frame_width: int,
+    frame_height: int,
+) -> list[dict[str, Any]]:
+    audited: list[dict[str, Any]] = []
+    for index, box in enumerate(boxes, start=1):
+        right = box["x"] + box["width"]
+        bottom = box["y"] + box["height"]
+        if right > frame_width or bottom > frame_height:
+            raise SystemExit(
+                f"{kind} box #{index} exceeds the {frame_width}x{frame_height} frame: "
+                f"{box['x']},{box['y']},{box['width']},{box['height']}"
+            )
+        audited.append({**box, "kind": kind, "index": index})
+    return audited
+
+
+def boxes_conflict(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    gap: int,
+) -> bool:
+    """Return True when rectangles overlap or have less than the required gap."""
+    first_right = first["x"] + first["width"]
+    first_bottom = first["y"] + first["height"]
+    second_right = second["x"] + second["width"]
+    second_bottom = second["y"] + second["height"]
+    return not (
+        first_right + gap <= second["x"]
+        or second_right + gap <= first["x"]
+        or first_bottom + gap <= second["y"]
+        or second_bottom + gap <= first["y"]
+    )
+
+
+def estimated_text_box(
+    text: str,
+    *,
+    size: int,
+    frame_width: int,
+    y: int,
+) -> dict[str, int]:
+    # Reserve a little more than drawtext's nominal glyph bounds for the 1–2px outline.
+    box_width = min(
+        frame_width,
+        math.ceil(estimated_text_units(text) * size * 1.06) + 6,
+    )
+    box_height = math.ceil(size * 1.25) + 4
+    return {
+        "x": max(0, (frame_width - box_width) // 2),
+        "y": y,
+        "width": box_width,
+        "height": box_height,
+    }
+
+
+def resolve_notice_placement(
+    *,
+    text: str,
+    size: int,
+    frame_width: int,
+    frame_height: int,
+    requested_y: int | None,
+    occupied_boxes: list[dict[str, Any]],
+    gap: int,
+    minimum_y: int,
+) -> tuple[int | None, dict[str, int] | None, str, bool]:
+    if not text:
+        return None, None, "not_added", True
+
+    provisional = estimated_text_box(
+        text,
+        size=size,
+        frame_width=frame_width,
+        y=0,
+    )
+    box_height = provisional["height"]
+    bottom_margin = max(10, round(frame_height * 0.015))
+
+    def candidate(y: int) -> dict[str, int]:
+        return {**provisional, "y": y}
+
+    def collisions(box: dict[str, int]) -> list[dict[str, Any]]:
+        return [
+            occupied
+            for occupied in occupied_boxes
+            if boxes_conflict(box, occupied, gap=gap)
+        ]
+
+    if requested_y is not None:
+        box = candidate(requested_y)
+        if requested_y < minimum_y or requested_y + box_height > frame_height:
+            raise SystemExit(
+                f"--notice-y must keep the added notice within y={minimum_y}–"
+                f"{frame_height - box_height}; got {requested_y}"
+            )
+        conflicts = collisions(box)
+        if conflicts:
+            labels = ", ".join(
+                f"{item['kind']}#{item['index']}" for item in conflicts
+            )
+            raise SystemExit(
+                f"--notice-y collides with audited source overlays ({labels}); "
+                "move it or correct the audited boxes"
+            )
+        return requested_y, box, "explicit", True
+
+    source_notice_boxes = [
+        box for box in occupied_boxes if box.get("kind") == "source_notice"
+    ]
+    if source_notice_boxes:
+        notice_y = min(
+            box["y"] - gap - box_height for box in source_notice_boxes
+        )
+        mode = "auto_above_source_notice"
+    else:
+        notice_y = frame_height - box_height - bottom_margin
+        mode = "default_bottom"
+    for _ in range(len(occupied_boxes) + 1):
+        box = candidate(notice_y)
+        conflicts = collisions(box)
+        if not conflicts:
+            if notice_y < minimum_y:
+                break
+            return notice_y, box, mode, True
+        notice_y = min(item["y"] - gap - box_height for item in conflicts)
+        mode = "auto_above_source_overlays"
+
+    raise SystemExit(
+        "No collision-free position remains for the added notice below the title/benefit. "
+        "Correct --source-notice-box/--source-subtitle-box, reduce --notice-font-size, "
+        "or provide a verified --notice-y."
+    )
+
+
 def resolve_overlay_plan(args: argparse.Namespace, width: int, height: int) -> dict[str, Any]:
     requested_title_size = args.title_font_size or max(28, round(height * 0.03))
     requested_benefit_size = args.benefit_font_size or max(24, round(height * 0.025))
@@ -276,12 +436,55 @@ def resolve_overlay_plan(args: argparse.Namespace, width: int, height: int) -> d
 
     notice_text = " · ".join(text for text in (risk_text, ai_text) if text)
     notice_size = fit_font_size(notice_text, requested_notice_size, width)
-    if args.notice_y is not None:
-        if args.notice_y < 0 or args.notice_y + notice_size >= height:
-            raise SystemExit("--notice-y places the added notice outside the frame")
-        notice_y = str(args.notice_y)
-    else:
-        notice_y = f"h-text_h-{max(10, round(height * 0.015))}"
+    source_notice_boxes = audited_boxes(
+        args.source_notice_box,
+        kind="source_notice",
+        frame_width=width,
+        frame_height=height,
+    )
+    source_subtitle_boxes = audited_boxes(
+        args.source_subtitle_box,
+        kind="source_subtitle",
+        frame_width=width,
+        frame_height=height,
+    )
+    if (args.source_risk_present or args.source_ai_present) and not source_notice_boxes:
+        raise SystemExit(
+            "Every existing source notice requires at least one "
+            "--source-notice-box x,y,w,h from the visual audit"
+        )
+    if args.source_subtitles_present and not source_subtitle_boxes:
+        raise SystemExit(
+            "--source-subtitles-present requires at least one "
+            "--source-subtitle-box x,y,w,h union region from the visual audit"
+        )
+    if not args.source_subtitles_present and source_subtitle_boxes:
+        raise SystemExit(
+            "--source-subtitle-box is only valid with --source-subtitles-present"
+        )
+    notice_gap = (
+        args.notice_gap
+        if args.notice_gap is not None
+        else max(8, round(height * (16 / 1920)))
+    )
+    if notice_gap < 0:
+        raise SystemExit("--notice-gap must be non-negative")
+    minimum_notice_y = (
+        benefit_y + benefit_size + notice_gap
+        if args.benefit_text
+        else title_bottom + notice_gap
+    )
+    occupied_boxes = [*source_notice_boxes, *source_subtitle_boxes]
+    notice_y, notice_box, notice_position_mode, notice_clear = resolve_notice_placement(
+        text=notice_text,
+        size=notice_size,
+        frame_width=width,
+        frame_height=height,
+        requested_y=args.notice_y,
+        occupied_boxes=occupied_boxes,
+        gap=notice_gap,
+        minimum_y=minimum_notice_y,
+    )
 
     return {
         "source_title_present": bool(args.source_title_present),
@@ -294,11 +497,18 @@ def resolve_overlay_plan(args: argparse.Namespace, width: int, height: int) -> d
         "benefit_size": benefit_size,
         "source_risk_present": bool(args.source_risk_present),
         "source_ai_present": bool(args.source_ai_present),
+        "source_subtitles_present": bool(args.source_subtitles_present),
         "added_risk_text": risk_text,
         "added_ai_text": ai_text,
         "notice_text": notice_text,
         "notice_y": notice_y,
+        "notice_box": notice_box,
         "notice_size": notice_size,
+        "notice_gap": notice_gap,
+        "notice_position_mode": notice_position_mode,
+        "source_notice_boxes": source_notice_boxes,
+        "source_subtitle_boxes": source_subtitle_boxes,
+        "notice_clear_of_source_overlays": notice_clear,
         "notice_background": False,
         "notice_shadow": 0,
     }
@@ -327,6 +537,9 @@ def build_parser() -> argparse.ArgumentParser:
     ai_group = parser.add_mutually_exclusive_group(required=True)
     ai_group.add_argument("--source-ai-present", action="store_true")
     ai_group.add_argument("--ai-text")
+    subtitle_group = parser.add_mutually_exclusive_group(required=True)
+    subtitle_group.add_argument("--source-subtitles-present", action="store_true")
+    subtitle_group.add_argument("--source-subtitles-absent", action="store_true")
     parser.add_argument("--font-file", type=Path)
     parser.add_argument("--title-font-size", type=int)
     parser.add_argument("--benefit-font-size", type=int)
@@ -335,6 +548,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title-y", type=int)
     parser.add_argument("--benefit-y", type=int)
     parser.add_argument("--notice-y", type=int)
+    parser.add_argument(
+        "--source-notice-box",
+        action="append",
+        type=parse_box,
+        default=[],
+        metavar="X,Y,W,H",
+        help="Repeatable source-pixel rectangle for an existing warning/AI notice",
+    )
+    parser.add_argument(
+        "--source-subtitle-box",
+        action="append",
+        type=parse_box,
+        default=[],
+        metavar="X,Y,W,H",
+        help="Repeatable source-pixel rectangle or union band for burned-in dialogue subtitles",
+    )
+    parser.add_argument(
+        "--notice-gap",
+        type=int,
+        help="Minimum pixel gap from audited source boxes (default: 16px at 1080x1920)",
+    )
     parser.add_argument("--title-color", default="FFF4C2")
     parser.add_argument("--benefit-color", default="FFE12B")
     parser.add_argument("--notice-color", default="FFFFFF")
@@ -343,8 +577,80 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument(
+        "--qa-dir",
+        type=Path,
+        help="Directory for mandatory opening/middle/late full frames and bottom crops",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser
+
+
+def qa_sample_times(body_duration: float) -> list[tuple[str, float]]:
+    inset = min(0.5, max(0.04, body_duration * 0.2))
+    candidates = [
+        ("opening", min(inset, body_duration * 0.25)),
+        ("middle", body_duration * 0.5),
+        ("late_body", max(0.0, body_duration - inset)),
+    ]
+    unique: list[tuple[str, float]] = []
+    seen: set[float] = set()
+    for label, timestamp in candidates:
+        normalized = round(max(0.0, timestamp), 3)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append((label, normalized))
+    return unique
+
+
+def extract_qa_frames(
+    *,
+    video: Path,
+    body_duration: float,
+    qa_dir: Path,
+    ffmpeg: str,
+) -> list[dict[str, Any]]:
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    frames: list[dict[str, Any]] = []
+    for label, timestamp in qa_sample_times(body_duration):
+        full_frame = qa_dir / f"{label}_{timestamp:.3f}s.png"
+        bottom_crop = qa_dir / f"{label}_{timestamp:.3f}s_bottom.png"
+        common = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{timestamp:.3f}",
+            "-i",
+            str(video),
+            "-frames:v",
+            "1",
+        ]
+        run([*common, str(full_frame)])
+        run(
+            [
+                *common,
+                "-vf",
+                "crop=iw:floor(ih*0.35/2)*2:0:ih-oh",
+                str(bottom_crop),
+            ]
+        )
+        if not full_frame.is_file() or not full_frame.stat().st_size:
+            raise SystemExit(f"Failed to create QA frame: {full_frame}")
+        if not bottom_crop.is_file() or not bottom_crop.stat().st_size:
+            raise SystemExit(f"Failed to create bottom-region QA crop: {bottom_crop}")
+        frames.append(
+            {
+                "label": label,
+                "timestamp_seconds": timestamp,
+                "full_frame": str(full_frame.resolve()),
+                "bottom_35_percent": str(bottom_crop.resolve()),
+            }
+        )
+    return frames
 
 
 def main() -> int:
@@ -359,6 +665,11 @@ def main() -> int:
     if output.exists() and not args.overwrite:
         raise SystemExit(f"Output already exists; pass --overwrite to replace it: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
+    qa_dir = (
+        args.qa_dir.expanduser().resolve()
+        if args.qa_dir
+        else output.with_name(output.name + ".qa")
+    )
 
     source_probe = probe(source, ffprobe)
     source_video = first_stream(source_probe, "video")
@@ -437,7 +748,7 @@ def main() -> int:
                 size=overlay_plan["notice_size"],
                 color=args.notice_color,
                 x="(w-text_w)/2",
-                y=overlay_plan["notice_y"],
+                y=str(overlay_plan["notice_y"]),
                 border=notice_border,
             )
         )
@@ -536,6 +847,12 @@ def main() -> int:
                 "-",
             ]
         )
+        qa_frames = extract_qa_frames(
+            video=output,
+            body_duration=cut_at,
+            qa_dir=qa_dir,
+            ffmpeg=ffmpeg,
+        )
     except Exception:
         if temp_output.exists():
             temp_output.unlink()
@@ -573,6 +890,10 @@ def main() -> int:
             overlay_plan["source_ai_present"] != bool(overlay_plan["added_ai_text"])
         ),
         "notice_background_disabled": not overlay_plan["notice_background"],
+        "notice_clear_of_source_overlays": overlay_plan[
+            "notice_clear_of_source_overlays"
+        ],
+        "notice_qa_frames_created": len(qa_frames) == len(qa_sample_times(cut_at)),
     }
     status = "passed" if all(checks.values()) else "failed"
     manifest_path = (
@@ -599,6 +920,9 @@ def main() -> int:
             "title_present": overlay_plan["source_title_present"],
             "risk_notice_present": overlay_plan["source_risk_present"],
             "ai_notice_present": overlay_plan["source_ai_present"],
+            "subtitles_present": overlay_plan["source_subtitles_present"],
+            "notice_boxes": overlay_plan["source_notice_boxes"],
+            "subtitle_boxes": overlay_plan["source_subtitle_boxes"],
         },
         "overlay_layout": {
             "title_y": overlay_plan["title_y"],
@@ -606,6 +930,9 @@ def main() -> int:
             "title_benefit_gap": overlay_plan["title_gap"],
             "benefit_y": overlay_plan["benefit_y"],
             "notice_y": overlay_plan["notice_y"],
+            "notice_box": overlay_plan["notice_box"],
+            "notice_gap": overlay_plan["notice_gap"],
+            "notice_position_mode": overlay_plan["notice_position_mode"],
             "notice_background": False,
             "notice_border": notice_border,
             "notice_shadow": 0,
@@ -618,6 +945,14 @@ def main() -> int:
         },
         "expected_duration_seconds": expected_duration,
         "output": str(output),
+        "qa_review": {
+            "status": "visual_review_required",
+            "instruction": (
+                "Inspect every full frame and bottom_35_percent crop; confirm the added notice "
+                "does not cover source notices, dialogue subtitles, or important faces."
+            ),
+            "frames": qa_frames,
+        },
         "output_probe": output_probe,
         "checks": checks,
     }
