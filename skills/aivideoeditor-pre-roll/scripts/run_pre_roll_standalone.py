@@ -1486,9 +1486,35 @@ def ass_escape(text: str) -> str:
     return str(text or "").replace("\\", "\\\\").replace("{", r"\{").replace("}", r"\}").replace("\n", r"\N")
 
 
+NUMERIC_SUBTITLE_CONNECTORS = frozenset(".．:：,，/／-－–—")
+NUMERIC_SUBTITLE_DASHES = frozenset("-－–—")
+
+
+def is_unicode_number(character: str) -> bool:
+    return bool(character) and unicodedata.category(character).startswith("N")
+
+
+def preserve_rendered_subtitle_punctuation(characters: List[str], index: int) -> bool:
+    """保留数字语义所需的小数点、时间/日期分隔符、范围线、负号和千位分隔符。"""
+    character = characters[index]
+    if character not in NUMERIC_SUBTITLE_CONNECTORS:
+        return False
+    previous = characters[index - 1] if index > 0 else ""
+    following = characters[index + 1] if index + 1 < len(characters) else ""
+    if is_unicode_number(previous) and is_unicode_number(following):
+        return True
+    return character in NUMERIC_SUBTITLE_DASHES and is_unicode_number(following) and not is_unicode_number(previous)
+
+
 def strip_rendered_subtitle_punctuation(text: str) -> str:
-    # 只处理最终显示的字幕，不影响口播文本、分段和时间轴。
-    return "".join(ch for ch in str(text or "") if not unicodedata.category(ch).startswith("P"))
+    # 只处理最终显示的字幕，不影响口播文本、分段和时间轴；保留数字语义标点。
+    characters = list(str(text or ""))
+    return "".join(
+        character
+        for index, character in enumerate(characters)
+        if not unicodedata.category(character).startswith("P")
+        or preserve_rendered_subtitle_punctuation(characters, index)
+    )
 
 
 def ass_inline_color(value: Optional[str], default_value: str) -> str:

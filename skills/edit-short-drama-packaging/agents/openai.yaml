@@ -1,4 +1,4 @@
 interface:
   display_name: "短剧包装剪辑"
   short_description: "只处理过审短剧，补齐剧名、利益点、提示语并拼接尾板"
-  default_prompt: "Use $edit-short-drama-packaging only on moderation-passed short-drama videos from 过了 or with downstream_gate.allow_short_drama_editing=true. Reject 没过 sources, then audit the existing title and notices, add only missing copy without background bars, and package the video with the matching tail board."
+  default_prompt: "Use $edit-short-drama-packaging on a moderation-passed short drama to audit source notice and subtitle rectangles, add only missing copy without background bars, require collision-free notice placement plus bottom-region QA review, and append the orientation-matched tail board."
