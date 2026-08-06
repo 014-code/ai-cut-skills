@@ -14,9 +14,11 @@ from .usergrowth_models import UserGrowthCancelled, UserGrowthOrderPlan, UserGro
 from .usergrowth_redfruit import (
     REDFRUIT_PLAYLET_URL,
     redfruit_content_kind,
+    redfruit_expected_order_kind,
     redfruit_extract_order_title,
     redfruit_extract_playlet_card,
     redfruit_format_preflight_failure,
+    redfruit_order_kind,
     is_redfruit_workflow,
 )
 from .usergrowth_rules import display_material_from_label, classification_path_for_material
@@ -54,6 +56,10 @@ SELECT_CONTROL_SELECTOR = (
 DROPDOWN_ROOT_SELECTOR = ".arco-trigger-popup, .arco-select-dropdown, .arco-cascader-popup, [role='listbox']"
 # 下拉选项元素
 DROPDOWN_OPTION_SELECTOR = ".arco-select-option, .arco-cascader-option, [role='option']"
+
+
+class UserGrowthFatalPageError(RuntimeError):
+    """页面明确给出不可重试原因时直接中止当前重试。"""
 
 
 class UserGrowthBrowserClient:
@@ -119,7 +125,18 @@ class UserGrowthBrowserClient:
                     self._raise_if_cancelled()
                     if plan.status == "skipped":
                         continue
-                    await self._process_order(page, plan, progress)
+                    if getattr(plan, "_existing_only", False):
+                        active_items = [item for item in plan.items if item.status != "skipped"]
+                        page = await self._process_existing_creative_unit_items(
+                            page,
+                            plan,
+                            active_items,
+                            progress,
+                        )
+                        plan.status = "success"
+                        plan.message = "补录处理完成"
+                    else:
+                        await self._process_order(page, plan, progress)
                     if (
                             self.order_complete
                             and plan.status == "success"
@@ -146,6 +163,15 @@ class UserGrowthBrowserClient:
                     await browser.close()
                 except Exception:
                     pass
+
+    async def run_existing_creative_units(
+            self,
+            plan: UserGrowthOrderPlan,
+            progress: ProgressCallback | None = None,
+    ) -> None:
+        """只处理已存在创意单元的补录，不重新创建或上传文件。"""
+        setattr(plan, "_existing_only", True)
+        await self.run([plan], progress)
 
     def _write_run_log(self, message: str) -> None:
         """把流程级别的计时日志追加到 run.log。
@@ -334,6 +360,7 @@ class UserGrowthBrowserClient:
             plan.status = "skipped"
             plan.message = "没有可上传素材"
             return
+        original_active_items = list(active_items)
 
         self._emit(progress, f"处理订单 {plan.order_id}，素材 {len(active_items)} 个")
         try:
@@ -354,27 +381,42 @@ class UserGrowthBrowserClient:
                     item.message = plan.message
                 return
             page = await self._upload_and_enter_chameleon_with_retry(page, plan, active_items, progress)
-            plan.task_id = await self._read_current_task_id(page)
-            if not plan.task_id:
-                await self._snapshot_error(page, f"order_{plan.order_id}_task_id_not_found")
-                raise RuntimeError("未读取到当前任务ID")
+            existing_unit_items = [
+                item
+                for item in original_active_items
+                if self._existing_creative_unit_id_for_item(item)
+            ]
+            if active_items:
+                plan.task_id = await self._read_current_task_id(page, progress=progress)
+                if not plan.task_id:
+                    await self._snapshot_error(page, f"order_{plan.order_id}_task_id_not_found")
+                    raise RuntimeError("未读取到当前任务ID")
 
-            redfruit_flow = self._is_redfruit_items(active_items)
-            wait_result = await self._wait_task_success(
-                page,
-                progress,
-                expected_attempts=max(len(active_items), 1),
-                plan=None if redfruit_flow else plan,
-                items=[] if redfruit_flow else active_items,
-                task_id="" if redfruit_flow else plan.task_id,
-            )
-            if wait_result == "cid_backed_up":
-                return
-            await self._submit_review(page)
-            if redfruit_flow:
-                await self._process_redfruit_after_review(page, plan, active_items, plan.task_id, progress)
-            else:
-                await self._fill_cids_for_task(page, active_items, plan.task_id, progress)
+                redfruit_flow = self._is_redfruit_items(active_items)
+                wait_result = await self._wait_task_success(
+                    page,
+                    progress,
+                    expected_attempts=max(len(active_items), 1),
+                    plan=None if redfruit_flow else plan,
+                    items=[] if redfruit_flow else active_items,
+                    task_id="" if redfruit_flow else plan.task_id,
+                )
+                if wait_result != "cid_backed_up":
+                    await self._submit_review(page)
+                    if redfruit_flow:
+                        await self._process_redfruit_after_review(page, plan, active_items, plan.task_id, progress)
+                    else:
+                        await self._fill_cids_for_task(page, active_items, plan.task_id, progress)
+            elif existing_unit_items:
+                self._emit(progress, "本轮新上传素材均命中已存在创意单元，跳过新建单元录入")
+
+            if existing_unit_items:
+                page = await self._process_existing_creative_unit_items(
+                    page,
+                    plan,
+                    existing_unit_items,
+                    progress,
+                )
             plan.status = "success"
             plan.message = "处理完成"
         except UserGrowthCancelled as exc:
@@ -559,13 +601,23 @@ class UserGrowthBrowserClient:
         """红果短剧正式上传前的工单/剧名标签/BID 前置校验。"""
         order_body = await self._body_text(page, timeout_ms=5000)
         order_title = redfruit_extract_order_title(order_body, plan.order_id)
-        order_kind = redfruit_content_kind(order_title)
-        item_kinds = {
+        order_kind = redfruit_order_kind(order_title)
+        item_drama_kinds = {
             redfruit_content_kind(item.workflow_metadata.get("drama_type") or item.file_name or item.song_name)
             for item in items
             if item.status != "skipped"
         }
-        item_kinds.discard("")
+        item_drama_kinds.discard("")
+        item_order_kinds = {
+            redfruit_expected_order_kind(
+                item.file_name,
+                drama_type=item.workflow_metadata.get("drama_type") or item.file_name or item.song_name,
+                material_mode=item.workflow_metadata.get("material_mode") or item.material_type,
+            )
+            for item in items
+            if item.status != "skipped"
+        }
+        item_order_kinds.discard("")
         item_titles = sorted(
             {
                 str(item.workflow_metadata.get("drama_title") or item.song_name or Path(item.file_name).stem).strip()
@@ -587,29 +639,37 @@ class UserGrowthBrowserClient:
                     f"工单【{plan.order_id}】名称【{order_title}】未识别到动态漫/仿真人分类，无法继续！！",
                 ])
             )
-        if len(item_kinds) > 1:
+        if len(item_order_kinds) > 1:
             await self._snapshot_error(page, f"redfruit_preflight_mixed_item_kinds_{plan.order_id}")
             raise RuntimeError(
                 redfruit_format_preflight_failure([
-                    f"同一批素材里检测到多个剧目类型：{'、'.join(sorted(item_kinds))}，请先拆批！！",
+                    f"同一批素材里检测到多个应使用工单类型：{'、'.join(sorted(item_order_kinds))}，请先拆批！！",
                 ])
             )
-        item_kind = next(iter(item_kinds), "")
+        if len(item_drama_kinds) > 1:
+            await self._snapshot_error(page, f"redfruit_preflight_mixed_drama_kinds_{plan.order_id}")
+            raise RuntimeError(
+                redfruit_format_preflight_failure([
+                    f"同一批素材里检测到多个剧目类型：{'、'.join(sorted(item_drama_kinds))}，请先拆批！！",
+                ])
+            )
+        item_kind = next(iter(item_drama_kinds), "")
+        expected_order_kind = next(iter(item_order_kinds), "")
         errors: list[str] = []
         warnings: list[str] = []
-        if item_kind and item_kind != order_kind:
+        if expected_order_kind and expected_order_kind != order_kind:
             errors.append(
-                f"**用户指定订单与这批素材不符！！** 用户指定订单【{plan.order_id}】名称【{order_title}】分类为【{order_kind}】，"
-                f"但这批文件名识别为【{item_kind}】！！"
+                f"**用户指定订单与这批素材不符！！** 用户指定订单【{plan.order_id}】名称【{order_title}】应归类为【{order_kind}】，"
+                f"但这批文件名识别应使用【{expected_order_kind}】工单，剧目分类为【{item_kind or '未识别'}】！！"
             )
-        elif not item_kind:
-            warnings.append("文件名未识别到明确的动态漫/仿真人类型，已跳过工单分类对照！！")
+        elif not expected_order_kind:
+            warnings.append("文件名未识别到明确的动态漫/仿真人工单类型，已跳过工单分类对照！！")
         if not item_titles:
             errors.append("未读取到任何剧名，无法执行红果前置校验！！")
         self._emit(
             progress,
             f"红果前置校验：工单【{plan.order_id}】=【{order_title}】；文件分类=【{item_kind or '未识别'}】；"
-            f"工单分类=【{order_kind}】；剧目数={len(item_titles)}",
+            f"应使用工单=【{expected_order_kind or '未识别'}】；工单分类=【{order_kind}】；剧目数={len(item_titles)}",
         )
 
         playlet_page = await page.context.new_page()
@@ -677,7 +737,7 @@ class UserGrowthBrowserClient:
                     errors.append(
                         f"剧名【{title}】的短剧标签不一致：文件名类型【{expected_kind}】，墨攻标签【{card_label or card_kind}】！！"
                     )
-                if card_kind and order_kind and card_kind != order_kind:
+                if card_kind and order_kind in {"动态漫", "仿真人"} and card_kind != order_kind:
                     errors.append(
                         f"**用户指定订单与墨攻短剧选剧不符！！** 用户指定订单【{plan.order_id}】分类为【{order_kind}】，"
                         f"剧名【{title}】在墨攻短剧选剧中的标签为【{card_label or card_kind}】！！"
@@ -757,10 +817,23 @@ class UserGrowthBrowserClient:
                 old_url = page.url
                 if not await clicker(page, order_id):
                     continue
-                target_page = await self._wait_create_page_after_click(page, before_pages, old_url)
+                target_page = await self._wait_create_page_after_click(
+                    page,
+                    before_pages,
+                    old_url,
+                    order_id=order_id,
+                )
                 if target_page:
                     await target_page.wait_for_timeout(4000)
                     return target_page
+                blocked_message = await self._detect_create_creative_unit_blocked(page, order_id)
+                if blocked_message:
+                    await self._snapshot_error(
+                        page,
+                        f"order_{order_id}_create_blocked_{attempt}",
+                        extra=blocked_message,
+                    )
+                    raise UserGrowthFatalPageError(blocked_message)
             await self._snapshot_error(page, f"order_{order_id}_create_click_no_effect_{attempt}")
             return False
 
@@ -770,6 +843,14 @@ class UserGrowthBrowserClient:
                 description=f"打开订单 {order_id} 的新建创意单元",
                 max_attempts=4,
             )
+        except UserGrowthFatalPageError as exc:
+            await self._snapshot_error(
+                page,
+                f"order_{order_id}_create_blocked",
+                exc=exc,
+                extra=str(exc),
+            )
+            raise RuntimeError(str(exc)) from exc
         except RuntimeError as exc:
             await self._snapshot_error(
                 page,
@@ -779,7 +860,35 @@ class UserGrowthBrowserClient:
             )
             raise RuntimeError(f"订单 {order_id} 搜索结果中未找到新建创意单元") from exc
 
-    async def _wait_create_page_after_click(self, page, before_pages: list, old_url: str):
+    async def _detect_create_creative_unit_blocked(
+            self,
+            page,
+            order_id: str,
+            *,
+            timeout_ms: int = 3000,
+    ) -> str:
+        """识别点击新建创意单元后平台弹出的不可继续原因。"""
+        body = await self._body_text(page, timeout_ms=timeout_ms)
+        block_messages = (
+            "已超出当前订单的交付截止时间",
+            "当前订单已超出交付截止时间",
+            "订单已截止",
+            "订单已结束",
+            "当前订单不可新建创意单元",
+        )
+        for message in block_messages:
+            if message in body:
+                return f"订单 {order_id} {message}，无法新建创意单元"
+        return ""
+
+    async def _wait_create_page_after_click(
+            self,
+            page,
+            before_pages: list,
+            old_url: str,
+            *,
+            order_id: str | None = None,
+    ):
         """点击创建入口后等待当前页或新标签页进入上传页。"""
         before_ids = {id(p) for p in before_pages}
         deadline = asyncio.get_event_loop().time() + 25
@@ -809,6 +918,14 @@ class UserGrowthBrowserClient:
             if page.url != old_url and not await self._is_work_order_page(page):
                 self._wrap_page_speed(page)
                 return page
+            if order_id:
+                blocked_message = await self._detect_create_creative_unit_blocked(
+                    page,
+                    order_id,
+                    timeout_ms=1000,
+                )
+                if blocked_message:
+                    raise UserGrowthFatalPageError(blocked_message)
             await page.wait_for_timeout(800)
         return None
 
@@ -1091,7 +1208,10 @@ class UserGrowthBrowserClient:
             print(f"[enter-chameleon] {msg}", flush=True)
 
         self._emit(progress, f"等待 {len(items)} 个视频生成待提交卡片")
-        await self._wait_upload_cards_ready(page, items)
+        await self._wait_upload_cards_ready(page, items, progress)
+        if not items:
+            self._emit(progress, "当前批次全部命中已存在创意单元，跳过新建创意单元录入")
+            return page
         await self._click_if_present(page, "继续编辑")
         await page.wait_for_timeout(2000)
         # "确认提交"点击后可能打开新标签页，也可能当前页跳转；不设总超时等待目标页出现。
@@ -1161,16 +1281,29 @@ class UserGrowthBrowserClient:
 
     async def _looks_like_chameleon_entry_page(self, page) -> bool:
         """判断页面是否是录入变色龙后的投放信息确认页。"""
+        try:
+            if await self._first_existing(
+                    page,
+                    (
+                        "input[placeholder*='任务ID']",
+                        "input[placeholder*='任务']",
+                    ),
+            ):
+                return True
+        except Exception:
+            pass
         body = await self._body_text(page, timeout_ms=2000)
         if not body.strip():
             return False
         return "投放平台" in body and any(text in body for text in ("投放产品", "汽水音乐", "红果免费短剧", "红果免费漫剧"))
 
-    async def _wait_upload_cards_ready(self, page, items: list[UserGrowthVideoItem]) -> None:
-        """等待选中文件后页面生成对应数量的待提交创意设置卡片，不设总超时。"""
-        expected_count = len(items)
-        s_count = 0
-
+    async def _wait_upload_cards_ready(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None = None,
+    ) -> None:
+        """等待上传卡片可继续提交；遇到可回收的失败项时先剔除再继续等待。"""
         while True:
             try:
                 body = await self._body_text(page, timeout_ms=3000)
@@ -1180,9 +1313,6 @@ class UserGrowthBrowserClient:
             if self._has_upload_limit_zero_error(body):
                 await self._snapshot_error(page, "upload_limit_zero_before_cards_ready")
                 raise RuntimeError("当前选择文件数量超过订单创意单元上限: 0")
-            if "上传失败" in body or "上传异常" in body:
-                await self._snapshot_error(page, "upload_failed_before_cards_ready")
-                raise RuntimeError("等待上传卡片时页面提示上传失败")
 
             try:
                 # 查找页面上所有的 Arco 复选框/勾选图标
@@ -1193,7 +1323,7 @@ class UserGrowthBrowserClient:
                 s_count = len(visible_icons)
 
                 # 数量相等即视为上传成功
-                if s_count >= expected_count:
+                if s_count >= len(items):
                     await self._snapshot(page, "upload_cards_ready")
                     return
 
@@ -1201,8 +1331,358 @@ class UserGrowthBrowserClient:
                 # 统计过程中发生任何异常（比如页面还没加载出 DOM），忽略，继续下一轮
                 pass
 
+            handled = await self._recover_failed_upload_cards(page, items, progress)
+            if handled:
+                if not items:
+                    await self._snapshot(page, "upload_cards_ready_all_reused")
+                    return
+                await page.wait_for_timeout(800)
+                continue
+
             # 轮询间隔，避免 CPU 飙高
             await page.wait_for_timeout(1000)
+
+    async def _recover_failed_upload_cards(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None = None,
+    ) -> int:
+        """回收上传弹窗中可处理的失败素材行；返回已处理数量。"""
+        handled = 0
+        failed_rows = await self._visible_failed_upload_card_rows(page, items)
+        for item, row in failed_rows:
+            reason = await self._read_upload_card_failure_reason(page, row)
+            if not reason:
+                await self._snapshot_error(
+                    page,
+                    "upload_failed_reason_missing",
+                    extra=f"file={item.file_name}",
+                )
+                raise RuntimeError(f"素材【{item.file_name}】上传失败，但未读取到具体失败原因")
+            unit_id, material_id = self._parse_existing_creative_unit_failure(reason)
+            if not unit_id:
+                if "曾经被上传" in reason:
+                    await self._snapshot_error(
+                        page,
+                        "upload_duplicate_reason_parse_failed",
+                        extra=f"file={item.file_name}\nreason={reason}",
+                    )
+                    raise RuntimeError(f"素材【{item.file_name}】检测到重复上传，但未解析到原创意单元ID：{reason}")
+                if await self._upload_card_has_retry_action(row):
+                    metadata = item.workflow_metadata if isinstance(item.workflow_metadata, dict) else {}
+                    if metadata.get("upload_retry_clicked"):
+                        await self._snapshot_error(
+                            page,
+                            "upload_retry_still_failed",
+                            extra=f"file={item.file_name}\nreason={reason}",
+                        )
+                        raise RuntimeError(f"素材【{item.file_name}】点击重试后仍未恢复：{reason}")
+                    if await self._click_upload_card_retry(row):
+                        metadata["upload_retry_clicked"] = True
+                        metadata["upload_retry_clicked_at"] = datetime.now().isoformat(timespec="seconds")
+                        item.workflow_metadata = metadata
+                        self._emit(progress, f"素材【{item.file_name}】出现行内点击重试，已点击该素材对应按钮")
+                        self._write_run_log(
+                            f"[{datetime.now().isoformat(timespec='seconds')}] upload retry clicked "
+                            f"file={item.file_name}, reason={reason}"
+                        )
+                        handled += 1
+                        continue
+                    await self._snapshot_error(
+                        page,
+                        "upload_retry_click_failed",
+                        extra=f"file={item.file_name}\nreason={reason}",
+                    )
+                    raise RuntimeError(f"素材【{item.file_name}】出现点击重试但点击失败：{reason}")
+                if self._looks_like_upload_card_failure(reason):
+                    await self._snapshot_error(
+                        page,
+                        "upload_failed_unhandled_card",
+                        extra=f"file={item.file_name}\nreason={reason}",
+                    )
+                    raise RuntimeError(f"素材【{item.file_name}】上传失败：{reason}")
+                continue
+
+            deleted = await self._delete_upload_card_row(page, row)
+            if not deleted:
+                await self._snapshot_error(
+                    page,
+                    "upload_failed_card_delete_failed",
+                    extra=f"file={item.file_name}\nreason={reason}",
+                )
+                raise RuntimeError(f"素材【{item.file_name}】上传失败且删除失败：{reason}")
+
+            metadata = item.workflow_metadata if isinstance(item.workflow_metadata, dict) else {}
+            metadata["existing_creative_unit_id"] = unit_id
+            if material_id:
+                metadata["existing_material_id"] = material_id
+            metadata["upload_failure_reason"] = reason
+            item.workflow_metadata = metadata
+            item.status = "deferred_existing_creative_unit"
+            item.message = f"上传检测重复，后续按原创意单元 {unit_id} 补录"
+            items.remove(item)
+            handled += 1
+            self._emit(
+                progress,
+                f"素材【{item.file_name}】曾经上传过，已删除当前失败行，稍后按原创意单元【{unit_id}】补录",
+            )
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] upload duplicate recovered "
+                f"file={item.file_name}, creative_unit={unit_id}, material={material_id or ''}, reason={reason}"
+            )
+        return handled
+
+    async def _visible_failed_upload_card_rows(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+    ) -> list[tuple[UserGrowthVideoItem, object]]:
+        """只返回已经显式失败的可见上传行，避免轮询时逐行 hover 或误点。"""
+        failed_rows: list[tuple[UserGrowthVideoItem, object]] = []
+        for item in list(items):
+            row = await self._upload_card_row_for_item(page, item)
+            if row is None:
+                continue
+            if await self._upload_card_has_failure_signal(row):
+                failed_rows.append((item, row))
+        return failed_rows
+
+    async def _upload_card_row_for_item(self, page, item: UserGrowthVideoItem):
+        """按文件名找到上传弹窗中的单个文件行。"""
+        file_name = str(item.file_name or "")
+        if not file_name:
+            return None
+        selectors = (
+            ".arco-upload-list-item",
+            "[class*='upload-list-item']",
+            "[class*='upload-item']",
+            "[class*='upload-list'] li",
+            "[role='listitem']",
+        )
+        for selector in selectors:
+            try:
+                rows = page.locator(selector).filter(has_text=file_name)
+                visible = await self._visible_locators(rows, limit=20)
+                if visible:
+                    return visible[0]
+            except Exception:
+                continue
+        text_locator = page.get_by_text(file_name, exact=True).first
+        for xpath in (
+                "xpath=ancestor::*[contains(@class, 'arco-upload-list-item')][1]",
+                "xpath=ancestor::*[contains(@class, 'upload-list-item')][1]",
+                "xpath=ancestor::*[contains(@class, 'upload-item')][1]",
+                "xpath=ancestor::*[self::li or @role='listitem'][1]",
+        ):
+            try:
+                row = text_locator.locator(xpath)
+                if await row.count() and await row.is_visible():
+                    return row
+            except Exception:
+                continue
+        return None
+
+    async def _read_upload_card_failure_reason(self, page, row) -> str:
+        """读取上传失败行的 tooltip/行文案，返回可读失败原因。"""
+        texts: list[str] = []
+        row_text = await self._locator_text(row, timeout_ms=1500)
+        if row_text:
+            texts.append(row_text)
+        try:
+            row_html = await row.evaluate("(node) => node.outerHTML")
+            if row_html:
+                texts.append(row_html)
+        except Exception:
+            pass
+        try:
+            attr_texts = await row.evaluate(
+                """(node) => {
+                    const attrs = ['title', 'aria-label', 'data-title', 'data-tooltip', 'data-tooltip-content', 'data-original-title'];
+                    const values = [];
+                    const walk = (el) => {
+                        if (!el || el.nodeType !== 1) return;
+                        for (const attr of attrs) {
+                            try {
+                                const val = el.getAttribute && el.getAttribute(attr);
+                                if (val) values.push(val);
+                            } catch (err) {}
+                        }
+                        for (const child of el.children || []) walk(child);
+                    };
+                    walk(node);
+                    return values;
+                }"""
+            )
+            if attr_texts:
+                texts.extend(str(text) for text in attr_texts if text)
+        except Exception:
+            pass
+
+        hover_targets = (
+            ".arco-upload-list-error-icon",
+            ".arco-icon-exclamation-circle-fill",
+            ".arco-icon-exclamation-circle",
+            ".arco-icon-close-circle-fill",
+            "[class*='error-icon']",
+            "[class*='fail-icon']",
+            "[class*='error'] [role='img']",
+            "[class*='fail'] [role='img']",
+        )
+        for selector in hover_targets:
+            try:
+                for target in await self._visible_locators(row.locator(selector), limit=8):
+                    try:
+                        await target.hover(timeout=2500)
+                        await page.wait_for_timeout(250)
+                        texts.extend(await self._visible_tooltip_texts(page))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        return self._extract_upload_failure_reason(texts)
+
+    async def _upload_card_has_failure_signal(self, row) -> bool:
+        """判断上传行是否真的进入失败/需重试状态；不滚动、不 hover。"""
+        row_text = await self._locator_text(row, timeout_ms=800)
+        if self._extract_upload_failure_reason((row_text,)):
+            return True
+        return await self._upload_card_has_retry_action(row) or await self._upload_card_has_error_marker(row)
+
+    async def _upload_card_has_retry_action(self, row) -> bool:
+        """判断单个上传行内是否有真正可见的点击重试动作。"""
+        for selector in (
+                "button:has-text('点击重试')",
+                "text=点击重试",
+        ):
+            try:
+                if await self._visible_locators(row.locator(selector), limit=3):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _upload_card_has_error_marker(self, row) -> bool:
+        """判断单个上传行内是否有明确错误图标。"""
+        selectors = (
+            ".arco-upload-list-error-icon",
+            ".arco-icon-exclamation-circle-fill",
+            ".arco-icon-exclamation-circle",
+            ".arco-icon-close-circle-fill",
+            "[class*='upload-list-error']",
+            "[class*='status-error']",
+            "[class*='error-icon']",
+            "[class*='fail-icon']",
+        )
+        for selector in selectors:
+            try:
+                if await self._visible_locators(row.locator(selector), limit=5):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _click_upload_card_retry(self, row) -> bool:
+        """只点击当前失败上传行里的重试按钮。"""
+        for selector in (
+                "button:has-text('点击重试')",
+                "text=点击重试",
+        ):
+            try:
+                for candidate in await self._visible_locators(row.locator(selector), limit=3):
+                    try:
+                        await candidate.click(timeout=3000)
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
+    async def _visible_tooltip_texts(self, page) -> list[str]:
+        """读取当前可见 tooltip/浮层文本。"""
+        texts: list[str] = []
+        roots = page.locator(
+            ".arco-tooltip, .arco-trigger-popup, [role='tooltip'], "
+            ".ant-tooltip, .ant-popover, [class*='tooltip'], [class*='popover']"
+        )
+        for root in await self._visible_locators(roots, limit=20):
+            text = await self._locator_text(root, timeout_ms=1000)
+            if text:
+                texts.append(text)
+        return texts
+
+    @staticmethod
+    def _extract_upload_failure_reason(texts: Iterable[str]) -> str:
+        """从若干页面文本里抽取最像上传失败原因的一段。"""
+        cleaned_texts = []
+        for text in texts:
+            cleaned = re.sub(r"[\r\n\t]+", " ", str(text or "")).strip()
+            if cleaned:
+                cleaned_texts.append(cleaned)
+        if not cleaned_texts:
+            return ""
+
+        hard_keywords = ("上传检测失败", "该文件曾经被上传")
+        for keyword in hard_keywords:
+            for cleaned in cleaned_texts:
+                index = cleaned.find(keyword)
+                if index >= 0:
+                    return cleaned[index:index + 360].strip()
+
+        soft_keywords = ("上传失败", "上传异常", "创建失败")
+        for keyword in soft_keywords:
+            for cleaned in cleaned_texts:
+                index = cleaned.find(keyword)
+                if index >= 0:
+                    return cleaned[index:index + 360].strip()
+
+        for cleaned in cleaned_texts:
+            if "点击重试" in cleaned:
+                return "点击重试"
+        return ""
+
+    @staticmethod
+    def _parse_existing_creative_unit_failure(reason: str) -> tuple[str, str]:
+        """解析“该文件曾经被上传”类失败中的原创意单元 ID 和素材 ID。"""
+        text = str(reason or "")
+        if "曾经被上传" not in text:
+            return "", ""
+        unit_match = re.search(r"创意单元\s*(?:id|ID)\s*[:：]?\s*([A-Za-z0-9_-]{4,})", text)
+        material_match = re.search(r"素材\s*(?:id|ID)\s*[:：]?\s*(\d{4,})", text)
+        return (
+            unit_match.group(1).strip() if unit_match else "",
+            material_match.group(1).strip() if material_match else "",
+        )
+
+    @staticmethod
+    def _looks_like_upload_card_failure(reason: str) -> bool:
+        compact = _compact_text(reason)
+        return any(keyword in compact for keyword in ("上传检测失败", "上传失败", "上传异常", "创建失败"))
+
+    async def _delete_upload_card_row(self, page, row) -> bool:
+        """删除上传弹窗中的单个失败文件行。"""
+        selectors = (
+            "[aria-label*='删除']",
+            "[title*='删除']",
+            "button:has-text('删除')",
+            ".arco-icon-delete",
+            "[class*='delete']",
+            "[class*='remove']",
+        )
+        for selector in selectors:
+            try:
+                for button in await self._visible_locators(row.locator(selector), limit=10):
+                    if await self._click_locator_center(page, button) or await self._click_locator(button):
+                        await page.wait_for_timeout(500)
+                        await self._click_if_present(page, "确定")
+                        await page.wait_for_timeout(500)
+                        return True
+            except Exception:
+                continue
+
+        return False
 
     async def _wait_before_submit_after_upload(self, page, items: list[UserGrowthVideoItem]) -> None:
         """提交前按视频数量等待平台完成文件预处理。"""
@@ -2596,18 +3076,14 @@ class UserGrowthBrowserClient:
             self._emit(progress, f"红果短剧任务 {task_id}：未读取到 CID，继续执行 ARLP 和分类标签修改")
 
         material_page = cid_page
-        await self._wait_material_items_ready(material_page, items)
-        await self._select_all_materials(material_page, items)
-        await self._run_material_edit_action(material_page, "增加ARLP")
-        await self._ensure_redfruit_arlp_modal(material_page, items[0])
-        await self._click_redfruit_modal_action(material_page, ("保存并送审", "保存"))
-        await self._wait_redfruit_arlp_complete(material_page, progress)
+        await self._ensure_redfruit_arlp_all_success(material_page, items, progress)
 
         await self._refresh_material_list_page(material_page)
-        await self._select_all_materials(material_page, items)
-        await self._run_material_edit_action(material_page, "修改分类标签")
-        await self._fill_redfruit_post_review_classifications(material_page, items, progress)
-        await self._click_redfruit_modal_action(material_page, ("保存", "确定", "确认"))
+        await self._ensure_redfruit_post_review_classifications_all_success(
+            material_page,
+            items,
+            progress,
+        )
 
         plan.status = "success"
         plan.message = "红果短剧送审、ARLP 和分类标签修改完成"
@@ -2628,6 +3104,276 @@ class UserGrowthBrowserClient:
         if not platform_ok:
             await self._snapshot_error(page, "redfruit_arlp_platform_not_selected")
             raise RuntimeError("增加 ARLP 未选中投放平台")
+
+    async def _ensure_redfruit_arlp_all_success(
+            self,
+            material_page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+    ) -> None:
+        """反复增加 ARLP，直到对应任务报告全部素材成功。"""
+        if not items:
+            return
+
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            if attempt > 1:
+                await self._clear_redfruit_material_selection(material_page, progress)
+                self._emit(progress, f"红果短剧 ARLP 第 {attempt} 轮：重新点第一条素材并全选所有")
+
+            await self._wait_material_items_ready(material_page, items)
+            await self._select_all_materials(material_page, items)
+            await self._run_material_edit_action(material_page, "增加ARLP")
+            await self._ensure_redfruit_arlp_modal(material_page, items[0])
+
+            before_pages = list(material_page.context.pages)
+            before_url = material_page.url
+            await self._click_redfruit_modal_action(material_page, ("保存并送审", "保存"))
+            task_page = await self._wait_redfruit_arlp_task_page(
+                material_page,
+                before_pages,
+                before_url,
+                progress,
+            )
+            result = await self._wait_redfruit_arlp_task_result(task_page, progress, "增加 ARLP")
+            self._emit(
+                progress,
+                f"红果短剧 ARLP 第 {attempt} 轮结果：任务 {result['task_id']}，"
+                f"成功 {result['success']}/{result['total']}，失败 {result['failed']}",
+            )
+            await self._close_redfruit_result_dialog(material_page)
+
+            if result["total"] > 0 and result["success"] >= result["total"]:
+                self._emit(progress, f"红果短剧 ARLP 全部成功：{result['success']}/{result['total']}")
+                return
+
+            self._emit(
+                progress,
+                f"红果短剧 ARLP 部分成功：{result['success']}/{result['total']}，"
+                "清空当前选择后重新增加 ARLP",
+            )
+            await self._refresh_material_list_page(material_page)
+
+    async def _wait_redfruit_arlp_task_page(
+            self,
+            material_page,
+            before_pages: list,
+            before_url: str,
+            progress: ProgressCallback | None,
+    ):
+        """等待 ARLP 成功提示中的「查看任务详情」打开操作任务页。"""
+        before_ids = {id(candidate) for candidate in before_pages}
+        details_clicked = False
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+
+            for candidate in reversed(material_page.context.pages):
+                if candidate.is_closed():
+                    continue
+                candidate_url = str(candidate.url or "")
+                is_new_page = id(candidate) not in before_ids
+                is_current_task_page = candidate is material_page and candidate_url != before_url
+                if "/aigc/manage/task" not in candidate_url or not (is_new_page or is_current_task_page):
+                    continue
+                try:
+                    await candidate.wait_for_load_state("domcontentloaded", timeout=1000)
+                except Exception:
+                    pass
+                self._wrap_page_speed(candidate)
+                return candidate
+
+            if not details_clicked:
+                locators = (
+                    material_page.get_by_role("button", name="查看任务详情", exact=True).first,
+                    material_page.get_by_text("查看任务详情", exact=True).first,
+                    material_page.locator("button:has-text('查看任务详情')").first,
+                )
+                if await self._click_first_visible_locator(*locators):
+                    details_clicked = True
+                    self._emit(progress, "增加 ARLP 任务已创建，打开任务详情等待处理结果")
+
+            if attempt % 10 == 0:
+                self._emit(progress, f"等待增加 ARLP 任务详情页，第 {attempt} 次")
+            await self._sleep(1)
+
+    async def _wait_redfruit_arlp_task_result(
+            self,
+            task_page,
+            progress: ProgressCallback | None,
+            operation_name: str = "增加 ARLP",
+    ) -> dict[str, int | str]:
+        """持续刷新红果操作任务，直到明确得到成功或部分失败结果。"""
+        task_id = await self._read_current_task_id(task_page, progress)
+        interval_ms = max(int(self.refresh_interval_seconds * 500), 3000)
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            row = await self._find_task_row(task_page, task_id)
+            progress_data = await self._read_redfruit_arlp_task_progress(row)
+            if progress_data:
+                progress_data["task_id"] = task_id
+                total = int(progress_data["total"])
+                success = int(progress_data["success"])
+                failed = int(progress_data["failed"])
+                status = str(progress_data["status"])
+                if total > 0 and success >= total:
+                    return progress_data
+                if total > 0 and success + failed >= total:
+                    return progress_data
+                if failed > 0 and any(token in status for token in ("失败", "部分")):
+                    return progress_data
+
+            if attempt % 10 == 0:
+                self._emit(progress, f"等待{operation_name}任务 {task_id} 完成，第 {attempt} 次")
+            await self._click_if_present(task_page, "刷新列表")
+            await task_page.wait_for_timeout(interval_ms)
+            await self._search_task_by_id(task_page, task_id)
+
+    async def _read_redfruit_arlp_task_progress(self, row) -> dict[str, int | str] | None:
+        """读取 ARLP 任务行的状态、总数、成功数和失败数。"""
+        if not row:
+            return None
+        cells = row.locator("td")
+        try:
+            count = await cells.count()
+        except Exception:
+            return None
+        if count < 8:
+            return None
+
+        values: list[str] = []
+        for index in range(min(count, 10)):
+            values.append(_compact_text(await self._locator_text(cells.nth(index), timeout_ms=2000)))
+
+        def parse_count(value: str) -> int:
+            return int(value) if re.fullmatch(r"\d+", value or "") else -1
+
+        total = parse_count(values[5])
+        success = parse_count(values[6])
+        failed = parse_count(values[7])
+        if min(total, success, failed) < 0:
+            return None
+        return {
+            "status": values[3] if len(values) > 3 else "",
+            "total": total,
+            "success": success,
+            "failed": failed,
+        }
+
+    async def _close_redfruit_result_dialog(self, page) -> None:
+        """关闭 ARLP 任务创建成功提示，避免遮挡下一轮素材选择。"""
+        buttons = page.get_by_role("button", name="Close", exact=True)
+        try:
+            count = await buttons.count()
+        except Exception:
+            return
+        for index in range(count - 1, -1, -1):
+            locator = buttons.nth(index)
+            try:
+                if await locator.is_visible() and await self._click_locator(locator):
+                    await page.wait_for_timeout(300)
+                    return
+            except Exception:
+                continue
+
+    async def _clear_redfruit_material_selection(
+            self,
+            page,
+            progress: ProgressCallback | None,
+    ) -> None:
+        """重试 ARLP 前清空上一轮选择，保证下一轮重新点卡片再全选。"""
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            selected = await self._selected_count(page)
+            if selected <= 0:
+                return
+            attempt += 1
+            if await self._click_text_or_locator(page, "取消全选"):
+                await self._wait_selected_count(page, 0, timeout_ms=None)
+                return
+            if attempt % 10 == 0:
+                self._emit(progress, f"等待清空上一轮素材选择，当前已选择 {selected} 项，第 {attempt} 次")
+            await self._sleep(1)
+
+    async def _ensure_redfruit_post_review_classifications_all_success(
+            self,
+            material_page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+    ) -> None:
+        """修改红果后审分类标签，并持续补改直到每条素材都成功。"""
+        if not items:
+            return
+
+        item = items[0]
+        paths = [
+            list(path)
+            for path in (
+                item.post_review_classification_paths
+                or item.workflow_metadata.get("post_review_classification_paths", [])
+            )
+            if path
+        ]
+        if not paths:
+            self._emit(progress, "红果短剧未配置后审分类标签路径，跳过修改分类标签任务")
+            return
+
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            if attempt > 1:
+                await self._clear_redfruit_material_selection(material_page, progress)
+                await self._refresh_material_list_page(material_page)
+                self._emit(
+                    progress,
+                    f"红果短剧修改分类标签第 {attempt} 轮：重新点第一条素材并全选所有",
+                )
+
+            await self._wait_material_items_ready(material_page, items)
+            await self._select_all_materials(material_page, items)
+            await self._run_material_edit_action(material_page, "修改分类标签")
+            await self._fill_redfruit_post_review_classifications(material_page, items, progress)
+
+            before_pages = list(material_page.context.pages)
+            before_url = material_page.url
+            await self._click_redfruit_modal_action(material_page, ("保存", "确定", "确认"))
+            task_page = await self._wait_redfruit_arlp_task_page(
+                material_page,
+                before_pages,
+                before_url,
+                progress,
+            )
+            result = await self._wait_redfruit_arlp_task_result(
+                task_page,
+                progress,
+                "修改分类标签",
+            )
+            self._emit(
+                progress,
+                f"红果短剧修改分类标签第 {attempt} 轮结果：任务 {result['task_id']}，"
+                f"成功 {result['success']}/{result['total']}，失败 {result['failed']}",
+            )
+            await self._close_redfruit_result_dialog(material_page)
+
+            if result["total"] > 0 and result["success"] >= result["total"]:
+                self._emit(
+                    progress,
+                    f"红果短剧修改分类标签全部成功：{result['success']}/{result['total']}",
+                )
+                return
+
+            self._emit(
+                progress,
+                f"红果短剧修改分类标签部分成功：{result['success']}/{result['total']}，"
+                "将刷新素材列表并重新补改遗漏素材",
+            )
 
     async def _fill_redfruit_post_review_classifications(
             self,
@@ -2864,6 +3610,196 @@ class UserGrowthBrowserClient:
         except Exception:
             return False
 
+    def _existing_creative_unit_id_for_item(self, item: UserGrowthVideoItem) -> str:
+        """读取上传失败时记录下来的原创意单元 ID。"""
+        metadata = item.workflow_metadata if isinstance(item.workflow_metadata, dict) else {}
+        return str(metadata.get("existing_creative_unit_id") or "").strip()
+
+    async def _process_existing_creative_unit_items(
+            self,
+            page,
+            plan: UserGrowthOrderPlan,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+    ):
+        """上传检测重复时，回到创意单元列表按原创意单元 ID 补录素材。"""
+        unit_ids = []
+        for item in items:
+            unit_id = self._existing_creative_unit_id_for_item(item)
+            if unit_id and unit_id not in unit_ids:
+                unit_ids.append(unit_id)
+        if not unit_ids:
+            return page
+
+        self._emit(progress, f"回到工单管理补录已存在创意单元：{','.join(unit_ids)}")
+        await self._open_work_order_management(page, progress)
+        self._emit(progress, "已返回工单管理，准备进入创意单元页")
+        await self._open_creative_unit_tab(page)
+        self._emit(progress, f"已打开创意单元页，按 ID 搜索：{','.join(unit_ids)}")
+        await self._search_creative_units_by_ids(page, unit_ids)
+        self._emit(progress, "创意单元搜索完成，准备跨页勾选")
+        pseudo_items = [
+            UserGrowthVideoItem(
+                path=Path(unit_id),
+                file_name=unit_id,
+                material_type="",
+                song_name="",
+            )
+            for unit_id in unit_ids
+        ]
+        await self._select_creative_units_for_items(page, pseudo_items)
+        self._emit(progress, "创意单元已选中，准备进入录入素材")
+        entry_page = await self._enter_chameleon_from_selected_creative_units(page, items, progress)
+        if entry_page is None:
+            for item in items:
+                item.status = "success"
+                item.message = "原创意单元已录入，无需重复录入"
+            return page
+
+        self._emit(progress, "已进入录入素材页，准备读取任务ID")
+        task_id = await self._read_current_task_id(entry_page, progress=progress)
+        if not task_id:
+            await self._snapshot_error(entry_page, f"existing_creative_units_task_id_not_found_{plan.order_id}")
+            raise RuntimeError("补录原创意单元后未读取到当前任务ID")
+        plan.task_id = task_id
+
+        redfruit_flow = self._is_redfruit_items(items)
+        wait_result = await self._wait_task_success(
+            entry_page,
+            progress,
+            expected_attempts=max(len(items), 1),
+            plan=None if redfruit_flow else plan,
+            items=[] if redfruit_flow else items,
+            task_id="" if redfruit_flow else task_id,
+        )
+        if wait_result == "cid_backed_up":
+            return entry_page
+        await self._submit_review(entry_page)
+        if redfruit_flow:
+            await self._process_redfruit_after_review(entry_page, plan, items, task_id, progress)
+        else:
+            await self._fill_cids_for_task(entry_page, items, task_id, progress)
+        return entry_page
+
+    async def _open_creative_unit_tab(self, page) -> None:
+        """进入工单管理页的创意单元 tab。"""
+        if await self._click_text_or_locator(page, "创意单元"):
+            await page.wait_for_timeout(1200)
+            return
+        raise RuntimeError("未找到创意单元 tab")
+
+    async def _search_creative_units_by_ids(self, page, unit_ids: list[str]) -> None:
+        """在创意单元 tab 中按多个创意单元 ID 逗号搜索。"""
+        query = ",".join(unit_ids)
+        search_input = await self._wait_first_existing(
+            page,
+            (
+                "input[placeholder*='创意单元名称或ID']",
+                "input[placeholder*='创意单元名称']",
+                "input[placeholder*='创意单元']",
+            ),
+            timeout_ms=30000,
+        )
+        if not search_input:
+            raise RuntimeError("未找到创意单元名称或ID搜索框")
+        await self._type_into_locator(search_input, page, query)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(2500)
+
+        async def any_unit_visible() -> bool:
+            body = await self._body_text(page, timeout_ms=3000)
+            return any(unit_id in body for unit_id in unit_ids)
+
+        if not await self._wait_for_result(any_unit_visible, timeout_ms=30000, interval_ms=1000):
+            await self._snapshot_error(page, "existing_creative_units_not_found", extra=f"query={query}")
+            raise RuntimeError(f"未在创意单元列表中找到：{query}")
+
+    async def _enter_chameleon_from_selected_creative_units(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None = None,
+    ):
+        """从已选中的创意单元列表进入录入素材，兼容已录入提示。"""
+        before_body = await self._body_text(page, timeout_ms=3000)
+        try:
+            await self._wait_and_click_text(page, "录入素材", timeout_ms=None)
+        except Exception as exc:
+            body = await self._body_text(page, timeout_ms=3000)
+            combined = f"{before_body}\n{body}"
+            if any(text in combined for text in ("已录入", "已经录入", "无需再进行", "无需重复")):
+                self._emit(progress, "原创意单元已录入，跳过补录素材步骤")
+                await self._click_if_present(page, "确定")
+                return None
+            await self._snapshot_error(page, "existing_creative_units_enter_chameleon_failed", exc=exc)
+            raise
+
+        entry_page = await self._wait_for_existing_creative_unit_entry_page(page, progress)
+        if entry_page is None:
+            self._emit(progress, "原创意单元已录入，跳过补录素材步骤")
+            await self._click_if_present(page, "确定")
+            return None
+        self._wrap_page_speed(entry_page)
+        try:
+            await entry_page.wait_for_load_state("domcontentloaded", timeout=0)
+        except Exception as exc:
+            await self._snapshot_error(entry_page, "existing_creative_units_entry_load_failed", exc=exc)
+            raise RuntimeError(f"原创意单元录入页加载失败: {exc}, url={entry_page.url}")
+        while True:
+            body = await self._body_text(entry_page, timeout_ms=2000)
+            if any(text in body for text in ("已录入", "已经录入", "无需再进行", "无需重复")):
+                self._emit(progress, "原创意单元已录入，跳过补录素材步骤")
+                await self._click_if_present(entry_page, "确定")
+                return None
+            if await self._looks_like_chameleon_entry_page(entry_page):
+                break
+            await entry_page.wait_for_timeout(500)
+        await self._snapshot(entry_page, "existing_creative_units_after_enter_chameleon")
+        await self._ensure_chameleon_modal(entry_page, items[0])
+        await self._click_chameleon_modal_confirm(entry_page)
+        await entry_page.wait_for_timeout(350)
+        await self._fill_card_defaults(entry_page, items[0])
+        return entry_page
+
+    async def _wait_for_existing_creative_unit_entry_page(
+            self,
+            page,
+            progress: ProgressCallback | None = None,
+    ):
+        """等待补录原创意单元后进入录入页；兼容同页弹层和新标签页。"""
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            for candidate in reversed(page.context.pages):
+                if candidate.is_closed():
+                    continue
+                try:
+                    await candidate.wait_for_load_state("domcontentloaded", timeout=1000)
+                except Exception:
+                    pass
+                try:
+                    body = await self._body_text(candidate, timeout_ms=2000)
+                except Exception:
+                    body = ""
+                compact_body = _compact_text(body)
+                if any(text in compact_body for text in ("已录入", "已经录入", "无需再进行", "无需重复")):
+                    return None
+                try:
+                    if await self._first_existing(
+                            candidate,
+                            (
+                                "input[placeholder*='任务ID']",
+                                "input[placeholder*='任务']",
+                            ),
+                    ) or await self._looks_like_chameleon_entry_page(candidate):
+                        return candidate
+                except Exception:
+                    continue
+            if attempt % 10 == 0:
+                self._emit(progress, f"等待录入素材页渲染中，第 {attempt} 次")
+            await self._sleep(1)
+
     async def _select_creative_units_for_items(self, page, items: list[UserGrowthVideoItem]) -> None:
         """上传后在创意单元列表跨页全选本次生成的所有单元。"""
         expected_count = len(items)
@@ -2917,9 +3853,19 @@ class UserGrowthBrowserClient:
             )
             if selected_count >= expected_count:
                 return selected_count
-            if not await self._click_pagination_next(page):
+            if not await self._click_creative_unit_next_page(page):
                 break
-            await page.wait_for_timeout(1200)
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] creative unit pagination: "
+                f"等待第 {page_index + 1} 页表格刷新"
+            )
+
+            async def page_changed() -> bool:
+                await self._wait_creative_unit_table_ready(page, timeout_ms=None)
+                current_signature = await self._creative_unit_page_signature(page)
+                return bool(current_signature and current_signature != page_signature)
+
+            await self._wait_for_result(page_changed, timeout_ms=None, interval_ms=500)
 
         return selected_count
 
@@ -3037,14 +3983,157 @@ class UserGrowthBrowserClient:
                     except Exception:
                         continue
             if not target:
-                return
-            if not (await self._click_locator_center(page, target) or await self._click_locator(target)):
-                return
+                clicked = await page.evaluate(
+                    r"""() => {
+                        const visible = el => {
+                            if (!el) return false;
+                            const style = getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                        };
+                        const pager = [...document.querySelectorAll('.arco-pagination')].find(el => visible(el) && /条\s*\/\s*页|条每页/.test(el.innerText || ''));
+                        if (!pager) return false;
+                        const control = [...pager.querySelectorAll('*')].reverse().find(el => visible(el) && /\d+\s*条\s*\/\s*页|\d+\s*条每页/.test((el.innerText || '').trim()));
+                        if (!control) return false;
+                        control.click();
+                        return true;
+                    }"""
+                )
+                if not clicked:
+                    return
+                await page.wait_for_timeout(500)
+            elif not (await self._click_locator_center(page, target) or await self._click_locator(target)):
+                try:
+                    await target.evaluate("element => element.click()")
+                except Exception:
+                    return
             await page.wait_for_timeout(500)
+            root = await self._open_dropdown_root(page)
+            if root:
+                options = await self._visible_locators(
+                    root.locator(
+                        ".arco-select-option, .arco-cascader-option, [role='option'], "
+                        ".arco-dropdown-option, li, [role='menuitem']"
+                    ),
+                    limit=100,
+                )
+                best_option = None
+                best_value = -1
+                for option in options:
+                    text = _compact_text(await self._locator_text(option, timeout_ms=1000))
+                    match = re.search(r"(\d{1,4})", text)
+                    if match and int(match.group(1)) > best_value:
+                        best_value = int(match.group(1))
+                        best_option = option
+                if best_option and best_value > 0:
+                    if not await self._click_locator(best_option):
+                        await best_option.evaluate("element => element.click()")
+                    await page.wait_for_timeout(1200)
+                    return
             if await self._click_largest_open_dropdown_option(page):
+                await page.wait_for_timeout(1000)
+            else:
+                await page.evaluate(
+                    r"""() => {
+                        const visible = el => {
+                            if (!el) return false;
+                            const style = getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                        };
+                        const options = [...document.querySelectorAll('.arco-trigger-popup *, .arco-select-dropdown *, [role="listbox"] *')]
+                            .filter(el => visible(el) && /^\d+\s*条\s*\/\s*页$|^\d+\s*条每页$/.test((el.innerText || '').trim()));
+                        const option = options.sort((a, b) => parseInt(b.innerText, 10) - parseInt(a.innerText, 10))[0];
+                        if (option) option.click();
+                    }"""
+                )
                 await page.wait_for_timeout(1000)
         except Exception:
             return
+
+    async def _click_creative_unit_next_page(self, page) -> bool:
+        """只点击创意单元表格自身的下一页，避免误点页面其它分页控件。"""
+        pagers = await self._visible_locators(page.locator(".arco-pagination"), limit=20)
+        for pager in pagers:
+            try:
+                controls = await self._visible_locators(
+                    pager.locator("li, button, a, [role='button']"),
+                    limit=80,
+                )
+            except Exception:
+                continue
+            numeric: list[tuple[int, object, bool]] = []
+            for control in controls:
+                text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+                if not re.fullmatch(r"\d{1,4}", text):
+                    continue
+                value = int(text)
+                class_name = str(await control.get_attribute("class") or "").lower()
+                aria_current = str(await control.get_attribute("aria-current") or "").lower()
+                active = "active" in class_name or "current" in class_name or aria_current == "page"
+                numeric.append((value, control, active))
+            if not numeric:
+                continue
+            active_values = [value for value, _, active in numeric if active]
+            current = max(active_values) if active_values else min(value for value, _, _ in numeric)
+            next_values = [(value, control) for value, control, _ in numeric if value > current]
+            if next_values:
+                _, next_control = min(next_values, key=lambda pair: pair[0])
+                if await self._click_locator_center(page, next_control) or await self._click_locator(next_control):
+                    self._write_run_log(
+                        f"[{datetime.now().isoformat(timespec='seconds')}] creative unit pagination: "
+                        f"{current} -> {min(next_values, key=lambda pair: pair[0])[0]}"
+                    )
+                    return True
+            for control in controls:
+                text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+                class_name = str(await control.get_attribute("class") or "").lower()
+                aria_label = str(await control.get_attribute("aria-label") or "").lower()
+                if text in {">", "›", "下一页"} or "next" in aria_label or "next" in class_name:
+                    disabled = (
+                        str(await control.get_attribute("aria-disabled") or "").lower() == "true"
+                        or "disabled" in class_name
+                    )
+                    if not disabled and (await self._click_locator_center(page, control) or await self._click_locator(control)):
+                        self._write_run_log(
+                            f"[{datetime.now().isoformat(timespec='seconds')}] creative unit pagination: "
+                            f"{current} -> next"
+                        )
+                        return True
+        try:
+            clicked = await page.evaluate(
+                r"""() => {
+                    const visible = el => {
+                        if (!el) return false;
+                        const style = getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                    };
+                    for (const pager of document.querySelectorAll('.arco-pagination')) {
+                        if (!visible(pager)) continue;
+                        const controls = [...pager.querySelectorAll('li, button, a, [role="button"]')]
+                            .filter(visible);
+                        const numeric = controls
+                            .map(el => ({el, text: (el.innerText || '').trim(), cls: String(el.className || '').toLowerCase(), aria: el.getAttribute('aria-current')}))
+                            .filter(item => /^\d+$/.test(item.text));
+                        if (!numeric.length) continue;
+                        const active = numeric.filter(item => item.cls.includes('active') || item.cls.includes('current') || item.aria === 'page');
+                        const current = active.length ? Math.max(...active.map(item => parseInt(item.text, 10))) : Math.min(...numeric.map(item => parseInt(item.text, 10)));
+                        const next = numeric.filter(item => parseInt(item.text, 10) > current).sort((a, b) => parseInt(a.text, 10) - parseInt(b.text, 10))[0];
+                        if (next) {
+                            next.el.scrollIntoView({block: 'center', inline: 'center'});
+                            next.el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            if clicked:
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _click_largest_open_dropdown_option(self, page) -> bool:
         """在当前展开的下拉里点击数值最大的页大小选项。"""
@@ -3278,18 +4367,6 @@ class UserGrowthBrowserClient:
             return
         raise RuntimeError(f"未找到弹窗操作按钮：{'/'.join(texts)}")
 
-    async def _wait_redfruit_arlp_complete(self, page, progress: ProgressCallback | None) -> None:
-        """等待增加 ARLP 弹窗关闭并给平台处理留出刷新窗口。"""
-        for attempt in range(1, 21):
-            body = await self._body_text(page, timeout_ms=3000)
-            compact = _compact_text(body)
-            if "保存并送审" not in compact and ("增加ARLP" not in compact or "成功" in compact):
-                await page.wait_for_timeout(3000)
-                return
-            self._emit(progress, f"等待增加 ARLP 处理完成，第 {attempt} 次")
-            await page.wait_for_timeout(3000)
-        self._emit(progress, "增加 ARLP 未观察到明确完成提示，继续尝试后续分类标签修改")
-
     async def _refresh_material_list_page(
             self,
             page,
@@ -3317,9 +4394,9 @@ class UserGrowthBrowserClient:
         message = f"{type(exc).__name__}: {exc}"
         return "TargetClosedError" in message or "Target page, context or browser has been closed" in message
 
-    async def _read_current_task_id(self, page) -> str:
+    async def _read_current_task_id(self, page, progress: ProgressCallback | None = None) -> str:
         """从当前任务列表首条数据读取任务ID。"""
-        await self._wait_task_list_ready(page)
+        await self._wait_task_list_ready(page, progress=progress)
         task_id_input = await self._wait_first_existing(
             page,
             (
@@ -3335,10 +4412,18 @@ class UserGrowthBrowserClient:
         except Exception:
             return self._extract_digits(await self._locator_text(task_id_input, timeout_ms=2000))
 
-    async def _wait_task_list_ready(self, page, timeout_ms: int = 30000) -> None:
+    async def _wait_task_list_ready(
+            self,
+            page,
+            timeout_ms: int | None = None,
+            progress: ProgressCallback | None = None,
+    ) -> None:
         """等待任务ID输入框中出现值后再读取任务ID。"""
-
-        async def task_list_ready():
+        attempt = 0
+        deadline = None if timeout_ms is None else asyncio.get_event_loop().time() + timeout_ms / 1000
+        while deadline is None or asyncio.get_event_loop().time() < deadline:
+            self._raise_if_cancelled()
+            attempt += 1
             task_id_input = await self._first_existing(
                 page,
                 (
@@ -3346,16 +4431,18 @@ class UserGrowthBrowserClient:
                     "input[placeholder*='任务']",
                 ),
             )
-            if not task_id_input:
-                return False
-            try:
-                value = await task_id_input.input_value(timeout=1500)
-            except Exception:
-                value = await self._locator_text(task_id_input, timeout_ms=1500)
-            return bool(self._extract_digits(value))
-
-        if await self._wait_for_result(task_list_ready, timeout_ms=timeout_ms, interval_ms=500):
-            return
+            if task_id_input:
+                try:
+                    value = await task_id_input.input_value(timeout=1500)
+                except Exception:
+                    value = await self._locator_text(task_id_input, timeout_ms=1500)
+                if self._extract_digits(value):
+                    return
+                if attempt % 10 == 0:
+                    self._emit(progress, f"等待任务ID填充中，第 {attempt} 次")
+            elif attempt % 10 == 0:
+                self._emit(progress, f"等待任务ID输入框渲染中，第 {attempt} 次")
+            await self._sleep(1)
         raise RuntimeError("等待任务ID输入框渲染超时，未读取到任务ID")
 
     async def _open_task_detail_for_task_id(
@@ -3796,6 +4883,20 @@ class UserGrowthBrowserClient:
         except RuntimeError:
             return
 
+    async def _click_exact_text_in_locator_when_visible(self, container, text: str, timeout_ms: int = 3000) -> bool:
+        """等待容器内某个精确文本真的出现后再点击。"""
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+        locator = container.locator(f"text={text}")
+        while asyncio.get_event_loop().time() < deadline:
+            for candidate in await self._visible_locators(locator, limit=20):
+                try:
+                    await candidate.click(timeout=1000)
+                    return True
+                except Exception:
+                    continue
+            await asyncio.sleep(0.2)
+        return False
+
     async def _click_text_or_locator(self, page, text: str) -> bool:
         """点击文本；若不存在则返回 False。"""
         try:
@@ -3937,6 +5038,8 @@ class UserGrowthBrowserClient:
                     return result
 
             except Exception as exc:
+                if isinstance(exc, UserGrowthFatalPageError):
+                    raise
                 last_error = exc
 
             if attempt < max_attempts:

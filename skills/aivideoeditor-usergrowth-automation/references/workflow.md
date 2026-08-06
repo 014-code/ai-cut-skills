@@ -60,6 +60,8 @@ write_back_results(config.order_excel, config.order_excel, plan.items, include_r
 
 The runner serializes writes per resolved Excel path, which protects same-process multi-batch writes. It does not protect against Excel/WPS having the file open.
 
+For `workflow=redfruit_short_drama`, the browser phase does not write a song Excel. After review it opens the task-created material list, adds ARLP, and waits for the separate ARLP operation task to report that every selected material succeeded. A partial or failed ARLP task is retried from a fresh `点第一张素材 -> 全选所有 -> 增加ARLP` selection cycle until the task row's successful count equals its total count or the user cancels the run. Once ARLP is complete, the same material set goes through `编辑 -> 修改分类标签`; its operation task is checked with the same counters, and any partial result is retried from a fresh full-selection cycle until every material reports success.
+
 ## Batch Runs
 
 The vendored desktop runner still provides `run_usergrowth_batches` for whole-folder `UserGrowthRunConfig` batches. The standalone CLI batch manifest uses the selected-video path instead:

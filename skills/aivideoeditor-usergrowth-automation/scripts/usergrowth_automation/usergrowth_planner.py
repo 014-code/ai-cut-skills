@@ -85,10 +85,26 @@ def build_redfruit_batches_from_paths(
     default_genre = config.redfruit_default_genre or ""
     for path_value in video_paths:
         path = Path(path_value)
-        signature = redfruit_batch_signature(path.name, default_genre=default_genre, bid_map=config.redfruit_bid_map)
+        signature = redfruit_batch_signature(
+            path.name,
+            default_genre=default_genre,
+            bid_map=config.redfruit_bid_map,
+            layout_override=config.redfruit_layout_override,
+            material_mode_override=config.redfruit_material_mode_override,
+            ai_custom_tag=config.redfruit_ai_custom_tag,
+            extra_custom_tags=config.redfruit_extra_custom_tags,
+        )
         if signature not in grouped:
             grouped[signature] = (
-                redfruit_batch_label(path.name, default_genre=default_genre, bid_map=config.redfruit_bid_map),
+                redfruit_batch_label(
+                    path.name,
+                    default_genre=default_genre,
+                    bid_map=config.redfruit_bid_map,
+                    layout_override=config.redfruit_layout_override,
+                    material_mode_override=config.redfruit_material_mode_override,
+                    ai_custom_tag=config.redfruit_ai_custom_tag,
+                    extra_custom_tags=config.redfruit_extra_custom_tags,
+                ),
                 [],
             )
         label, paths = grouped[signature]
@@ -150,11 +166,19 @@ def build_redfruit_batches_from_items(
             item.file_name,
             default_genre=default_genre,
             bid_map=config.redfruit_bid_map,
+            layout_override=config.redfruit_layout_override,
+            material_mode_override=config.redfruit_material_mode_override,
+            ai_custom_tag=config.redfruit_ai_custom_tag,
+            extra_custom_tags=config.redfruit_extra_custom_tags,
         )
         label = redfruit_batch_label(
             item.file_name,
             default_genre=default_genre,
             bid_map=config.redfruit_bid_map,
+            layout_override=config.redfruit_layout_override,
+            material_mode_override=config.redfruit_material_mode_override,
+            ai_custom_tag=config.redfruit_ai_custom_tag,
+            extra_custom_tags=config.redfruit_extra_custom_tags,
         )
         if signature not in grouped:
             grouped[signature] = (label, [])
@@ -343,6 +367,10 @@ def _redfruit_metadata_for_config(config: UserGrowthRunConfig, path: Path) -> di
         path,
         default_genre=config.redfruit_default_genre or "",
         bid_map=config.redfruit_bid_map,
+        layout_override=config.redfruit_layout_override,
+        material_mode_override=config.redfruit_material_mode_override,
+        ai_custom_tag=config.redfruit_ai_custom_tag,
+        extra_custom_tags=config.redfruit_extra_custom_tags,
     )
     if config.delivery_products:
         metadata["delivery_products"] = list(config.delivery_products)

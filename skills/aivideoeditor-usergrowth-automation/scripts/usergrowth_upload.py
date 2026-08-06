@@ -36,7 +36,11 @@ from usergrowth_automation.usergrowth_rules import (
     extract_song_name,
     optional_tags_for_file,
 )
-from usergrowth_automation.usergrowth_redfruit import is_redfruit_workflow, normalise_workflow
+from usergrowth_automation.usergrowth_redfruit import (
+    build_redfruit_metadata,
+    is_redfruit_workflow,
+    normalise_workflow,
+)
 from usergrowth_automation.usergrowth_tag_templates import (
     DEFAULT_CUSTOM_TAG_TEMPLATE_NAME,
     combine_template_tags,
@@ -89,6 +93,21 @@ def main(argv: list[str] | None = None) -> int:
 
         config = _config_from_args(args, manifest, base_dir)
         cli_error_output_root = config.output_root
+        existing_unit_ids = _existing_creative_unit_ids_from_args(args, manifest)
+        if existing_unit_ids:
+            if config.dry_run:
+                raise RuntimeError("补录已有创意单元需要 --live --confirm-live。")
+            if not _live_confirmed(args, manifest):
+                raise RuntimeError("补录已有创意单元需要同时传 --live --confirm-live。")
+            if not config.account or not config.password:
+                raise RuntimeError("正式补录需要账号密码。可用 --account/--password 或 USERGROWTH_ACCOUNT/USERGROWTH_PASSWORD。")
+            payload = run_existing_creative_units_task(
+                config,
+                existing_unit_ids,
+                progress=lambda message: print(message, flush=True),
+            )
+            print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
+            return 1 if payload.get("summary", {}).get("failed") else 0
         selectors = _video_selectors_from_args(args, manifest)
         glob_patterns = _list_value(args.video_glob) + _list_from_manifest(manifest, "video_globs")
         auto_split = _auto_split_requested(args, manifest)
@@ -151,6 +170,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--video-glob", action="append", default=[], help="Glob matched against relative path and file name.")
     parser.add_argument("--video-list", help="Text file with one selected video path/name per line.")
     parser.add_argument("--all-videos", action="store_true", help="Select all videos in video-folder.")
+    parser.add_argument(
+        "--existing-creative-unit-id",
+        action="append",
+        default=[],
+        help="只补录已有创意单元，不重新上传文件；可重复传入。",
+    )
+    parser.add_argument("--existing-creative-unit-title", help="补录批次的剧名，仅用于红果分类/日志。")
+    parser.add_argument("--existing-creative-unit-drama-type", help="补录批次剧目类型：动态漫或仿真人。")
+    parser.add_argument("--existing-creative-unit-bid", help="补录批次的 bid_剧目ID。")
     parser.add_argument("--backfill-excel", help="Backfill Excel path.")
     parser.add_argument("--song-excel", help="Song library Excel path.")
     parser.add_argument("--output-root", help="Output folder for task.json, logs, dry-run result.xlsx, and debug files.")
@@ -167,6 +195,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workflow", help="Workflow name such as soda_music or redfruit_short_drama.")
     parser.add_argument("--redfruit-default-genre", help="Default redfruit genre used when file names do not specify one.")
     parser.add_argument("--redfruit-bid-map", help="JSON string mapping drama titles to bid_... values.")
+    parser.add_argument("--redfruit-layout-override", help="Force redfruit layout label, e.g. 竖版-横改竖.")
+    parser.add_argument("--redfruit-material-mode-override", help="Force redfruit material mode, e.g. AI前贴 or 原片.")
+    parser.add_argument("--redfruit-ai-custom-tag", help="AI redfruit custom tag used for AI前贴/后贴 materials.")
+    parser.add_argument("--redfruit-extra-custom-tag", action="append", default=[], help="Extra redfruit custom tag. Can be repeated.")
     parser.add_argument("--split-by-song", action="store_true", help="Auto-split selected videos into one batch per song before running.")
     parser.add_argument("--concurrency", type=int, default=None, help="Batch concurrency. Defaults to batch count, clamped to 1..10; multi-batch runs use at least 2.")
     parser.add_argument("--account", help="UserGrowth account. Prefer USERGROWTH_ACCOUNT env var.")
@@ -398,8 +430,11 @@ def _manifest_output_root(args: argparse.Namespace, manifest: dict[str, Any], ba
 
 
 def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_dir: Path) -> UserGrowthRunConfig:
-    video_folder = _required_path(_pick(args.video_folder, manifest, "video_folder"), base_dir, "video_folder")
     output_root = _required_path(_pick(args.output_root, manifest, "output_root"), base_dir, "output_root")
+    video_value = _pick(args.video_folder, manifest, "video_folder")
+    if video_value in (None, "") and _existing_creative_unit_ids_from_args(args, manifest):
+        video_value = str(output_root)
+    video_folder = _required_path(video_value, base_dir, "video_folder")
     workflow = normalise_workflow(_pick(args.workflow, manifest, "workflow") or "soda_music")
     backfill_value = _pick(args.backfill_excel, manifest, "backfill_excel", "order_excel")
     song_value = _pick(args.song_excel, manifest, "song_excel")
@@ -428,6 +463,33 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
         workflow=workflow,
         redfruit_default_genre=str(_pick(args.redfruit_default_genre, manifest, "redfruit_default_genre") or "").strip(),
         redfruit_bid_map=_parse_redfruit_bid_map(_pick(args.redfruit_bid_map, manifest, "redfruit_bid_map")),
+        redfruit_layout_override=str(
+            _pick(args.redfruit_layout_override, manifest, "redfruit_layout_override", "redfruit_layout")
+            or ""
+        ).strip(),
+        redfruit_material_mode_override=str(
+            _pick(
+                args.redfruit_material_mode_override,
+                manifest,
+                "redfruit_material_mode_override",
+                "redfruit_material_mode",
+            )
+            or ""
+        ).strip(),
+        redfruit_ai_custom_tag=str(
+            _pick(args.redfruit_ai_custom_tag, manifest, "redfruit_ai_custom_tag")
+            or "创意AI素材"
+        ).strip(),
+        redfruit_extra_custom_tags=_redfruit_extra_custom_tags_from_args(args, manifest),
+        existing_creative_unit_title=str(
+            _pick(args.existing_creative_unit_title, manifest, "existing_creative_unit_title") or ""
+        ).strip(),
+        existing_creative_unit_drama_type=str(
+            _pick(args.existing_creative_unit_drama_type, manifest, "existing_creative_unit_drama_type") or ""
+        ).strip(),
+        existing_creative_unit_bid=str(
+            _pick(args.existing_creative_unit_bid, manifest, "existing_creative_unit_bid") or ""
+        ).strip(),
         custom_tag_template_name=str(
             _pick(args.custom_tag_template_name, manifest, "custom_tag_template_name", "tag_template_name")
             or DEFAULT_CUSTOM_TAG_TEMPLATE_NAME
@@ -471,6 +533,15 @@ def _custom_tag_template_tags_from_args(args: argparse.Namespace, manifest: dict
     return default_custom_tag_template_tags()
 
 
+def _redfruit_extra_custom_tags_from_args(args: argparse.Namespace, manifest: dict[str, Any]) -> list[str]:
+    tags = [
+        *_list_value(args.redfruit_extra_custom_tag),
+        *_list_from_manifest(manifest, "redfruit_extra_custom_tags"),
+        *_list_from_manifest(manifest, "redfruit_extra_custom_tag"),
+    ]
+    return normalise_template_tags(tags)
+
+
 def _parse_redfruit_bid_map(value: Any) -> dict[str, str]:
     if value in (None, ""):
         return {}
@@ -503,6 +574,21 @@ def _video_selectors_from_args(args: argparse.Namespace, manifest: dict[str, Any
             list_path = Path(args.manifest).resolve().parent / list_path
         selectors.extend(_read_video_list(list_path))
     return selectors
+
+
+def _existing_creative_unit_ids_from_args(args: argparse.Namespace, manifest: dict[str, Any]) -> list[str]:
+    values = [*_list_value(getattr(args, "existing_creative_unit_id", []))]
+    values.extend(_list_from_manifest(manifest, "existing_creative_unit_ids"))
+    values.extend(_list_from_manifest(manifest, "existing_creative_unit_id"))
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for unit_id in str(value).replace("\n", ",").split(","):
+            unit_id = unit_id.strip()
+            if unit_id and unit_id not in seen:
+                seen.add(unit_id)
+                result.append(unit_id)
+    return result
 
 
 def _read_video_list(path: Path) -> list[str]:
@@ -691,6 +777,90 @@ def run_selected_usergrowth_task(
         return payload
     except BaseException as exc:
         _write_task_error(task_root, config, video_paths, exc)
+        try:
+            setattr(exc, "_usergrowth_task_root", str(task_root))
+        except Exception:
+            pass
+        raise
+
+
+def run_existing_creative_units_task(
+    config: UserGrowthRunConfig,
+    unit_ids: list[str],
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """执行只补录已有创意单元的红果短剧任务。"""
+    task_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_task_name = _safe_name(config.task_name or "usergrowth_existing_creative_units")
+    task_root = config.output_root / f"{task_id}_{safe_task_name}"
+    debug_dir = task_root / "debug"
+    task_root.mkdir(parents=True, exist_ok=True)
+    unit_ids = list(dict.fromkeys(str(unit_id).strip() for unit_id in unit_ids if str(unit_id).strip()))
+    if not unit_ids:
+        raise RuntimeError("没有提供可补录的创意单元 ID。")
+    if not is_redfruit_workflow(config.workflow):
+        raise RuntimeError("已有创意单元直补入口目前只支持红果短剧流程。")
+    if not config.order_id.strip():
+        raise RuntimeError("补录已有创意单元需要订单 ID。")
+
+    drama_title = config.existing_creative_unit_title or "补录批次"
+    drama_type = config.existing_creative_unit_drama_type or "动态漫"
+    bid = config.existing_creative_unit_bid or ""
+    synthetic_name = (
+        f"dxzc-{drama_type}-{drama_title}-0806-无剧名-六部-补录-原创AI前贴-{bid}.mp4"
+    )
+    metadata = build_redfruit_metadata(
+        Path(synthetic_name),
+        default_genre=config.redfruit_default_genre or "古风言情",
+        bid_map=config.redfruit_bid_map,
+        layout_override=config.redfruit_layout_override or "竖版-纯竖版",
+        material_mode_override=config.redfruit_material_mode_override or "AI前/后贴",
+        ai_custom_tag=config.redfruit_ai_custom_tag or "创新AI素材",
+        extra_custom_tags=config.redfruit_extra_custom_tags,
+    )
+    items: list[UserGrowthVideoItem] = []
+    for unit_id in unit_ids:
+        items.append(
+            UserGrowthVideoItem(
+                path=Path(unit_id),
+                file_name=unit_id,
+                material_type="红果短剧补录",
+                song_name=metadata.get("drama_title", "补录批次"),
+                workflow="redfruit_short_drama",
+                order_id=config.order_id.strip(),
+                custom_tags=list(metadata.get("custom_tags") or []),
+                classification_path=list(metadata.get("genre_path") or []),
+                classification_paths=list(metadata.get("classification_paths") or []),
+                post_review_classification_paths=list(metadata.get("post_review_classification_paths") or []),
+                workflow_metadata={
+                    **metadata,
+                    "existing_creative_unit_id": unit_id,
+                    "direct_existing_unit_recovery": True,
+                },
+            )
+        )
+    plan = UserGrowthOrderPlan(order_id=config.order_id.strip(), items=items)
+
+    try:
+        _emit(progress, f"准备补录已有创意单元：{len(items)} 个，订单 {plan.order_id}")
+        browser = UserGrowthBrowserClient(
+            config.account,
+            config.password,
+            headless=config.headless,
+            debug_dir=debug_dir,
+            refresh_interval_seconds=config.refresh_interval_seconds,
+            max_status_retries=config.max_status_retries,
+            browser_slow_mo_ms=config.browser_slow_mo_ms,
+        )
+        asyncio.run(browser.run_existing_creative_units(plan, progress))
+        payload = _build_payload(config, task_id, task_root, [plan], items, None, None)
+        payload["mode"] = "existing_creative_unit_recovery"
+        payload["existing_creative_unit_ids"] = unit_ids
+        (task_root / "task.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_log(task_root, payload)
+        return payload
+    except BaseException as exc:
+        _write_task_error(task_root, config, [Path(unit_id) for unit_id in unit_ids], exc)
         try:
             setattr(exc, "_usergrowth_task_root", str(task_root))
         except Exception:
@@ -994,6 +1164,13 @@ def _safe_config_dict(config: UserGrowthRunConfig) -> dict[str, Any]:
         "headless": config.headless,
         "redfruit_default_genre": config.redfruit_default_genre,
         "redfruit_bid_map": dict(config.redfruit_bid_map),
+        "redfruit_layout_override": config.redfruit_layout_override,
+        "redfruit_material_mode_override": config.redfruit_material_mode_override,
+        "redfruit_ai_custom_tag": config.redfruit_ai_custom_tag,
+        "redfruit_extra_custom_tags": list(config.redfruit_extra_custom_tags),
+        "existing_creative_unit_title": config.existing_creative_unit_title,
+        "existing_creative_unit_drama_type": config.existing_creative_unit_drama_type,
+        "existing_creative_unit_bid": config.existing_creative_unit_bid,
         "refresh_interval_seconds": config.refresh_interval_seconds,
         "browser_slow_mo_ms": config.browser_slow_mo_ms,
     }

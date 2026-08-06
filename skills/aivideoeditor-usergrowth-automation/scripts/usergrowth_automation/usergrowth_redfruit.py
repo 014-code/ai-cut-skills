@@ -145,6 +145,17 @@ def redfruit_content_kind(value: object) -> str:
     return ""
 
 
+def redfruit_order_kind(value: object) -> str:
+    """把红果工单名归一为动态漫/仿真人；AI前贴等素材标签不参与这里的判断。"""
+    return redfruit_content_kind(value)
+
+
+def redfruit_expected_order_kind(file_name: object, *, drama_type: object = "", material_mode: object = "") -> str:
+    """根据文件名上的剧目类型判断应使用哪类工单；素材类型不参与前置工单校验。"""
+    _ = material_mode
+    return redfruit_content_kind(drama_type or file_name)
+
+
 def redfruit_extract_order_title(body_text: str, order_id: str) -> str:
     """从工单搜索结果正文中提取当前订单标题。"""
     wanted = str(order_id or "").strip()
@@ -283,14 +294,18 @@ def build_redfruit_metadata(
         *,
         default_genre: str = REDFRUIT_DEFAULT_GENRE,
         bid_map: dict[str, Any] | None = None,
+        layout_override: str = "",
+        material_mode_override: str = "",
+        ai_custom_tag: str = "创意AI素材",
+        extra_custom_tags: list[str] | None = None,
 ) -> dict[str, Any]:
     file_name = path.name
     stem = Path(file_name).stem
     drama_type = redfruit_drama_type(file_name)
-    material_mode = redfruit_material_mode(file_name)
+    material_mode = _normalise_redfruit_material_mode_override(material_mode_override) or redfruit_material_mode(file_name)
     title = redfruit_drama_title(file_name)
     bid = redfruit_bid(file_name) or _lookup_redfruit_bid(title, file_name, bid_map)
-    layout = redfruit_layout_label(path)
+    layout = _normalise_redfruit_layout_override(layout_override) or redfruit_layout_label(path)
     genre_path = redfruit_genre_path(file_name, default_genre=default_genre)
     genre = genre_path[-1] if genre_path else REDFRUIT_GENRE_OTHER
     genre_group = genre_path[1] if len(genre_path) > 2 else REDFRUIT_GENRE_OTHER
@@ -311,7 +326,13 @@ def build_redfruit_metadata(
         ["有无logo", "无logo以及其他的产品信息"],
         ["是否为AI素材", "AI素材"],
     ]
-    custom_tags = redfruit_custom_tags(file_name, bid=bid)
+    custom_tags = redfruit_custom_tags(
+        file_name,
+        bid=bid,
+        material_mode=material_mode,
+        ai_custom_tag=ai_custom_tag,
+        extra_tags=extra_custom_tags,
+    )
     return {
         "workflow": WORKFLOW_REDFRUIT_SHORT_DRAMA,
         "drama_title": title,
@@ -473,16 +494,68 @@ def _match_redfruit_genre_path(value: object) -> list[str]:
     return []
 
 
-def redfruit_custom_tags(file_name: str, *, bid: str = "") -> list[str]:
+def redfruit_custom_tags(
+        file_name: str,
+        *,
+        bid: str = "",
+        material_mode: str | None = None,
+        ai_custom_tag: str = "创意AI素材",
+        extra_tags: list[str] | None = None,
+) -> list[str]:
     tags = list(REDFRUIT_FIXED_CUSTOM_TAGS)
     bid = bid or redfruit_bid(file_name)
     if bid:
         tags.append(bid)
     tags.append(redfruit_drama_type(file_name))
     tags.extend(redfruit_editor_tags(file_name))
-    if redfruit_material_mode(file_name) in {"AI前贴", "AI后贴"}:
-        tags.append("创意AI素材")
+    mode = material_mode or redfruit_material_mode(file_name)
+    if mode in {"AI前贴", "AI后贴"} and str(ai_custom_tag or "").strip():
+        tags.append(str(ai_custom_tag).strip())
+    tags.extend(str(tag).strip() for tag in (extra_tags or []) if str(tag).strip())
     return _dedupe_tags(tags)
+
+
+def _normalise_redfruit_material_mode_override(value: object) -> str:
+    text = _compact(value)
+    if not text:
+        return ""
+    if "ai前/后贴" in text or "ai前后贴" in text or "ai素材" in text:
+        return "AI前贴"
+    if "ai前贴" in text or "aigc前贴" in text or "原创ai" in text:
+        return "AI前贴"
+    if "ai后贴" in text or "aigc后贴" in text:
+        return "AI后贴"
+    if "功能综述" in text or "功能总述" in text:
+        return "功能综述"
+    if "解说" in text or "旁白" in text:
+        return "解说"
+    if "bgm混剪" in text or "音乐混剪" in text:
+        return "BGM混剪"
+    if "混剪" in text:
+        return "混剪"
+    if "原片" in text:
+        return "原片"
+    return ""
+
+
+def _normalise_redfruit_layout_override(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = _compact(text)
+    if "横改竖" in compact:
+        return "竖版-横改竖"
+    if "竖改横" in compact:
+        return "横版-竖改横"
+    if "纯横" in compact:
+        return "横版-纯横版"
+    if "纯竖" in compact:
+        return "竖版-纯竖版"
+    if "横版" in compact or "横板" in compact:
+        return "横版-纯横版"
+    if "竖版" in compact or "竖板" in compact:
+        return "竖版-纯竖版"
+    return text.replace("竖板", "竖版").replace("横板", "横版")
 
 
 def redfruit_editor_tags(file_name: str) -> list[str]:
@@ -543,9 +616,21 @@ def redfruit_batch_signature(
         *,
         default_genre: str = REDFRUIT_DEFAULT_GENRE,
         bid_map: dict[str, Any] | None = None,
+        layout_override: str = "",
+        material_mode_override: str = "",
+        ai_custom_tag: str = "创意AI素材",
+        extra_custom_tags: list[str] | None = None,
 ) -> str:
     """把单个文件压成可用于自动拆批的稳定签名。"""
-    meta = build_redfruit_metadata(Path(file_name), default_genre=default_genre, bid_map=bid_map)
+    meta = build_redfruit_metadata(
+        Path(file_name),
+        default_genre=default_genre,
+        bid_map=bid_map,
+        layout_override=layout_override,
+        material_mode_override=material_mode_override,
+        ai_custom_tag=ai_custom_tag,
+        extra_custom_tags=extra_custom_tags,
+    )
     parts = [
         meta.get("drama_title", ""),
         meta.get("drama_type", ""),
@@ -565,9 +650,21 @@ def redfruit_batch_label(
         *,
         default_genre: str = REDFRUIT_DEFAULT_GENRE,
         bid_map: dict[str, Any] | None = None,
+        layout_override: str = "",
+        material_mode_override: str = "",
+        ai_custom_tag: str = "创意AI素材",
+        extra_custom_tags: list[str] | None = None,
 ) -> str:
     """生成红果自动拆批的显示名称。"""
-    meta = build_redfruit_metadata(Path(file_name), default_genre=default_genre, bid_map=bid_map)
+    meta = build_redfruit_metadata(
+        Path(file_name),
+        default_genre=default_genre,
+        bid_map=bid_map,
+        layout_override=layout_override,
+        material_mode_override=material_mode_override,
+        ai_custom_tag=ai_custom_tag,
+        extra_custom_tags=extra_custom_tags,
+    )
     title = meta.get("drama_title") or Path(file_name).stem
     mode = meta.get("material_mode") or "原片"
     bid = meta.get("bid") or "未识别bid"
