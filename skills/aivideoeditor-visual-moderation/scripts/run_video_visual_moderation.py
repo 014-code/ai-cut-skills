@@ -2027,6 +2027,15 @@ def bbox_at_time(redaction: Dict[str, Any], timestamp: float) -> Optional[List[f
     if timestamp >= normalized_keyframes[-1][0]:
         return normalized_keyframes[-1][1]
 
+    interpolation_mode = str(redaction.get("bbox_interpolation") or redaction.get("interpolation") or "").lower()
+    if interpolation_mode in {"step", "hold", "instant"} or redaction.get("type") in {"text_mosaic", "subtitle_replace"}:
+        previous_bbox = normalized_keyframes[0][1]
+        for keyframe_time, bbox in normalized_keyframes:
+            if timestamp < keyframe_time:
+                return previous_bbox
+            previous_bbox = bbox
+        return previous_bbox
+
     for index in range(len(normalized_keyframes) - 1):
         left_time, left_bbox = normalized_keyframes[index]
         right_time, right_bbox = normalized_keyframes[index + 1]

@@ -256,7 +256,7 @@
     },
     "aivideoeditor-visual-moderation": {
       "category": "assets",
-      "summary": "调用阿里云 Green 视频审核增强版，输出涉政、涉军、NSFW 违规信息、命中时间点、过审路由和短剧剪辑闸门。",
+      "summary": "调用阿里云 Green 视频审核增强版，输出违规时间点、过审路由和剪辑闸门；也支持素材尺度词表的字幕打码与骂人词消音规划。",
       "capability_path": [
         "Video",
         "Analyze",
@@ -278,13 +278,21 @@
         "军事敏感",
         "过审",
         "没过",
-        "allow_short_drama_editing"
+        "allow_short_drama_editing",
+        "素材尺度规范",
+        "必杀词",
+        "字幕打码",
+        "消音",
+        "骂人词汇"
       ],
       "when_to_use": [
         "需要调用阿里云视频审核增强版审核本地视频或 URL",
         "需要在短剧下载后进入包装前做视觉审核闸门",
         "需要跑短剧从下载审核到包装的全流程中的审核阶段",
-        "需要输出具体违规标签 命中时间点 原因和过审/未过审文件夹"
+        "需要输出具体违规标签 命中时间点 原因和过审/未过审文件夹",
+        "需要按素材尺度规范词表对字幕做打码",
+        "需要按骂人词汇命中时间段做音频消音",
+        "需要从 timestamped subtitle/dialogue JSON 生成 redaction_plan"
       ],
       "when_not_use": [
         "短剧下载",
@@ -292,13 +300,15 @@
         "只需要下载短剧素材",
         "只需要生成或包装视频且不需要内容审核",
         "只需要素材 Manifest 管理",
-        "需要打码 消音 或大模型二次理解"
+        "需要大模型二次理解"
       ],
       "inputs": [
         "video_files",
         "video_url",
         "aliyun_credentials_env",
-        "route_dir"
+        "route_dir",
+        "timestamped_dialogue_segments",
+        "subtitle_transcript_json"
       ],
       "outputs": [
         "moderation_report",
@@ -308,7 +318,11 @@
         "violation_summary_text",
         "pass_fail_routing",
         "downstream_gate",
-        "audit_logs"
+        "audit_logs",
+        "subtitle_audio_redaction_plan",
+        "keyword_hit_report",
+        "masked_subtitle_preview",
+        "muted_audio_preview"
       ],
       "requires": [],
       "optional": [
