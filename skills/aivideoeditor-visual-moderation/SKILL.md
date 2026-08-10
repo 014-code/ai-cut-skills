@@ -21,10 +21,11 @@ Provider-backed video review workflow:
 Business-keyword subtitle/audio workflow:
 
 1. Prepare timestamped dialogue/subtitle segments as JSON, or generate them with `scripts/run_high_accuracy_asr.py`.
-2. Run `scripts/run_keyword_text_audio_redaction.py`.
-3. Mask every hit from the material-scale keyword policy in subtitles.
-4. Mute the matching dialogue span for every subtitle-masked hit.
-5. Return a machine-readable `redaction_plan.json` and a human-readable `字幕消音模拟说明.txt`.
+2. Refresh the Feishu policy snapshot from the configured `素材尺度规范` wiki before a batch when the user is authenticated in Feishu. Keep the URL, document title, last-modified value, sync time, and policy version in `references/feishu_keyword_policy.json`; never store the Feishu password or browser tokens.
+3. Run `scripts/run_keyword_text_audio_redaction.py` or `scripts/run_keyword_video_redaction.py`.
+4. Mask every hit from the current Feishu-backed keyword policy in subtitles.
+5. Mute the matching dialogue span for every subtitle-masked hit.
+6. Return a machine-readable `redaction_plan.json` and a human-readable `字幕消音模拟说明.txt`.
 
 For the complete keyword policy, read `references/keyword_text_audio_redaction.md`.
 
@@ -46,9 +47,10 @@ The simulation rule is:
 - prefer word-level timing when the transcript includes `words`, `tokens`, or `frontend.words`
 - keep every keyword occurrence by span; do not dedupe repeated hits just because the keyword text is the same
 - keep a small subtitle pre-roll so the first visible frame is covered immediately
-- choose a fixed anchor OCR subtitle box for each hit so the mask does not slide across the subtitle line
-- always run full-video OCR at a fixed interval (default 0.30 seconds), not only inside ASR-hit segments; ASR is a timing aid, never the OCR coverage boundary
+- choose a fixed anchor OCR keyword box for each hit so truncated OCR text cannot move the mask to a different character position across adjacent frames
+- always run full-video OCR at a fixed interval (default 0.30 seconds), then refine OCR text transitions with frame-rate boundary scans whenever either adjacent subtitle observation contains a policy hit; ASR is a timing aid, never the OCR coverage boundary
 - merge adjacent OCR hits for the same keyword into one continuous time window with a small temporal hold, so a subtitle does not become unmasked between sampled frames
+- refine OCR hit boundaries against the preceding and following subtitle observations: extend across an empty/continuing subtitle sample when needed, but stop before a different sentence; extensions remain limited to the matched keyword bbox
 - derive each mask from the OCR line box and the matched character span; never use a full-frame, whole-person, or full subtitle-band mask as a leak-prevention fallback
 - render audio mutes by trimming, zeroing, and concatenating audio segments; do not rely on ffmpeg `enable=between(t,...)` for later timestamps
 - keyword matching is normalized for spaces and punctuation, so OCR/transcript variants like `装 13` and `：tmd` still hit the canonical policy term
@@ -70,6 +72,7 @@ For keyword subtitle/audio redaction:
 - For source-video redaction, omit `--transcript` to auto-generate one with `run_high_accuracy_asr.py` before keyword matching.
 - If available, `words` / `tokens` / `frontend.words` word-level timestamps are consumed automatically for tighter audio mute spans and better subtitle timing.
 - Output directory: `--output-dir`.
+- Policy snapshot: `references/feishu_keyword_policy.json` by default, or pass `--policy-json` explicitly.
 - `rapidocr_onnxruntime` must be available for precise OCR subtitle-line localization.
 - Do not require Aliyun, DashScope, or Qwen credentials.
 
@@ -166,8 +169,8 @@ The actual source-video workflow writes:
 - `字幕消音处理说明.txt`
 - the processed MP4 at `--output`
 
-Default subtitle masking uses RapidOCR on a bottom subtitle search band, then narrows the mask to the hit character span inside the recognized subtitle line. Subtitle masks use step/hold keyframes with a fixed anchor OCR box for each hit, not linear interpolation, so masks appear immediately instead of sliding across the subtitle. The fallback `--subtitle-bbox` only applies when OCR/text-region localization fails.
-The source-video workflow always performs a full-video RapidOCR scan at a 0.30-second interval. OCR hits are merged across adjacent frames and used to supplement or extend ASR hits, which prevents missed words outside the ASR transcript or during short subtitle flashes. The report records scan count, OCR supplement windows, and localization fallback counts.
+Default subtitle masking uses RapidOCR on a bottom subtitle search band, then narrows the mask to the hit character span inside the recognized subtitle line. Subtitle masks use step/hold keyframes with a fixed anchor OCR keyword box for each hit, not linear interpolation, so truncated OCR text cannot move the mask across the line and masks appear immediately. The fallback `--subtitle-bbox` only applies when OCR/text-region localization fails.
+The source-video workflow always performs a full-video RapidOCR scan at a 0.30-second interval, then frame-scans the boundary between adjacent observations when the subtitle text or hit set changes. OCR hits are merged across adjacent frames and used to supplement or extend ASR hits, which prevents missed words outside the ASR transcript or during short subtitle flashes. The report records coarse scan count, adaptive boundary scan count, OCR supplement windows, and localization fallback counts.
 If the transcript includes word-level timestamps, the actual source-video workflow tightens each keyword's time window before rendering and uses those word spans for audio mute instead of the whole subtitle segment.
 
 Run the built-in simulation demo:
