@@ -29,6 +29,8 @@ HERE = Path(__file__).resolve().parent
 GREEN_MOD = load_module(HERE / "run_aliyun_video_moderation.py", "aliyun_green_video")
 VISUAL_MOD = load_module(HERE / "run_video_visual_moderation.py", "skill_video_visual_moderation")
 
+AUDIO_MUTE_RENDER_PAD_SECONDS = 0.12
+
 
 def get_nested(data: Dict[str, Any], *keys: str) -> Any:
     return GREEN_MOD.get_nested(data, *keys)
@@ -329,13 +331,107 @@ def escape_filter_time(value: Any) -> str:
     return f"{float(value):.3f}".rstrip("0").rstrip(".")
 
 
+def merge_audio_mutes(mutes: List[Dict[str, Any]], max_gap: float = 0.03) -> List[Dict[str, Any]]:
+    intervals: List[Dict[str, Any]] = []
+    for item in mutes:
+        start = float(item.get("start_time", 0.0) or 0.0)
+        end = float(item.get("end_time", start) or start)
+        if end < start:
+            start, end = end, start
+        start = max(0.0, start)
+        end = max(start, end)
+        if end <= start + 0.001:
+            continue
+        intervals.append(
+            {
+                "start_time": round(start, 3),
+                "end_time": round(end, 3),
+                "keywords": sorted(set(item.get("keywords") or [])),
+                "reason": item.get("reason"),
+            }
+        )
+    ordered = sorted(intervals, key=lambda item: (item["start_time"], item["end_time"]))
+    if not ordered:
+        return []
+    merged: List[Dict[str, Any]] = [dict(ordered[0])]
+    for item in ordered[1:]:
+        previous = merged[-1]
+        if float(item["start_time"]) <= float(previous["end_time"]) + max_gap:
+            previous["end_time"] = max(float(previous["end_time"]), float(item["end_time"]))
+            previous["keywords"] = sorted(set(previous.get("keywords", []) + item.get("keywords", [])))
+        else:
+            merged.append(dict(item))
+    return merged
+
+
+def expand_audio_mutes_for_render(
+    mutes: List[Dict[str, Any]],
+    pad_seconds: float = AUDIO_MUTE_RENDER_PAD_SECONDS,
+) -> List[Dict[str, Any]]:
+    if pad_seconds <= 0:
+        return merge_audio_mutes(mutes)
+
+    padded: List[Dict[str, Any]] = []
+    for item in mutes:
+        start = float(item.get("start_time", 0.0) or 0.0)
+        end = float(item.get("end_time", start) or start)
+        if end < start:
+            start, end = end, start
+        start = max(0.0, start - pad_seconds)
+        end = max(start, end + pad_seconds)
+        padded.append(
+            {
+                "start_time": round(start, 3),
+                "end_time": round(end, 3),
+                "keywords": sorted(set(item.get("keywords") or [])),
+                "reason": item.get("reason"),
+            }
+        )
+    return merge_audio_mutes(padded)
+
+
 def build_audio_filter(mutes: List[Dict[str, Any]]) -> Optional[str]:
     filters = []
-    for item in mutes:
+    for item in merge_audio_mutes(mutes):
         start = escape_filter_time(item.get("start_time", 0.0))
         end = escape_filter_time(item.get("end_time", item.get("start_time", 0.0)))
-        filters.append(f"volume=enable='between(t,{start},{end})':volume=0")
+        filters.append(f"volume=0:enable='between(t,{start},{end})'")
     return ",".join(filters) if filters else None
+
+
+def build_audio_concat_filter(mutes: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    raw_intervals = merge_audio_mutes(mutes)
+    if not raw_intervals:
+        return None, []
+    intervals = expand_audio_mutes_for_render(raw_intervals)
+
+    parts: List[Tuple[float, Optional[float], bool]] = []
+    cursor = 0.0
+    for item in intervals:
+        start = max(cursor, float(item["start_time"]))
+        end = max(start, float(item["end_time"]))
+        if start > cursor + 0.001:
+            parts.append((cursor, start, False))
+        if end > start + 0.001:
+            parts.append((start, end, True))
+        cursor = max(cursor, end)
+    parts.append((cursor, None, False))
+
+    split_outputs = "".join(f"[s{index}]" for index in range(len(parts)))
+    filters = [f"[1:a]aresample=async=1:first_pts=0,asetpts=N/SR/TB,asplit={len(parts)}{split_outputs}"]
+    concat_inputs = []
+    for index, (start, end, muted) in enumerate(parts):
+        trim = f"atrim=start={escape_filter_time(start)}"
+        if end is not None:
+            trim += f":end={escape_filter_time(end)}"
+        chain = f"[s{index}]{trim},asetpts=PTS-STARTPTS"
+        if muted:
+            chain += ",volume=0"
+        chain += f"[a{index}]"
+        filters.append(chain)
+        concat_inputs.append(f"[a{index}]")
+    filters.append("".join(concat_inputs) + f"concat=n={len(parts)}:v=0:a=1[aout]")
+    return ";".join(filters), intervals
 
 
 def mux_audio(
@@ -345,9 +441,9 @@ def mux_audio(
     output_video: Path,
     mutes: List[Dict[str, Any]],
 ) -> None:
-    audio_filter = build_audio_filter(mutes)
+    audio_filter_complex, _mute_intervals = build_audio_concat_filter(mutes)
     output_video.parent.mkdir(parents=True, exist_ok=True)
-    if audio_filter:
+    if audio_filter_complex:
         args = [
             str(ffmpeg),
             "-y",
@@ -355,10 +451,12 @@ def mux_audio(
             str(visual_video),
             "-i",
             str(source_video),
+            "-filter_complex",
+            audio_filter_complex,
             "-map",
             "0:v:0",
             "-map",
-            "1:a:0?",
+            "[aout]",
             "-c:v",
             "libx264",
             "-pix_fmt",
@@ -367,8 +465,6 @@ def mux_audio(
             "20",
             "-preset",
             "veryfast",
-            "-af",
-            audio_filter,
             "-c:a",
             "aac",
             "-shortest",
@@ -442,6 +538,10 @@ def apply_redactions(
         "visual_report": visual_report,
         "visual_redaction_count": len(visual_items),
         "audio_mute_count": len(mute_items),
+        "audio_mute_strategy": "atrim_volume_zero_concat" if mute_items else "passthrough",
+        "audio_mute_intervals": merge_audio_mutes(mute_items),
+        "audio_mute_render_intervals": expand_audio_mutes_for_render(mute_items),
+        "audio_mute_render_pad_seconds": AUDIO_MUTE_RENDER_PAD_SECONDS if mute_items else 0.0,
     }
 
 

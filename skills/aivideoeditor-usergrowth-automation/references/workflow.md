@@ -60,6 +60,8 @@ write_back_results(config.order_excel, config.order_excel, plan.items, include_r
 
 The runner serializes writes per resolved Excel path, which protects same-process multi-batch writes. It does not protect against Excel/WPS having the file open.
 
+For `workflow=redfruit_short_drama`, the browser phase does not write a song Excel. After review it opens the task-created material list, adds ARLP, and waits for the separate ARLP operation task to report that every selected material succeeded. A partial or failed ARLP task is retried from a fresh `点第一张素材 -> 全选所有 -> 增加ARLP` selection cycle until the task row's successful count equals its total count or the user cancels the run. Once ARLP is complete, the same material set goes through `编辑 -> 修改分类标签`; its operation task is checked with the same counters, and any partial result is retried from a fresh full-selection cycle until every material reports success.
+
 ## Batch Runs
 
 The vendored desktop runner still provides `run_usergrowth_batches` for whole-folder `UserGrowthRunConfig` batches. The standalone CLI batch manifest uses the selected-video path instead:
@@ -76,6 +78,7 @@ Same-process writes to the same backfill Excel still use `_backfill_lock`, so li
 
 - `task.json`: machine-readable config, summary, result path, duplicate song workbook path, and plans/items.
 - `run.log`: summary, selected template fields in config, `[song_matches]`, and per-item status/type/song/CID/tags.
+- Soda Music and Redfruit live runs additionally update a workflow checkpoint (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`) at each order stage. The file stores per-order stage, platform task IDs, item retry metadata, and CID/status so `--resume-task` can continue without recreating completed upload, review, CID backfill, ARLP, or classification work.
 - `error.json` and `error.log`: task-level failure records when execution fails after the task folder is created.
 - `<output_root>/_cli_errors/*.json` and `*.log`: early CLI failures before a task folder exists, when `output_root` was already parsed.
 - `batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log`: aggregate multi-batch status, child task folders, and child error log pointers.

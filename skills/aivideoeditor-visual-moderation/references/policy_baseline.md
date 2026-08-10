@@ -70,6 +70,10 @@ When action is `REVIEW` or `BLOCK`, emit a `redactions` array:
 
 Full-frame masking is prohibited. Whole-person, broad torso, and other subject-sized boxes are also prohibited for visual safety masking. Visual masking must target a concrete local region with `bbox` or `bbox_keyframes`, such as the specific exposed/suggestive body part, political symbol, real military identifier, or risky text region. If no reliable local region is available, emit `visual_localization_required` evidence and route the item to a better localization step or manual review instead of masking the whole frame or the whole person.
 
+Subtitle keyword masking must be localized inside the detected subtitle/OCR text line and narrowed to the hit character span. Do not default to masking the full subtitle band; use a narrow subtitle-line fallback only when text-region localization fails, and record that fallback in the report.
+
+Subtitle keyword masks must appear immediately using step/hold keyframes. Do not linearly interpolate subtitle/text mask boxes, because that creates visible sliding masks before the risky word is covered.
+
 ## Suggested Thresholds
 
 - High confidence: `>= 0.85`

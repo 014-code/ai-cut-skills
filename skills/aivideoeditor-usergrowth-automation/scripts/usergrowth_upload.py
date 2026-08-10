@@ -36,7 +36,11 @@ from usergrowth_automation.usergrowth_rules import (
     extract_song_name,
     optional_tags_for_file,
 )
-from usergrowth_automation.usergrowth_redfruit import is_redfruit_workflow, normalise_workflow
+from usergrowth_automation.usergrowth_redfruit import (
+    build_redfruit_metadata,
+    is_redfruit_workflow,
+    normalise_workflow,
+)
 from usergrowth_automation.usergrowth_tag_templates import (
     DEFAULT_CUSTOM_TAG_TEMPLATE_NAME,
     combine_template_tags,
@@ -75,6 +79,15 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path = Path(args.manifest).resolve() if args.manifest else None
         manifest = _read_manifest(manifest_path)
         base_dir = manifest_path.parent if manifest_path else Path.cwd()
+        if args.resume_task:
+            cli_error_output_root = Path(args.resume_task).resolve()
+            payload = run_resumed_usergrowth_task(
+                args,
+                Path(args.resume_task).resolve(),
+                progress=lambda message: print(message, flush=True),
+            )
+            print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
+            return 1 if payload.get("summary", {}).get("failed") else 0
         if _manifest_has_batches(manifest):
             cli_error_output_root = _manifest_output_root(args, manifest, base_dir)
             payload = run_batch_manifest_task(
@@ -89,6 +102,21 @@ def main(argv: list[str] | None = None) -> int:
 
         config = _config_from_args(args, manifest, base_dir)
         cli_error_output_root = config.output_root
+        existing_unit_ids = _existing_creative_unit_ids_from_args(args, manifest)
+        if existing_unit_ids:
+            if config.dry_run:
+                raise RuntimeError("补录已有创意单元需要 --live --confirm-live。")
+            if not _live_confirmed(args, manifest):
+                raise RuntimeError("补录已有创意单元需要同时传 --live --confirm-live。")
+            if not config.account or not config.password:
+                raise RuntimeError("正式补录需要账号密码。可用 --account/--password 或 USERGROWTH_ACCOUNT/USERGROWTH_PASSWORD。")
+            payload = run_existing_creative_units_task(
+                config,
+                existing_unit_ids,
+                progress=lambda message: print(message, flush=True),
+            )
+            print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
+            return 1 if payload.get("summary", {}).get("failed") else 0
         selectors = _video_selectors_from_args(args, manifest)
         glob_patterns = _list_value(args.video_glob) + _list_from_manifest(manifest, "video_globs")
         auto_split = _auto_split_requested(args, manifest)
@@ -151,6 +179,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--video-glob", action="append", default=[], help="Glob matched against relative path and file name.")
     parser.add_argument("--video-list", help="Text file with one selected video path/name per line.")
     parser.add_argument("--all-videos", action="store_true", help="Select all videos in video-folder.")
+    parser.add_argument(
+        "--existing-creative-unit-id",
+        action="append",
+        default=[],
+        help="只补录已有创意单元，不重新上传文件；可重复传入。",
+    )
+    parser.add_argument("--existing-creative-unit-title", help="补录批次的剧名，仅用于红果分类/日志。")
+    parser.add_argument("--existing-creative-unit-drama-type", help="补录批次剧目类型：动态漫或仿真人。")
+    parser.add_argument("--existing-creative-unit-bid", help="补录批次的 bid_剧目ID。")
     parser.add_argument("--backfill-excel", help="Backfill Excel path.")
     parser.add_argument("--song-excel", help="Song library Excel path.")
     parser.add_argument("--output-root", help="Output folder for task.json, logs, dry-run result.xlsx, and debug files.")
@@ -167,6 +204,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workflow", help="Workflow name such as soda_music or redfruit_short_drama.")
     parser.add_argument("--redfruit-default-genre", help="Default redfruit genre used when file names do not specify one.")
     parser.add_argument("--redfruit-bid-map", help="JSON string mapping drama titles to bid_... values.")
+    parser.add_argument("--redfruit-layout-override", help="Force redfruit layout label, e.g. 竖版-横改竖.")
+    parser.add_argument("--redfruit-material-mode-override", help="Force redfruit material mode, e.g. AI前贴 or 原片.")
+    parser.add_argument("--redfruit-ai-custom-tag", help="AI redfruit custom tag used for AI前贴/后贴 materials.")
+    parser.add_argument("--redfruit-extra-custom-tag", action="append", default=[], help="Extra redfruit custom tag. Can be repeated.")
     parser.add_argument("--split-by-song", action="store_true", help="Auto-split selected videos into one batch per song before running.")
     parser.add_argument("--concurrency", type=int, default=None, help="Batch concurrency. Defaults to batch count, clamped to 1..10; multi-batch runs use at least 2.")
     parser.add_argument("--account", help="UserGrowth account. Prefer USERGROWTH_ACCOUNT env var.")
@@ -174,6 +215,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-status-retries", type=int, default=None)
     parser.add_argument("--refresh-interval-seconds", type=float, default=None)
     parser.add_argument("--browser-slow-mo-ms", type=int, default=None)
+    parser.add_argument(
+        "--resume-task",
+        help="从汽水音乐或红果短剧任务目录、task.json 或 checkpoint.json 断点续跑；仅支持 --live --confirm-live。",
+    )
     return parser.parse_args(argv)
 
 
@@ -398,8 +443,11 @@ def _manifest_output_root(args: argparse.Namespace, manifest: dict[str, Any], ba
 
 
 def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_dir: Path) -> UserGrowthRunConfig:
-    video_folder = _required_path(_pick(args.video_folder, manifest, "video_folder"), base_dir, "video_folder")
     output_root = _required_path(_pick(args.output_root, manifest, "output_root"), base_dir, "output_root")
+    video_value = _pick(args.video_folder, manifest, "video_folder")
+    if video_value in (None, "") and _existing_creative_unit_ids_from_args(args, manifest):
+        video_value = str(output_root)
+    video_folder = _required_path(video_value, base_dir, "video_folder")
     workflow = normalise_workflow(_pick(args.workflow, manifest, "workflow") or "soda_music")
     backfill_value = _pick(args.backfill_excel, manifest, "backfill_excel", "order_excel")
     song_value = _pick(args.song_excel, manifest, "song_excel")
@@ -428,6 +476,33 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
         workflow=workflow,
         redfruit_default_genre=str(_pick(args.redfruit_default_genre, manifest, "redfruit_default_genre") or "").strip(),
         redfruit_bid_map=_parse_redfruit_bid_map(_pick(args.redfruit_bid_map, manifest, "redfruit_bid_map")),
+        redfruit_layout_override=str(
+            _pick(args.redfruit_layout_override, manifest, "redfruit_layout_override", "redfruit_layout")
+            or ""
+        ).strip(),
+        redfruit_material_mode_override=str(
+            _pick(
+                args.redfruit_material_mode_override,
+                manifest,
+                "redfruit_material_mode_override",
+                "redfruit_material_mode",
+            )
+            or ""
+        ).strip(),
+        redfruit_ai_custom_tag=str(
+            _pick(args.redfruit_ai_custom_tag, manifest, "redfruit_ai_custom_tag")
+            or "创意AI素材"
+        ).strip(),
+        redfruit_extra_custom_tags=_redfruit_extra_custom_tags_from_args(args, manifest),
+        existing_creative_unit_title=str(
+            _pick(args.existing_creative_unit_title, manifest, "existing_creative_unit_title") or ""
+        ).strip(),
+        existing_creative_unit_drama_type=str(
+            _pick(args.existing_creative_unit_drama_type, manifest, "existing_creative_unit_drama_type") or ""
+        ).strip(),
+        existing_creative_unit_bid=str(
+            _pick(args.existing_creative_unit_bid, manifest, "existing_creative_unit_bid") or ""
+        ).strip(),
         custom_tag_template_name=str(
             _pick(args.custom_tag_template_name, manifest, "custom_tag_template_name", "tag_template_name")
             or DEFAULT_CUSTOM_TAG_TEMPLATE_NAME
@@ -471,6 +546,15 @@ def _custom_tag_template_tags_from_args(args: argparse.Namespace, manifest: dict
     return default_custom_tag_template_tags()
 
 
+def _redfruit_extra_custom_tags_from_args(args: argparse.Namespace, manifest: dict[str, Any]) -> list[str]:
+    tags = [
+        *_list_value(args.redfruit_extra_custom_tag),
+        *_list_from_manifest(manifest, "redfruit_extra_custom_tags"),
+        *_list_from_manifest(manifest, "redfruit_extra_custom_tag"),
+    ]
+    return normalise_template_tags(tags)
+
+
 def _parse_redfruit_bid_map(value: Any) -> dict[str, str]:
     if value in (None, ""):
         return {}
@@ -503,6 +587,21 @@ def _video_selectors_from_args(args: argparse.Namespace, manifest: dict[str, Any
             list_path = Path(args.manifest).resolve().parent / list_path
         selectors.extend(_read_video_list(list_path))
     return selectors
+
+
+def _existing_creative_unit_ids_from_args(args: argparse.Namespace, manifest: dict[str, Any]) -> list[str]:
+    values = [*_list_value(getattr(args, "existing_creative_unit_id", []))]
+    values.extend(_list_from_manifest(manifest, "existing_creative_unit_ids"))
+    values.extend(_list_from_manifest(manifest, "existing_creative_unit_id"))
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for unit_id in str(value).replace("\n", ",").split(","):
+            unit_id = unit_id.strip()
+            if unit_id and unit_id not in seen:
+                seen.add(unit_id)
+                result.append(unit_id)
+    return result
 
 
 def _read_video_list(path: Path) -> list[str]:
@@ -617,6 +716,230 @@ def _dedupe_paths(paths: Iterable[Path]) -> list[Path]:
     return deduped
 
 
+def run_resumed_usergrowth_task(
+    args: argparse.Namespace,
+    resume_path: Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """从汽水音乐或红果 task.json/checkpoint 恢复订单级浏览器流程。"""
+    if not args.live or not args.confirm_live:
+        raise RuntimeError("断点续跑必须同时传 --live --confirm-live。")
+
+    task_json_path = resume_path / "task.json" if resume_path.is_dir() else resume_path
+    if task_json_path.name in {"redfruit_checkpoint.json", "soda_music_checkpoint.json", "usergrowth_checkpoint.json"}:
+        task_json_path = task_json_path.with_name("task.json")
+    if not task_json_path.is_file():
+        raise RuntimeError(f"未找到断点任务文件：{task_json_path}")
+    saved_payload = json.loads(task_json_path.read_text(encoding="utf-8"))
+    if not isinstance(saved_payload, dict):
+        raise RuntimeError("断点 task.json 不是 JSON object。")
+    saved_config = saved_payload.get("config") or {}
+    workflow = normalise_workflow(saved_config.get("workflow") or "soda_music")
+    if workflow not in {"soda_music", "redfruit_short_drama"}:
+        raise RuntimeError(f"--resume-task 不支持 workflow={workflow}。")
+    redfruit_workflow = is_redfruit_workflow(workflow)
+
+    task_root = Path(str(saved_payload.get("task_root") or task_json_path.parent)).resolve()
+    selected_values = saved_payload.get("selected_videos") or saved_config.get("selected_videos") or []
+    video_paths = [Path(str(value)).resolve() for value in selected_values if str(value).strip()]
+    missing = [str(path) for path in video_paths if not path.is_file()]
+    if missing:
+        raise RuntimeError("断点续跑找不到原始视频：" + "；".join(missing))
+
+    saved_plans = {
+        str(plan.get("order_id") or "").strip(): plan
+        for plan in (saved_payload.get("plans") or [])
+        if isinstance(plan, dict) and str(plan.get("order_id") or "").strip()
+    }
+    first_saved_item = None
+    for saved_plan in saved_plans.values():
+        saved_items = saved_plan.get("items") or []
+        if saved_items:
+            first_saved_item = saved_items[0]
+            break
+    first_metadata = (first_saved_item or {}).get("workflow_metadata") or {}
+
+    def saved_list(key: str, fallback_key: str = "") -> list[str]:
+        value = saved_config.get(key)
+        if not value and fallback_key:
+            value = first_metadata.get(fallback_key)
+        return [str(item).strip() for item in (value or []) if str(item).strip()]
+
+    account = _pick(args.account, {}, "account") or os.environ.get("USERGROWTH_ACCOUNT", "")
+    password = _pick(args.password, {}, "password") or os.environ.get("USERGROWTH_PASSWORD", "")
+    if not account or not password:
+        raise RuntimeError("断点续跑需要账号密码。可用 --account/--password 或 USERGROWTH_ACCOUNT/USERGROWTH_PASSWORD。")
+
+    saved_backfill = str(saved_config.get("backfill_excel") or "").strip()
+    saved_song_excel = str(saved_config.get("song_excel") or "").strip()
+    if redfruit_workflow:
+        order_excel = None
+        song_excel = None
+    else:
+        if not saved_backfill or not saved_song_excel:
+            raise RuntimeError("汽水音乐断点续跑缺少 backfill_excel 或 song_excel 配置。")
+        order_excel = Path(saved_backfill).resolve()
+        song_excel = Path(saved_song_excel).resolve()
+
+    config = UserGrowthRunConfig(
+        video_folder=Path(str(saved_config.get("video_folder") or video_paths[0].parent)).resolve(),
+        order_excel=order_excel,
+        song_excel=song_excel,
+        output_root=Path(str(saved_config.get("output_root") or task_root.parent)).resolve(),
+        account=account,
+        password=password,
+        order_id=str(saved_config.get("order_id") or next(iter(saved_plans), "")).strip(),
+        task_name=str(saved_config.get("task_name") or task_root.name).strip(),
+        batch_name=str(saved_config.get("batch_name") or "").strip(),
+        selected_video_paths=video_paths,
+        workflow=workflow,
+        delivery_products=saved_list("delivery_products", "delivery_products"),
+        delivery_platforms=saved_list("delivery_platforms", "delivery_platforms"),
+        delivery_platform_all=saved_config.get("delivery_platform_all"),
+        arlp_products=saved_list("arlp_products", "arlp_products"),
+        arlp_platforms=saved_list("arlp_platforms", "arlp_platforms"),
+        arlp_platform_all=saved_config.get("arlp_platform_all"),
+        redfruit_default_genre=str(saved_config.get("redfruit_default_genre") or "").strip(),
+        redfruit_bid_map=dict(saved_config.get("redfruit_bid_map") or {}),
+        redfruit_layout_override=str(saved_config.get("redfruit_layout_override") or "").strip(),
+        redfruit_material_mode_override=str(saved_config.get("redfruit_material_mode_override") or "").strip(),
+        redfruit_ai_custom_tag=str(saved_config.get("redfruit_ai_custom_tag") or "创意AI素材").strip(),
+        redfruit_extra_custom_tags=[str(item) for item in (saved_config.get("redfruit_extra_custom_tags") or [])],
+        custom_tag_template_name=str(saved_config.get("custom_tag_template_name") or DEFAULT_CUSTOM_TAG_TEMPLATE_NAME),
+        custom_tag_template_tags=[str(item) for item in (saved_config.get("custom_tag_template_tags") or [])],
+        month_tag=str(saved_config.get("month_tag") or ""),
+        recursive=bool(saved_config.get("recursive", True)),
+        dry_run=False,
+        headless=bool(args.headless or saved_config.get("headless", False)),
+        max_status_retries=int(_pick(args.max_status_retries, saved_config, "max_status_retries") or 3),
+        refresh_interval_seconds=float(_pick(args.refresh_interval_seconds, saved_config, "refresh_interval_seconds") or 12.0),
+        browser_slow_mo_ms=int(_pick(args.browser_slow_mo_ms, saved_config, "browser_slow_mo_ms") or 600),
+    )
+
+    plans, items = build_selected_usergrowth_plan(config, video_paths)
+    if not plans:
+        raise RuntimeError("断点续跑未重建出红果订单计划。")
+    for plan in plans:
+        saved_plan = saved_plans.get(plan.order_id) or {}
+        plan.task_id = str(saved_plan.get("task_id") or "")
+        plan.upload_task_id = str(saved_plan.get("upload_task_id") or plan.task_id)
+        plan.review_task_id = str(saved_plan.get("review_task_id") or "")
+        plan.arlp_task_id = str(saved_plan.get("arlp_task_id") or "")
+        plan.classification_task_id = str(saved_plan.get("classification_task_id") or "")
+        plan.stage = str(saved_plan.get("stage") or "pending")
+        plan.message = str(saved_plan.get("message") or "")
+        plan.checkpoint_message = str(saved_plan.get("checkpoint_message") or "")
+        if plan.stage in {"completed", "cid_backfilled_unreviewed"}:
+            plan.status = "success"
+        saved_items = {
+            str(item.get("file_name") or ""): item
+            for item in (saved_plan.get("items") or [])
+            if isinstance(item, dict)
+        }
+        for item in plan.items:
+            saved_item = saved_items.get(item.file_name) or {}
+            item.cid = str(saved_item.get("cid") or "")
+            item.cid_material_type = str(saved_item.get("cid_material_type") or "")
+            saved_metadata = saved_item.get("workflow_metadata")
+            if isinstance(saved_metadata, dict):
+                item.workflow_metadata = dict(saved_metadata)
+            saved_status = str(saved_item.get("status") or "").strip()
+            if saved_status in {"deferred_existing_creative_unit", "success", "skipped"}:
+                item.status = saved_status
+            if plan.stage in {"completed", "cid_backfilled_unreviewed"}:
+                item.status = "success"
+            if saved_item.get("message"):
+                item.message = str(saved_item["message"])
+
+    task_id = str(saved_payload.get("task_id") or task_root.name.split("_", 1)[0])
+    debug_dir = task_root / "debug"
+    duplicate_song_excel = task_root / "duplicate_songs.xlsx"
+    result_excel: Path | None = config.order_excel if not redfruit_workflow else None
+
+    def write_order_backfill(plan: UserGrowthOrderPlan) -> None:
+        if redfruit_workflow or not config.order_excel:
+            return
+        with _backfill_lock(config.order_excel):
+            write_back_results(config.order_excel, config.order_excel, plan.items, include_ready=False)
+        _emit(progress, f"订单 {plan.order_id} 已写回回填 Excel")
+
+    def persist_checkpoint() -> None:
+        payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
+        payload["selected_videos"] = [str(path) for path in video_paths]
+        payload["checkpoint_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _atomic_write_json(task_root / "task.json", payload)
+        checkpoint_payload = {
+            "version": 1,
+            "workflow": workflow,
+            "task_id": task_id,
+            "task_root": str(task_root),
+            "updated_at": payload["checkpoint_updated_at"],
+            "orders": {
+                plan.order_id: {
+                    "order_id": plan.order_id,
+                    "stage": plan.stage,
+                    "status": plan.status,
+                    "message": plan.message,
+                    "checkpoint_message": plan.checkpoint_message,
+                    "upload_task_id": plan.upload_task_id or plan.task_id,
+                    "review_task_id": plan.review_task_id,
+                    "arlp_task_id": plan.arlp_task_id,
+                    "classification_task_id": plan.classification_task_id,
+                    "items": {
+                        item.file_name: {
+                            "status": item.status,
+                            "message": item.message,
+                            "cid": item.cid,
+                            "cid_material_type": item.cid_material_type,
+                            "workflow_metadata": dict(item.workflow_metadata or {}),
+                        }
+                        for item in plan.items
+                    },
+                }
+                for plan in plans
+            },
+        }
+        checkpoint_name = "redfruit_checkpoint.json" if redfruit_workflow else "soda_music_checkpoint.json"
+        _atomic_write_json(task_root / checkpoint_name, checkpoint_payload)
+        _write_log(task_root, payload)
+
+    if all(plan.stage in {"completed", "cid_backfilled_unreviewed"} for plan in plans):
+        _emit(progress, f"断点任务已完成：{task_root}")
+        return saved_payload
+
+    try:
+        persist_checkpoint()
+        browser = UserGrowthBrowserClient(
+            config.account,
+            config.password,
+            headless=config.headless,
+            debug_dir=debug_dir,
+            refresh_interval_seconds=config.refresh_interval_seconds,
+            max_status_retries=config.max_status_retries,
+            browser_slow_mo_ms=config.browser_slow_mo_ms,
+            order_complete=write_order_backfill if not redfruit_workflow else None,
+            checkpoint_callback=lambda _plan: persist_checkpoint(),
+        )
+        asyncio.run(browser.run([plan for plan in plans if plan.status != "skipped"], progress))
+        payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
+        payload["selected_videos"] = [str(path) for path in video_paths]
+        _atomic_write_json(task_root / "task.json", payload)
+        persist_checkpoint()
+        return payload
+    except BaseException as exc:
+        try:
+            persist_checkpoint()
+        except Exception:
+            pass
+        _write_task_error(task_root, config, video_paths, exc)
+        setattr(exc, "_usergrowth_task_root", str(task_root))
+        raise
+
+
+# Backward-compatible import name for callers that used the redfruit-only helper.
+run_resumed_redfruit_task = run_resumed_usergrowth_task
+
+
 def run_selected_usergrowth_task(
     config: UserGrowthRunConfig,
     video_paths: list[Path],
@@ -629,6 +952,60 @@ def run_selected_usergrowth_task(
     duplicate_song_excel = task_root / "duplicate_songs.xlsx"
     task_root.mkdir(parents=True, exist_ok=True)
     supports_backfill = bool(config.order_excel) and not is_redfruit_workflow(config.workflow)
+    plans: list[UserGrowthOrderPlan] = []
+    items: list[UserGrowthVideoItem] = []
+    result_excel: Path | None = None
+
+    def persist_workflow_checkpoint() -> None:
+        """实时写入汽水或红果任务快照，进程中断后仍保留最近一个可恢复节点。"""
+        if config.dry_run or not plans:
+            return
+        payload = _build_payload(
+            config,
+            task_id,
+            task_root,
+            plans,
+            items,
+            result_excel,
+            duplicate_song_excel,
+        )
+        payload["selected_videos"] = [str(path) for path in video_paths]
+        payload["checkpoint_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _atomic_write_json(task_root / "task.json", payload)
+        checkpoint_payload = {
+            "version": 1,
+            "workflow": config.workflow,
+            "task_id": task_id,
+            "task_root": str(task_root),
+            "updated_at": payload["checkpoint_updated_at"],
+            "orders": {
+                plan.order_id: {
+                    "order_id": plan.order_id,
+                    "stage": plan.stage,
+                    "status": plan.status,
+                    "message": plan.message,
+                    "checkpoint_message": plan.checkpoint_message,
+                    "upload_task_id": plan.upload_task_id or plan.task_id,
+                    "review_task_id": plan.review_task_id,
+                    "arlp_task_id": plan.arlp_task_id,
+                    "classification_task_id": plan.classification_task_id,
+                    "items": {
+                        item.file_name: {
+                            "status": item.status,
+                            "message": item.message,
+                            "cid": item.cid,
+                            "cid_material_type": item.cid_material_type,
+                            "workflow_metadata": dict(item.workflow_metadata or {}),
+                        }
+                        for item in plan.items
+                    },
+                }
+                for plan in plans
+            },
+        }
+        checkpoint_name = "redfruit_checkpoint.json" if is_redfruit_workflow(config.workflow) else "soda_music_checkpoint.json"
+        _atomic_write_json(task_root / checkpoint_name, checkpoint_payload)
+        _write_log(task_root, payload)
 
     try:
         _emit(progress, f"已选中 {len(video_paths)} 个视频，开始读取歌曲库和回填模板")
@@ -644,6 +1021,7 @@ def run_selected_usergrowth_task(
         skipped_count = sum(1 for item in items if item.status == "skipped")
         _emit(progress, f"预检完成：待上传 {ready_count} 个，跳过 {skipped_count} 个")
         _emit_song_match_logs(progress, items)
+        persist_workflow_checkpoint()
 
         if config.dry_run:
             for item in items:
@@ -676,6 +1054,7 @@ def run_selected_usergrowth_task(
                 max_status_retries=config.max_status_retries,
                 browser_slow_mo_ms=config.browser_slow_mo_ms,
                 order_complete=write_order_backfill if supports_backfill else None,
+                checkpoint_callback=lambda _plan: persist_workflow_checkpoint(),
             )
             asyncio.run(browser.run(active_plans, progress))
             result_excel = config.order_excel if supports_backfill else None
@@ -686,11 +1065,100 @@ def run_selected_usergrowth_task(
 
         payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
         payload["selected_videos"] = [str(path) for path in video_paths]
+        _atomic_write_json(task_root / "task.json", payload)
+        persist_workflow_checkpoint()
+        _write_log(task_root, payload)
+        return payload
+    except BaseException as exc:
+        try:
+            persist_workflow_checkpoint()
+        except Exception:
+            pass
+        _write_task_error(task_root, config, video_paths, exc)
+        try:
+            setattr(exc, "_usergrowth_task_root", str(task_root))
+        except Exception:
+            pass
+        raise
+
+
+def run_existing_creative_units_task(
+    config: UserGrowthRunConfig,
+    unit_ids: list[str],
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """执行只补录已有创意单元的红果短剧任务。"""
+    task_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_task_name = _safe_name(config.task_name or "usergrowth_existing_creative_units")
+    task_root = config.output_root / f"{task_id}_{safe_task_name}"
+    debug_dir = task_root / "debug"
+    task_root.mkdir(parents=True, exist_ok=True)
+    unit_ids = list(dict.fromkeys(str(unit_id).strip() for unit_id in unit_ids if str(unit_id).strip()))
+    if not unit_ids:
+        raise RuntimeError("没有提供可补录的创意单元 ID。")
+    if not is_redfruit_workflow(config.workflow):
+        raise RuntimeError("已有创意单元直补入口目前只支持红果短剧流程。")
+    if not config.order_id.strip():
+        raise RuntimeError("补录已有创意单元需要订单 ID。")
+
+    drama_title = config.existing_creative_unit_title or "补录批次"
+    drama_type = config.existing_creative_unit_drama_type or "动态漫"
+    bid = config.existing_creative_unit_bid or ""
+    synthetic_name = (
+        f"dxzc-{drama_type}-{drama_title}-0806-无剧名-六部-补录-原创AI前贴-{bid}.mp4"
+    )
+    metadata = build_redfruit_metadata(
+        Path(synthetic_name),
+        default_genre=config.redfruit_default_genre or "古风言情",
+        bid_map=config.redfruit_bid_map,
+        layout_override=config.redfruit_layout_override or "竖版-纯竖版",
+        material_mode_override=config.redfruit_material_mode_override or "AI前/后贴",
+        ai_custom_tag=config.redfruit_ai_custom_tag or "创新AI素材",
+        extra_custom_tags=config.redfruit_extra_custom_tags,
+    )
+    items: list[UserGrowthVideoItem] = []
+    for unit_id in unit_ids:
+        items.append(
+            UserGrowthVideoItem(
+                path=Path(unit_id),
+                file_name=unit_id,
+                material_type="红果短剧补录",
+                song_name=metadata.get("drama_title", "补录批次"),
+                workflow="redfruit_short_drama",
+                order_id=config.order_id.strip(),
+                custom_tags=list(metadata.get("custom_tags") or []),
+                classification_path=list(metadata.get("genre_path") or []),
+                classification_paths=list(metadata.get("classification_paths") or []),
+                post_review_classification_paths=list(metadata.get("post_review_classification_paths") or []),
+                workflow_metadata={
+                    **metadata,
+                    "existing_creative_unit_id": unit_id,
+                    "direct_existing_unit_recovery": True,
+                },
+            )
+        )
+    plan = UserGrowthOrderPlan(order_id=config.order_id.strip(), items=items)
+
+    try:
+        _emit(progress, f"准备补录已有创意单元：{len(items)} 个，订单 {plan.order_id}")
+        browser = UserGrowthBrowserClient(
+            config.account,
+            config.password,
+            headless=config.headless,
+            debug_dir=debug_dir,
+            refresh_interval_seconds=config.refresh_interval_seconds,
+            max_status_retries=config.max_status_retries,
+            browser_slow_mo_ms=config.browser_slow_mo_ms,
+        )
+        asyncio.run(browser.run_existing_creative_units(plan, progress))
+        payload = _build_payload(config, task_id, task_root, [plan], items, None, None)
+        payload["mode"] = "existing_creative_unit_recovery"
+        payload["existing_creative_unit_ids"] = unit_ids
         (task_root / "task.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         _write_log(task_root, payload)
         return payload
     except BaseException as exc:
-        _write_task_error(task_root, config, video_paths, exc)
+        _write_task_error(task_root, config, [Path(unit_id) for unit_id in unit_ids], exc)
         try:
             setattr(exc, "_usergrowth_task_root", str(task_root))
         except Exception:
@@ -994,9 +1462,24 @@ def _safe_config_dict(config: UserGrowthRunConfig) -> dict[str, Any]:
         "headless": config.headless,
         "redfruit_default_genre": config.redfruit_default_genre,
         "redfruit_bid_map": dict(config.redfruit_bid_map),
+        "redfruit_layout_override": config.redfruit_layout_override,
+        "redfruit_material_mode_override": config.redfruit_material_mode_override,
+        "redfruit_ai_custom_tag": config.redfruit_ai_custom_tag,
+        "redfruit_extra_custom_tags": list(config.redfruit_extra_custom_tags),
+        "existing_creative_unit_title": config.existing_creative_unit_title,
+        "existing_creative_unit_drama_type": config.existing_creative_unit_drama_type,
+        "existing_creative_unit_bid": config.existing_creative_unit_bid,
         "refresh_interval_seconds": config.refresh_interval_seconds,
         "browser_slow_mo_ms": config.browser_slow_mo_ms,
     }
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """用同目录临时文件替换 JSON，避免中断留下半个 checkpoint。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_path, path)
 
 
 def _configure_stdio() -> None:
