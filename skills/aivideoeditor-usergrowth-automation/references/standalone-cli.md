@@ -36,6 +36,22 @@ Dry-run writes `<output-root>/<timestamp>_<task-name>/result.xlsx`, `task.json`,
 
 On failure after a task folder is created, read `<output-root>/<timestamp>_<task-name>/error.json` and `error.log`. On early CLI failures such as unmatched video selectors, check stderr and `<output-root>/_cli_errors/` when `output_root` was available.
 
+## Resume
+
+Live Soda Music and Redfruit runs write `task.json` plus a workflow checkpoint incrementally (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`). The checkpoint is per order, so concurrent batches do not overwrite each other. Soda stages include `pending`, `upload_processing`, `upload_task_created`, `upload_success`, `review_submitted`, `cid_backfilling`, `cid_backfilled_unreviewed`, and `completed`; Redfruit adds its ARLP/classification stages. During `upload_processing`, each duplicate-upload recovery and row-scoped `点击重试` action is persisted, so a resume does not blindly repeat already-handled upload rows.
+
+After an interruption, resume from the task folder, `task.json`, or `redfruit_checkpoint.json`:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\usergrowth_upload.py `
+  --resume-task "D:\path\to\task-folder" `
+  --live --confirm-live `
+  --account "$env:USERGROWTH_ACCOUNT" `
+  --password "$env:USERGROWTH_PASSWORD"
+```
+
+Resume supports `soda_music` and `redfruit_short_drama`. Credentials are read again from CLI arguments or environment variables and are never stored in the checkpoint. A `completed` or `cid_backfilled_unreviewed` checkpoint returns the saved result without opening a browser; earlier stages are resumed from their saved task IDs and item metadata.
+
 ## Selectors
 
 Video selection supports:

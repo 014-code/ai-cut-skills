@@ -41,7 +41,8 @@ The simulation rule is:
 
 - apply `subtitle_mask` to every keyword hit
 - apply `audio_mute` to every `subtitle_mask` hit
-- keep the audio mute span aligned to the subtitle segment unless finer timestamps are provided
+- derive audio mute spans from the exact masked character range inside each rendered subtitle; do not mute the full subtitle line or raw transcript segment
+- map `char_start` / `char_end` proportionally into the OCR-visible subtitle time window, with only a small audio safety pad; use finer word timestamps when provided
 - prefer word-level timing when the transcript includes `words`, `tokens`, or `frontend.words`
 - keep every keyword occurrence by span; do not dedupe repeated hits just because the keyword text is the same
 - keep a small subtitle pre-roll so the first visible frame is covered immediately

@@ -37,6 +37,7 @@ FALLBACK_SUBTITLE_LINE_BBOX = [0.22, 0.80, 0.78, 0.91]
 KEYWORD_BOX_MIN_WIDTH = 0.018
 KEYWORD_BOX_MIN_HEIGHT = 0.035
 SUBTITLE_TIME_PAD_SECONDS = 0.24
+KEYWORD_AUDIO_PAD_SECONDS = 0.04
 FULL_VIDEO_OCR_INTERVAL_SECONDS = 0.30
 FULL_VIDEO_OCR_MAX_SECONDS = 6 * 60 * 60
 
@@ -795,31 +796,48 @@ def locate_subtitle_hit_keyframes(
 
 
 def build_synchronized_audio_mutes(
-    plan: Dict[str, Any],
     subtitle_redactions: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Ensure every emitted subtitle mask is covered by an audio mute interval."""
+    """Mute only the audio span corresponding to each masked keyword character range."""
     candidates: List[Dict[str, Any]] = []
-    reason = "subtitle hit requires synchronized audio mute from business policy"
-    for item in plan.get("audio_mutes") or []:
-        candidates.append(
-            {
-                "start_time": item.get("start_time"),
-                "end_time": item.get("end_time"),
-                "keywords": sorted(item.get("keywords") or []),
-                "reason": reason,
-            }
-        )
+    reason = "rendered subtitle hit requires synchronized audio mute from business policy"
     for item in subtitle_redactions:
+        start_time, end_time, timing = keyword_audio_window(item)
         candidates.append(
             {
-                "start_time": item.get("start_time"),
-                "end_time": item.get("end_time"),
+                "start_time": start_time,
+                "end_time": end_time,
                 "keywords": sorted(item.get("keywords") or []),
                 "reason": reason,
+                "timing": timing,
             }
         )
     return MASK_MOD.merge_audio_mutes(candidates)
+
+
+def keyword_audio_window(item: Dict[str, Any]) -> Tuple[float, float, str]:
+    """Map the masked characters into a proportional subtitle/audio time span."""
+    segment_start = float(item.get("start_time", 0.0) or 0.0)
+    segment_end = float(item.get("end_time", segment_start) or segment_start)
+    if segment_end < segment_start:
+        segment_start, segment_end = segment_end, segment_start
+    source_text = str(item.get("source_text") or "")
+    char_start = item.get("char_start")
+    char_end = item.get("char_end")
+    try:
+        char_start = int(char_start)
+        char_end = int(char_end)
+    except (TypeError, ValueError):
+        char_start = -1
+        char_end = -1
+    if source_text and 0 <= char_start < char_end <= len(source_text) and segment_end > segment_start + 0.001:
+        duration = segment_end - segment_start
+        start = segment_start + duration * (char_start / len(source_text))
+        end = segment_start + duration * (char_end / len(source_text))
+        start = max(segment_start, start - KEYWORD_AUDIO_PAD_SECONDS)
+        end = min(segment_end, max(start + 0.04, end + KEYWORD_AUDIO_PAD_SECONDS))
+        return round(start, 3), round(end, 3), "proportional_keyword_character_span"
+    return round(segment_start, 3), round(segment_end, 3), "subtitle_window_fallback_missing_character_span"
 
 
 def subtitle_audio_sync_check(redactions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -827,8 +845,7 @@ def subtitle_audio_sync_check(redactions: Sequence[Dict[str, Any]]) -> Dict[str,
     audio_mutes = [item for item in redactions if item.get("type") == "audio_mute"]
     uncovered: List[Dict[str, Any]] = []
     for subtitle in subtitles:
-        start_time = float(subtitle.get("start_time", 0.0) or 0.0)
-        end_time = float(subtitle.get("end_time", start_time) or start_time)
+        start_time, end_time, timing = keyword_audio_window(subtitle)
         covered = any(
             float(audio.get("start_time", 0.0) or 0.0) <= start_time + 0.001
             and float(audio.get("end_time", 0.0) or 0.0) >= end_time - 0.001
@@ -840,6 +857,7 @@ def subtitle_audio_sync_check(redactions: Sequence[Dict[str, Any]]) -> Dict[str,
                     "start_time": round(start_time, 3),
                     "end_time": round(end_time, 3),
                     "keywords": sorted(subtitle.get("keywords") or []),
+                    "timing": timing,
                 }
             )
     return {
@@ -1145,14 +1163,14 @@ def build_redactions(video: Path, plan: Dict[str, Any], fallback_subtitle_bbox: 
         )
     capture.release()
     subtitle_redactions = [item for item in redactions if item.get("type") == "subtitle_replace"]
-    for item in build_synchronized_audio_mutes(plan, subtitle_redactions):
+    for item in build_synchronized_audio_mutes(subtitle_redactions):
         redactions.append(
             {
                 "type": "audio_mute",
                 "category": "subtitle_keyword",
                 "start_time": item["start_time"],
                 "end_time": item["end_time"],
-                "reason": item.get("reason") or "subtitle hit requires synchronized audio mute from business policy",
+                "reason": item.get("reason") or "rendered subtitle hit requires synchronized audio mute from business policy",
                 "keywords": sorted(item.get("keywords") or []),
                 "source": "keyword_policy",
             }

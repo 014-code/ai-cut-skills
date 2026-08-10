@@ -22,9 +22,16 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - Hard kill, power loss, or process termination
   Only logs flushed before termination will exist. Check the latest task folder under `output_root`, then `error.*`, `task.json`, `run.log`, and `debug/` in that order.
 
+- Redfruit process interruption
+  Read `redfruit_checkpoint.json` first. `orders.<order_id>.stage` identifies the resume point and the saved task IDs identify the platform task to query. `task.json` contains the same stage and material snapshot; `run.log` contains checkpoint transitions; `debug/run.log` contains browser/network recovery details. Resume with `--resume-task` as documented in `references/standalone-cli.md`. A `completed` checkpoint does not open a browser again.
+
+- Network interruption, blank page, or browser target unexpectedly closed
+  Do not treat the browser window disappearing as a normal business failure until recovery has been exhausted: the runner is designed to keep waiting indefinitely. Read `debug/run.log` and search for `network wait`, `network recovery wait`, `network recovered`, `网络仍未恢复`, and `网络已恢复`. The backoff starts at 2 seconds and is capped at 30 seconds. Navigation failures and target-closed errors are retried without intentionally closing the browser; if the browser process disconnected, the runner relaunches it, logs in again, and resumes the current order loop. Only a user cancellation intentionally closes the browser.
+
 ## File Meanings
 
 - `task.json`: final structured result when the task reaches normal completion; contains config, summary, selected videos, plans and item statuses.
+- `soda_music_checkpoint.json` / `redfruit_checkpoint.json`: workflow checkpoint with per-order stage, task IDs, material CID/status, row-scoped retry metadata, and duplicate-recovery metadata such as `existing_creative_unit_id`; inspect the matching file first after interruption. If the stage is `upload_processing`, inspect item metadata before resuming: handled retry rows and deferred duplicate files are not blindly re-uploaded.
 - `run.log`: final human-readable summary when the task reaches normal completion.
 - `error.json`: structured failure record for task-level exceptions.
 - `error.log`: human-readable failure record and traceback.

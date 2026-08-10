@@ -817,7 +817,11 @@ def select_rank_entry(entries: list[dict[str, Any]], drama_name: str | None) -> 
 
 def is_video_url(url: str) -> bool:
     lower = url.lower()
-    return (".mp4" in lower or ".m3u8" in lower) and "adxvideo" in lower
+    # AdXRay currently serves playable material from both the legacy
+    # adxvideo host and the newer adx-game-material host.
+    return (".mp4" in lower or ".m3u8" in lower) and (
+        "adxvideo" in lower or "adx-game-material" in lower
+    )
 
 
 def absolute_url(url: str, *, base_url: str) -> str:

@@ -25,7 +25,7 @@ This skill intentionally excludes PyInstaller/exe packaging and release tasks un
 - Running the standalone tool, selecting exact videos, manifests, dependency setup: read `references/standalone-cli.md`.
 - Workflow, task outputs, batch behavior, dry-run/live split: read `references/workflow.md`.
 - Excel backfill, CID, song-name column, song library, duplicate/blocked songs: read `references/excel-contract.md`.
-- Browser upload, login, order search, 录入变色龙, review, CID scraping, redfruit ARLP completion/retry, and post-review classification completion/retry: read `references/browser-flow.md`.
+- Browser upload, login, order search, 录入变色龙, review, CID scraping, Soda/Redfruit retry and checkpoint recovery, redfruit ARLP completion/retry, and post-review classification completion/retry: read `references/browser-flow.md`.
 - Errors, flaky selectors, missing dependencies, locked Excel, debug screenshots/logs: read `references/failure-playbook.md`.
 - Test selection and verification expectations: read `references/validation.md`.
 
@@ -37,7 +37,7 @@ Primary CLI:
 python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\usergrowth_upload.py --help
 ```
 
-The CLI supports `--video`, `--video-glob`, `--video-list`, `--all-videos`, `--split-by-song`, direct existing-creative-unit recovery with repeated `--existing-creative-unit-id`, single-run JSON manifests, and multi-batch manifests with top-level `batches` plus `--concurrency`. It fails when a requested selector does not match any video.
+The CLI supports `--video`, `--video-glob`, `--video-list`, `--all-videos`, `--split-by-song`, direct existing-creative-unit recovery with repeated `--existing-creative-unit-id`, Soda/Redfruit `--resume-task`, single-run JSON manifests, and multi-batch manifests with top-level `batches` plus `--concurrency`. It fails when a requested selector does not match any video.
 
 ## Safety Rules
 

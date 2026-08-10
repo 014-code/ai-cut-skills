@@ -4,7 +4,13 @@
 
 `UserGrowthBrowserClient.run` lazily imports Playwright. Missing Playwright raises `需要先安装 playwright，并执行 playwright install chromium`. The client launches Chromium with local browser channels in this order: `msedge`, then `chrome`. Viewport is `1440x1000`; slow motion is controlled by `browser_slow_mo_ms` and `USERGROWTH_OPERATION_SPEED_FACTOR`.
 
-Login uses `https://usergrowth.com.cn/open/login`, then navigates/checks `https://usergrowth.com.cn/home`. Captcha recognition uses `UserGrowthCaptchaSolver` and `ddddocr`. Login retries up to 5 times and considers `/home`, `墨攻AI`, or `采购中心` as logged-in signals. After login, image/font/favicon requests are blocked.
+Login uses `https://usergrowth.com.cn/open/login`, then navigates/checks `https://usergrowth.com.cn/home`. Captcha recognition uses `UserGrowthCaptchaSolver` and `ddddocr`. The credential/captcha validation itself still has five business attempts, but navigation/network failures are outside that limit: the browser remains open and waits with exponential backoff until the network or page session recovers. The client considers `/home`, `墨攻AI`, or `采购中心` as logged-in signals. After login, image/font/favicon requests are blocked.
+
+## Network And Browser-Session Recovery
+
+Network/navigation failures such as `ERR_CONNECTION_CLOSED`, `ERR_CONNECTION_RESET`, `ERR_CONNECTION_REFUSED`, `ERR_TIMED_OUT`, `ERR_NETWORK_CHANGED`, `ERR_INTERNET_DISCONNECTED`, `ERR_NAME_NOT_RESOLVED`, proxy failures, and navigation timeouts are treated as temporary. The runner writes `network wait`, `network recovery wait`, and `network recovered` records to `debug/run.log` and keeps waiting with exponential backoff capped at 30 seconds. It does not close the browser because a page is blank, an API is slow, or a navigation failed.
+
+If Playwright reports that the page/context/browser target was closed unexpectedly, the runner waits for recovery and attempts to create a page again. If the browser process itself is disconnected, it relaunches the browser, logs in again, and resumes the current order loop. The only normal path that intentionally closes the browser is a user cancellation; the final cleanup also runs after normal completion or a non-recoverable business failure.
 
 ## Per-Order Flow
 
@@ -28,9 +34,9 @@ Login uses `https://usergrowth.com.cn/open/login`, then navigates/checks `https:
 
 Upload-card recovery is row-scoped. The browser first waits for a concrete failed upload row, then reads that row's visible text or red-exclamation tooltip. It must not click a page-level `点击重试` or sweep arbitrary icons/buttons.
 
-If a single uploaded row turns red with `上传检测失败：该文件曾经被上传...`, the browser first deletes that failed row, records its `creative_unit_id`, and removes it from the current batch. After the normal rows finish, it returns to `工单管理 -> 创意单元`, searches those `creative_unit_id` values with commas, and clicks `录入素材` for the reused creative units. If the platform says it is already recorded, the run skips the follow-up entry step.
+If a single uploaded row turns red with `上传检测失败：该文件曾经被上传...`, the browser first deletes that failed row, records its `creative_unit_id`, and removes it from the current batch. After the normal rows finish, it returns to `工单管理 -> 创意单元`, searches those `creative_unit_id` values with commas, and clicks `录入素材` for the reused creative units. If the platform says it is already recorded, the run skips the follow-up entry step. This recovery and its row metadata are checkpointed for both Soda Music and Redfruit.
 
-If the failed row itself exposes `点击重试`, the browser clicks only that row's retry action once. If the same row still fails after retry, or the reason is another upload failure, the run stops with the row-level reason and writes debug snapshots.
+If the failed row itself exposes `点击重试`, the browser clicks only that row's retry action once and checkpoints the row-scoped action for both workflows. If the same row still fails after retry, or the reason is another upload failure, the run stops with the row-level reason and writes debug snapshots.
 
 The CLI also supports direct redfruit recovery when the original creative-unit IDs are already known. It reuses the same row-scoped search and cross-page selection logic without creating an upload page or re-uploading files.
 
@@ -72,19 +78,25 @@ Default form choices:
 
 If task status keeps refreshing for a long time without reaching `全部成功`, the browser can first open `查看详情`, read CIDs, write them back to Excel, and mark the row note as `未送审`. This is a backup path, not the normal success path.
 
+## Workflow Checkpoints
+
+Both workflows write stage transitions, task IDs, item statuses, CID values, CID material types, and workflow metadata to the task folder. Soda resume covers upload processing, upload task completion, review submission, CID backfill, and the explicit `未送审` CID-backup terminal state. Network/navigation failures remain recoverable and do not clear these checkpoints.
+
 ## Redfruit ARLP Completion
+
+Redfruit orders are checkpointed independently of the browser session. The browser records the current order stage, upload task ID, review task ID, ARLP task ID, classification task ID, and per-material CID/status before continuing. The `upload_processing` stage is written before upload begins and after each duplicate-upload recovery, including the original creative-unit ID, material ID, failure reason, and deferred status. A browser or network interruption can therefore resume from the saved stage without re-uploading files whose original creative units were already recovered. The CLI resume entry is documented in `references/standalone-cli.md`.
 
 After a redfruit review, the browser opens `素材/文案列表查看`, clicks one material card to enter selection mode, then uses `全选 -> 全选所有` before `编辑 -> 增加ARLP`.
 
 The ARLP submission creates a separate operation task. The browser opens `查看任务详情` and reads the task row's `总任务数`, `执行成功数量`, and `执行失败数量` instead of treating the creation-success dialog as the final result:
 
-- When `执行成功数量 == 总任务数`, ARLP is complete and the workflow continues to `修改分类标签`.
+- When the selection counter equals the batch material count, the operation task `总任务数` must also equal that same batch count, with `执行成功数量 == 总任务数` and `执行失败数量 == 0`; only then is ARLP complete and the workflow continues to `修改分类标签`. A `20/20` task cannot finish a 32-material batch.
 - When the task reaches a terminal partial result, the browser logs the task ID and counts, closes the result dialog, refreshes the material list, clears the old selection, and repeats `点第一张素材 -> 全选所有 -> 增加ARLP`.
 - The retry loop has no artificial attempt limit. It keeps refreshing and retrying until all selected materials are reported successful or the user cancels the run.
 
 Typical progress messages are `ARLP 第 N 轮结果：任务 <id>，成功 X/Y，失败 Z`, `ARLP 部分成功...重新增加 ARLP`, and `ARLP 全部成功...`. The task and browser diagnostics continue to be written to the normal `run.log` and `debug/` artifacts.
 
-After ARLP is fully successful, the browser runs `编辑 -> 修改分类标签` for the same complete material selection. Saving the classification edit also creates an operation task, so the browser does not treat the save dialog as completion: it opens `查看任务详情`, reads the same total/success/failure counters, and waits until every material is successful. A partial result closes the result dialog, refreshes the material list, clears the previous selection, and repeats `点第一张素材 -> 全选所有 -> 编辑 -> 修改分类标签`; this has no artificial retry limit. Typical messages are `修改分类标签第 N 轮结果...`, `修改分类标签部分成功...重新补改遗漏素材`, and `修改分类标签全部成功...`.
+After ARLP is fully successful, the browser runs `编辑 -> 修改分类标签` for the same complete material selection. Saving the classification edit also creates an operation task, so the browser does not treat the save dialog as completion: it opens `查看任务详情`, requires the task total to equal the batch count, and requires every one of those materials to report success with zero failures. A partial result or an undersized task closes the result dialog, refreshes the material list, clears the previous selection, and repeats `点第一张素材 -> 全选所有 -> 编辑 -> 修改分类标签`; this has no artificial retry limit. The selector deliberately waits for `全选所有` and does not silently fall back to `全选当前页`.
 
 ## Redfruit Preflight
 

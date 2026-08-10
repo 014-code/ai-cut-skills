@@ -78,6 +78,7 @@ Same-process writes to the same backfill Excel still use `_backfill_lock`, so li
 
 - `task.json`: machine-readable config, summary, result path, duplicate song workbook path, and plans/items.
 - `run.log`: summary, selected template fields in config, `[song_matches]`, and per-item status/type/song/CID/tags.
+- Soda Music and Redfruit live runs additionally update a workflow checkpoint (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`) at each order stage. The file stores per-order stage, platform task IDs, item retry metadata, and CID/status so `--resume-task` can continue without recreating completed upload, review, CID backfill, ARLP, or classification work.
 - `error.json` and `error.log`: task-level failure records when execution fails after the task folder is created.
 - `<output_root>/_cli_errors/*.json` and `*.log`: early CLI failures before a task folder exists, when `output_root` was already parsed.
 - `batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log`: aggregate multi-batch status, child task folders, and child error log pointers.

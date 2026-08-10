@@ -95,6 +95,12 @@ class UserGrowthOrderPlan:
     order_id: str
     items: list[UserGrowthVideoItem] = field(default_factory=list)
     task_id: str = ""
+    upload_task_id: str = ""
+    review_task_id: str = ""
+    arlp_task_id: str = ""
+    classification_task_id: str = ""
+    stage: str = "pending"
+    checkpoint_message: str = ""
     upload_limit: int | None = None
     status: str = "pending"
     message: str = ""
@@ -104,6 +110,12 @@ class UserGrowthOrderPlan:
         return {
             "order_id": self.order_id,
             "task_id": self.task_id,
+            "upload_task_id": self.upload_task_id,
+            "review_task_id": self.review_task_id,
+            "arlp_task_id": self.arlp_task_id,
+            "classification_task_id": self.classification_task_id,
+            "stage": self.stage,
+            "checkpoint_message": self.checkpoint_message,
             "upload_limit": self.upload_limit,
             "status": self.status,
             "message": self.message,

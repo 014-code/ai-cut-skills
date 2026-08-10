@@ -33,7 +33,7 @@ Mask terms such as:
 
 Mask terms such as:
 
-`警察`, `警察局`, `派出所`, `民政局`, `团长`, `营长`, `旅长`, `首长`, `解放军`, `中国`, `中华人民共和国`, `一国两制`, `台独`, `港独`, `疆独`, `藏独`, `一中一台`, `两个中国`, `军委`, `中央`, `部委`, `省委`, `市委`, `政府机关`, `特供`, `专供`, `国宴专用`, `RMDHT`, `GYZY`, `日本`, `小日本`, `日军`, `抗日`, `台湾`, `香港`, `澳门`, `美国`, `韩国`, `习近平`, `习大大`, `毛泽东`, `毛爷爷`, `毛主席`, `周恩来`, `邓小平`, `胡锦涛`, `袁世凯`
+`警察`, `警察局`, `派出所`, `民政局`, `团长`, `营长`, `旅长`, `首长`, `解放军`, `中国`, `中华人民共和国`, `一国两制`, `台独`, `港独`, `疆独`, `藏独`, `一中一台`, `两个中国`, `军委`, `中央`, `部委`, `省委`, `市委`, `省政府`, `市政府`, `县政府`, `区政府`, `政府`, `政府机关`, `特供`, `专供`, `国宴专用`, `RMDHT`, `GYZY`, `日本`, `小日本`, `日军`, `抗日`, `台湾`, `香港`, `澳门`, `美国`, `韩国`, `习近平`, `习大大`, `毛泽东`, `毛爷爷`, `毛主席`, `周恩来`, `邓小平`, `胡锦涛`, `袁世凯`
 
 ### 竞品及私域导流
 
@@ -56,7 +56,8 @@ The tool will:
 
 - mask every matched keyword in `masked_text`
 - add `audio_mute` to every hit
-- keep mute spans aligned to the segment when no finer token timestamps are available
+- derive mute spans from the exact `char_start` / `char_end` range of each subtitle mask, not from the full subtitle line or transcript segment
+- when no finer token timestamps are available, map the masked character ratio proportionally into the OCR-visible subtitle time window and apply only a small safety pad
 - if `words`, `tokens`, or `frontend.words` exist, resolve hits to word-level spans first
 - match keywords after normalizing spaces and punctuation, so variants like `装 13`, `：tmd`, `vx`, `QQ`, and OCR text with mixed punctuation still hit their canonical terms
 - preserve repeated hits by span; do not collapse them only because the keyword text repeats
