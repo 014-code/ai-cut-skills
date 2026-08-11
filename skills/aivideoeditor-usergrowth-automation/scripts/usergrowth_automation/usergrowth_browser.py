@@ -4870,8 +4870,9 @@ class UserGrowthBrowserClient:
         """解析“已录入为素材”弹窗中的素材 ID 与 CID 映射。"""
         compact = _compact_text(text)
         pairs = re.findall(
-            r"创意(?:id|ID)[:=：]?(\d+).*?(?:cid|CID)[:=：]?([0-9a-fA-F]{32})",
+            r"创意id[:=：]?(\d+).*?cid[:=：]?([0-9a-fA-F]{32})",
             compact,
+            flags=re.IGNORECASE,
         )
         return {material_id: cid.lower() for material_id, cid in pairs}
 
