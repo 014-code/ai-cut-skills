@@ -90,3 +90,18 @@ Skill 默认只定义素材种类和输入契约，不保存具体素材名称�
 `start` 和 `end` 必须来自当前任务时间轴。不要把其他视频的时间码、素材路径或文件名写回 Skill；已批准的特殊规则只按专用引用文件维护。素材使用半开区间 `[start,end)`。Whisper 流程中时间轴使用 `time_mode=input`，每个素材的 `start/end` 直接复用 Whisper 字幕 input 边界；同一连续素材段的相邻条目必须严格 `previous.end == next.start`，不允许重叠或 0.2–0.3 秒过渡缓冲；只有有意返回数字人才切换 `sequence_id`。
 
 `effective_region` 保存在 Manifest 中，`render` 会根据素材真实路径自动加载并映射到画布；不要在时间轴里凭感觉重新填写另一套区域。
+
+视频素材必须额外显式声明透明、播放和音频策略：
+
+```json
+{
+  "kind": "video",
+  "layout": "phone",
+  "transparency_mode": "embedded_alpha",
+  "playback_mode": "once_hold_last",
+  "include_audio": true,
+  "audio_gain_db": -3
+}
+```
+
+`transparency_mode` 只允许 `opaque` 或 `embedded_alpha`，不得省略。`embedded_alpha` 必须通过 10%、50%、90% 真实解码抽样；不得使用黑色抠像、Screen、`colorkey`、`chromakey` 或 blend 降级。`playback_mode` 只允许 `once`、`once_hold_last`、`loop`，动画物料默认 `once_hold_last`。`include_audio=true` 时必须存在真实音轨，按映射后入点延迟并使用 `audio_gain_db` 混入。

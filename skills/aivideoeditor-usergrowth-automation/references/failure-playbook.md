@@ -1,6 +1,6 @@
 # Failure Playbook
 
-Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`, `run.log`, `error.json`, `error.log`, `debug/run.log`, and the newest `debug/*.png`/`*.txt` when live automation fails.
+Use the task folder and `debug/` artifacts first. Read `diagnostic_summary.json` before the detailed files; then inspect `task.json`, `run.log`, `error.json`, `error.log`, `debug/events.jsonl`, `debug/run.log`, and the newest `debug/*.png`/`*.txt` when live automation fails.
 
 ## Where To Read Logs
 
@@ -22,26 +22,37 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
 - Hard kill, power loss, or process termination
   Only logs flushed before termination will exist. Check the latest task folder under `output_root`, then `error.*`, `task.json`, `run.log`, and `debug/` in that order.
 
-- Redfruit process interruption
-  Read `redfruit_checkpoint.json` first. `orders.<order_id>.stage` identifies the resume point and the saved task IDs identify the platform task to query. `task.json` contains the same stage and material snapshot; `run.log` contains checkpoint transitions; `debug/run.log` contains browser/network recovery details. Resume with `--resume-task` as documented in `references/standalone-cli.md`. A `completed` checkpoint does not open a browser again.
+- Soda or Redfruit process interruption
+  Read `soda_music_checkpoint.json` or `redfruit_checkpoint.json` first. `orders.<order_id>.stage` identifies the resume point, saved task IDs identify the platform task to query, and `operation_retry_counts` preserves consumed task-row retry attempts. `task.json` contains the same stage and material snapshot; `run.log` contains checkpoint transitions; `debug/run.log` contains browser/network recovery details. Resume with `--resume-task` as documented in `references/standalone-cli.md`. A `completed` checkpoint does not open a browser again. Soda `review_submitting`, `review_submitted`, and `cid_backfilling` resume without uploading files again.
 
 - Network interruption, blank page, or browser target unexpectedly closed
-  Do not treat the browser window disappearing as a normal business failure until recovery has been exhausted: the runner is designed to keep waiting indefinitely. Read `debug/run.log` and search for `network wait`, `network recovery wait`, `network recovered`, `网络仍未恢复`, and `网络已恢复`. The backoff starts at 2 seconds and is capped at 30 seconds. Navigation failures and target-closed errors are retried without intentionally closing the browser; if the browser process disconnected, the runner relaunches it, logs in again, and resumes the current order loop. Only a user cancellation intentionally closes the browser.
+  Do not treat the browser window disappearing as a normal business failure until recovery has been exhausted. Read `debug/run.log` and search for `network wait`, `network recovery wait`, `network recovered`, `网络仍未恢复`, `网络已恢复`, `browser disconnected`, and `browser process tracked`. Navigation failures, network errors, and non-zero/unknown browser exits may relaunch the browser and resume from the checkpoint with a bounded automatic retry count. A clean Chromium exit code `0` is treated as the user manually closing the browser: the current task stops immediately and must not open another browser automatically.
 
 ## File Meanings
 
 - `task.json`: final structured result when the task reaches normal completion; contains config, summary, selected videos, plans and item statuses.
-- `soda_music_checkpoint.json` / `redfruit_checkpoint.json`: workflow checkpoint with per-order stage, task IDs, material CID/status, row-scoped retry metadata, and duplicate-recovery metadata such as `existing_creative_unit_id`; inspect the matching file first after interruption. If the stage is `upload_processing`, inspect item metadata before resuming: handled retry rows and deferred duplicate files are not blindly re-uploaded.
+- `soda_music_checkpoint.json` / `redfruit_checkpoint.json`: workflow checkpoint with per-order stage, task IDs, `operation_retry_counts`, material CID/status, row-scoped retry metadata, and duplicate-recovery metadata such as `existing_creative_unit_id`; inspect the matching file first after interruption. If the stage is `upload_processing`, inspect item metadata before resuming: handled retry rows and deferred duplicate files are not blindly re-uploaded.
 - `run.log`: final human-readable summary when the task reaches normal completion.
 - `error.json`: structured failure record for task-level exceptions.
 - `error.log`: human-readable failure record and traceback.
 - `debug/run.log`: browser timing, browser error snapshot metadata, exception type/message/traceback for `_snapshot_error`.
+- `debug/events.jsonl`: structured run/checkpoint and row-level recovery events. It is diagnostic-only and does not drive browser actions.
+- `diagnostic_summary.json`: first-stop summary containing current stage, task IDs, checkpoint path, error details, artifact paths, and a resumable command when available.
 - `debug/<name>.txt`: page URL and body text at the failing browser step.
 - `debug/<name>.png`: full-page screenshot at the failing browser step.
 - `duplicate_songs.xlsx`: duplicate song-name records relevant to the selected batch, when duplicates are found.
 - `batch_runs/<timestamp>_<task-name>/batch_summary.json`: aggregate multi-batch result with per-batch status, child task folder paths, selected counts, and error log pointers.
 
+When a Soda Music or Redfruit multi-batch run is explicitly serial (`--concurrency 1`), a batch that reaches its retry limit remains `status=failed` in `batch_summary.json`, and the next batch is started. A user cancellation or manual browser close stops the remaining serial queue instead of opening another browser.
+
 ## Common Failures
+
+- Feishu API reports permission denied or cannot resolve the Wiki node: verify the token mode, app scopes, Wiki-node sharing, and spreadsheet read/edit permissions. Do not fall back to browser cell automation.
+- Feishu read-only plan contains conflicts: inspect `task.json.feishu.library_conflicts` and `existing_bid_conflicts`. Multi-BID library conflicts are skipped; existing source BIDs are preserved unless overwrite was explicitly requested.
+- Feishu writeback verification fails: stop and inspect the exact range from `task.json.feishu.planned_writes`. Do not proceed to assume the source sheet contains the planned BID values.
+
+- Tomato Music batch search shows `暂无数据`: confirm the customer context, preserve the material page `selectorId`, use newline-separated CID values, and reduce the search to at most 50 CIDs. Do not switch to comma-separated input or click `全选所有` on a no-result page.
+- Tomato Music tag task count mismatch: inspect `tomato_music_tagging_checkpoint.json` and the chunk's visible `共 N 条` count. The runner must stop unless the operation task reports total N, success N, and failure 0.
 
 - `需要先安装 playwright，并执行 playwright install chromium`
   Check `material_remix_desktop_source/requirements.txt`, install dependencies in the desktop environment, then run browser install for Chromium if needed.
@@ -77,7 +88,7 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
   Inspect `chameleon_delivery_*` snapshots. Check `投放产品`, `汽水音乐`, and `投放平台` dropdown behavior.
 
 - Upload row says the file was uploaded before
-  Inspect `upload_failed_*` snapshots and `debug/run.log`. The recovery path parses `创意单元id` and `素材id`, deletes the failed upload row, finishes the rest of the batch, then searches `工单管理 -> 创意单元` by comma-separated creative-unit IDs and clicks `录入素材`. If `录入素材` reports `已录入`, no further action is required for that reused creative unit.
+  Inspect `upload_failed_*` snapshots and `debug/run.log`. The recovery path parses `创意单元id` and `素材id`, deletes the failed upload row, finishes the rest of the batch, then searches `工单管理 -> 创意单元` by comma-separated creative-unit IDs and clicks `录入素材`. If the page reports `以下创意已录入为素材`, parse the returned `创意id/cid` pairs, mark only those returned materials successful, confirm the dialog, and close or continue from the creative-unit list. When only part of the selected set was already recorded, the runner unchecks those returned creative units, verifies the selected count equals the remaining count, and continues the same entry flow for the unchecked remainder. If all selected materials were already recorded, no new entry task is opened. In Redfruit checkpoint recovery this is terminal only for the returned items: write `stage=completed` only when the whole active batch is done. If some items are still unresolved, preserve `stage=upload_processing`, log the remaining count, and block re-upload until their original creative-unit IDs are recovered. If the dialog has no concrete parseable creative ID, or an ID cannot be matched to the current batch, stop instead of marking the batch successful.
 
 - Direct existing creative-unit recovery stops after the first page
   Inspect `debug/run.log`. A correct run logs `creative unit page 1: selected_count=20`, then page transitions such as `1 -> 2` and `2 -> 3`, and waits for the visible row signature to change before selecting the next page. The final selected count must equal the requested ID count.
@@ -92,7 +103,7 @@ Use the task folder and `debug/` artifacts first. Ask for or inspect `task.json`
   Inspect console/debug output around `级联选择失败`. Confirm `LUNA_` labels and field names: `汽水音乐-素材类型`, `LUNA素材来源`, `LUNA功能卖点`.
 
 - Task never becomes `全部成功`
-  Inspect task row text and refresh behavior. `_wait_task_success` and `_wait_task_row_success` fail on `已失败`/`失败`.
+  Inspect task row text and refresh behavior. For Redfruit, an explicitly `已失败` upload, ARLP, or classification task is retried only through that task row's `重试` action, up to 3 times. Soda applies the same exact-row rule to its post-submit review task. The log/event records `task_id`, operation name, and `retry=N/3`; Soda also writes `operation_retry_counts["汽水音乐送审:<task_id>"]` into its checkpoint, so a browser restart cannot reset the limit. After the third failed retry the run stops. A partial-success ARLP/classification result still uses the missing-item completion loop instead of consuming this full-task retry budget.
 
 - CID count mismatch
   Inspect `task_<id>_cid_count_mismatch`. Check material list search input, copy fallback, item order, and whether some uploads produced no CID.

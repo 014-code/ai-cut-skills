@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import traceback
 from typing import Any, Iterable
 
@@ -49,6 +50,8 @@ from usergrowth_automation.usergrowth_tag_templates import (
     normalise_template_tags,
 )
 from usergrowth_automation.usergrowth_runner import (
+    ARTIFACT_SCHEMA_VERSION,
+    WORKFLOW_CONTRACT_VERSION,
     _backfill_lock,
     _build_payload,
     _clamp_batch_concurrency,
@@ -61,6 +64,7 @@ from usergrowth_automation.usergrowth_runner import (
 
 ProgressCallback = Any
 SELECTION_MANIFEST_KEYS = {"videos", "video_globs", "video_glob", "video_list", "all_videos"}
+MAX_AUTOMATIC_RESUME_RETRIES = 2
 
 
 @dataclass
@@ -209,7 +213,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--redfruit-ai-custom-tag", help="AI redfruit custom tag used for AI前贴/后贴 materials.")
     parser.add_argument("--redfruit-extra-custom-tag", action="append", default=[], help="Extra redfruit custom tag. Can be repeated.")
     parser.add_argument("--split-by-song", action="store_true", help="Auto-split selected videos into one batch per song before running.")
-    parser.add_argument("--concurrency", type=int, default=None, help="Batch concurrency. Defaults to batch count, clamped to 1..10; multi-batch runs use at least 2.")
+    parser.add_argument("--concurrency", type=int, default=None, help="Batch concurrency. Defaults to batch count, clamped to 1..10; explicitly use 1 for serial batches.")
     parser.add_argument("--account", help="UserGrowth account. Prefer USERGROWTH_ACCOUNT env var.")
     parser.add_argument("--password", help="UserGrowth password. Prefer USERGROWTH_PASSWORD env var.")
     parser.add_argument("--max-status-retries", type=int, default=None)
@@ -826,6 +830,11 @@ def run_resumed_usergrowth_task(
         plan.review_task_id = str(saved_plan.get("review_task_id") or "")
         plan.arlp_task_id = str(saved_plan.get("arlp_task_id") or "")
         plan.classification_task_id = str(saved_plan.get("classification_task_id") or "")
+        plan.operation_retry_counts = {
+            str(key): int(value)
+            for key, value in dict(saved_plan.get("operation_retry_counts") or {}).items()
+            if str(value).isdigit()
+        }
         plan.stage = str(saved_plan.get("stage") or "pending")
         plan.message = str(saved_plan.get("message") or "")
         plan.checkpoint_message = str(saved_plan.get("checkpoint_message") or "")
@@ -870,10 +879,14 @@ def run_resumed_usergrowth_task(
         _atomic_write_json(task_root / "task.json", payload)
         checkpoint_payload = {
             "version": 1,
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
             "workflow": workflow,
             "task_id": task_id,
             "task_root": str(task_root),
             "updated_at": payload["checkpoint_updated_at"],
+            "selected_video_count": len(video_paths),
+            "order_ids": [plan.order_id for plan in plans],
             "orders": {
                 plan.order_id: {
                     "order_id": plan.order_id,
@@ -885,6 +898,7 @@ def run_resumed_usergrowth_task(
                     "review_task_id": plan.review_task_id,
                     "arlp_task_id": plan.arlp_task_id,
                     "classification_task_id": plan.classification_task_id,
+                    "operation_retry_counts": dict(plan.operation_retry_counts),
                     "items": {
                         item.file_name: {
                             "status": item.status,
@@ -905,35 +919,51 @@ def run_resumed_usergrowth_task(
 
     if all(plan.stage in {"completed", "cid_backfilled_unreviewed"} for plan in plans):
         _emit(progress, f"断点任务已完成：{task_root}")
+        _write_diagnostic_summary(task_root, status="success")
         return saved_payload
 
-    try:
-        persist_checkpoint()
-        browser = UserGrowthBrowserClient(
-            config.account,
-            config.password,
-            headless=config.headless,
-            debug_dir=debug_dir,
-            refresh_interval_seconds=config.refresh_interval_seconds,
-            max_status_retries=config.max_status_retries,
-            browser_slow_mo_ms=config.browser_slow_mo_ms,
-            order_complete=write_order_backfill if not redfruit_workflow else None,
-            checkpoint_callback=lambda _plan: persist_checkpoint(),
-        )
-        asyncio.run(browser.run([plan for plan in plans if plan.status != "skipped"], progress))
-        payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
-        payload["selected_videos"] = [str(path) for path in video_paths]
-        _atomic_write_json(task_root / "task.json", payload)
-        persist_checkpoint()
-        return payload
-    except BaseException as exc:
+    restart_attempt = 0
+    while True:
         try:
             persist_checkpoint()
-        except Exception:
-            pass
-        _write_task_error(task_root, config, video_paths, exc)
-        setattr(exc, "_usergrowth_task_root", str(task_root))
-        raise
+            browser = UserGrowthBrowserClient(
+                config.account,
+                config.password,
+                headless=config.headless,
+                debug_dir=debug_dir,
+                refresh_interval_seconds=config.refresh_interval_seconds,
+                max_status_retries=config.max_status_retries,
+                browser_slow_mo_ms=config.browser_slow_mo_ms,
+                order_complete=write_order_backfill if not redfruit_workflow else None,
+                checkpoint_callback=lambda _plan: persist_checkpoint(),
+            )
+            asyncio.run(browser.run([plan for plan in plans if plan.status != "skipped"], progress))
+            payload = _build_payload(config, task_id, task_root, plans, items, result_excel, duplicate_song_excel)
+            payload["selected_videos"] = [str(path) for path in video_paths]
+            _atomic_write_json(task_root / "task.json", payload)
+            persist_checkpoint()
+            _write_diagnostic_summary(task_root, status="success")
+            return payload
+        except BaseException as exc:
+            try:
+                persist_checkpoint()
+            except Exception:
+                pass
+            if _is_auto_resume_retryable_failure(exc) and restart_attempt < MAX_AUTOMATIC_RESUME_RETRIES:
+                restart_attempt += 1
+                delay_seconds = min(60, 2 ** min(restart_attempt, 6))
+                _prepare_plans_for_automatic_resume(plans)
+                _emit(
+                    progress,
+                    f"断点续跑失败后自动重试 {restart_attempt}/{MAX_AUTOMATIC_RESUME_RETRIES}，"
+                    f"重新启动浏览器，"
+                    f"{delay_seconds} 秒后继续当前阶段：{exc}",
+                )
+                time.sleep(delay_seconds)
+                continue
+            _write_task_error(task_root, config, video_paths, exc)
+            setattr(exc, "_usergrowth_task_root", str(task_root))
+            raise
 
 
 # Backward-compatible import name for callers that used the redfruit-only helper.
@@ -974,10 +1004,14 @@ def run_selected_usergrowth_task(
         _atomic_write_json(task_root / "task.json", payload)
         checkpoint_payload = {
             "version": 1,
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
             "workflow": config.workflow,
             "task_id": task_id,
             "task_root": str(task_root),
             "updated_at": payload["checkpoint_updated_at"],
+            "selected_video_count": len(video_paths),
+            "order_ids": [plan.order_id for plan in plans],
             "orders": {
                 plan.order_id: {
                     "order_id": plan.order_id,
@@ -989,6 +1023,7 @@ def run_selected_usergrowth_task(
                     "review_task_id": plan.review_task_id,
                     "arlp_task_id": plan.arlp_task_id,
                     "classification_task_id": plan.classification_task_id,
+                    "operation_retry_counts": dict(plan.operation_retry_counts),
                     "items": {
                         item.file_name: {
                             "status": item.status,
@@ -1045,18 +1080,39 @@ def run_selected_usergrowth_task(
                     write_back_results(config.order_excel, config.order_excel, plan.items, include_ready=False)
                 _emit(progress, f"订单 {plan.order_id} 已写回回填 Excel")
 
-            browser = UserGrowthBrowserClient(
-                config.account,
-                config.password,
-                headless=config.headless,
-                debug_dir=debug_dir,
-                refresh_interval_seconds=config.refresh_interval_seconds,
-                max_status_retries=config.max_status_retries,
-                browser_slow_mo_ms=config.browser_slow_mo_ms,
-                order_complete=write_order_backfill if supports_backfill else None,
-                checkpoint_callback=lambda _plan: persist_workflow_checkpoint(),
-            )
-            asyncio.run(browser.run(active_plans, progress))
+            automatic_resume_attempt = 0
+            while True:
+                browser = UserGrowthBrowserClient(
+                    config.account,
+                    config.password,
+                    headless=config.headless,
+                    debug_dir=debug_dir,
+                    refresh_interval_seconds=config.refresh_interval_seconds,
+                    max_status_retries=config.max_status_retries,
+                    browser_slow_mo_ms=config.browser_slow_mo_ms,
+                    order_complete=write_order_backfill if supports_backfill else None,
+                    checkpoint_callback=lambda _plan: persist_workflow_checkpoint(),
+                )
+                try:
+                    asyncio.run(browser.run(active_plans, progress))
+                    break
+                except BaseException as exc:
+                    persist_workflow_checkpoint()
+                    if (
+                            not _is_auto_resume_retryable_failure(exc)
+                            or automatic_resume_attempt >= MAX_AUTOMATIC_RESUME_RETRIES
+                    ):
+                        raise
+                    automatic_resume_attempt += 1
+                    delay_seconds = min(30, 2 ** automatic_resume_attempt)
+                    _prepare_plans_for_automatic_resume(active_plans)
+                    _emit(
+                        progress,
+                        f"任务失败后自动断点重试 "
+                        f"{automatic_resume_attempt}/{MAX_AUTOMATIC_RESUME_RETRIES}，"
+                        f"{delay_seconds} 秒后重启浏览器继续当前阶段：{exc}",
+                    )
+                    time.sleep(delay_seconds)
             result_excel = config.order_excel if supports_backfill else None
             if result_excel:
                 _emit(progress, f"正式上传完成，CID 已写回：{result_excel}")
@@ -1068,6 +1124,7 @@ def run_selected_usergrowth_task(
         _atomic_write_json(task_root / "task.json", payload)
         persist_workflow_checkpoint()
         _write_log(task_root, payload)
+        _write_diagnostic_summary(task_root, status="success")
         return payload
     except BaseException as exc:
         try:
@@ -1154,8 +1211,9 @@ def run_existing_creative_units_task(
         payload = _build_payload(config, task_id, task_root, [plan], items, None, None)
         payload["mode"] = "existing_creative_unit_recovery"
         payload["existing_creative_unit_ids"] = unit_ids
-        (task_root / "task.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(task_root / "task.json", payload)
         _write_log(task_root, payload)
+        _write_diagnostic_summary(task_root, status="success")
         return payload
     except BaseException as exc:
         _write_task_error(task_root, config, [Path(unit_id) for unit_id in unit_ids], exc)
@@ -1191,6 +1249,18 @@ def run_selected_usergrowth_batches(
             batch_progress(f"执行失败：{exc}")
             return _batch_failed_result(spec, exc)
 
+    if worker_count == 1:
+        for spec in specs:
+            result = run_one(spec)
+            results[spec.index] = result
+            if result.get("status") == "failed" and spec.index < len(specs) - 1:
+                _emit(
+                    progress,
+                    f"[{spec.label}] 已达到本批重试上限，串行模式跳过当前批，"
+                    f"继续第 {spec.index + 2} 批",
+                )
+        return [result for result in results if result is not None]
+
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
             executor.submit(run_one, spec): spec.index
@@ -1217,6 +1287,7 @@ def _batch_success_result(spec: SelectedBatchSpec, payload: dict[str, Any]) -> d
         "task_root": task_root,
         "task_json": str(Path(task_root) / "task.json") if task_root else "",
         "run_log": str(Path(task_root) / "run.log") if task_root else "",
+        "diagnostic_summary": str(Path(task_root) / "diagnostic_summary.json") if task_root else "",
         "summary": payload.get("summary", {}),
         "result_excel": payload.get("result_excel", ""),
         "duplicate_song_excel": payload.get("duplicate_song_excel", ""),
@@ -1238,6 +1309,7 @@ def _batch_failed_result(spec: SelectedBatchSpec, exc: Exception) -> dict[str, A
         "task_root": task_root,
         "error_json": str(Path(task_root) / "error.json") if task_root else "",
         "error_log": str(Path(task_root) / "error.log") if task_root else "",
+        "diagnostic_summary": str(Path(task_root) / "diagnostic_summary.json") if task_root else "",
         "config": _safe_config_dict(spec.config),
     }
 
@@ -1382,6 +1454,171 @@ def _public_payload(payload: dict) -> dict:
     return public
 
 
+def _write_diagnostic_summary(
+    task_root: Path,
+    *,
+    status: str,
+    exc: BaseException | None = None,
+) -> None:
+    """生成便于人工或 Agent 定位、续跑的旁路摘要，不参与流程判断。"""
+    try:
+        task_payload = _read_json_object(task_root / "task.json")
+        checkpoint_paths = [
+            path
+            for path in (
+                task_root / "soda_music_checkpoint.json",
+                task_root / "redfruit_checkpoint.json",
+                task_root / "usergrowth_checkpoint.json",
+            )
+            if path.is_file()
+        ]
+        checkpoint_path = max(checkpoint_paths, key=lambda path: path.stat().st_mtime) if checkpoint_paths else None
+        checkpoint_payload = _read_json_object(checkpoint_path) if checkpoint_path else {}
+
+        order_states: list[dict[str, Any]] = []
+        checkpoint_orders = checkpoint_payload.get("orders")
+        if isinstance(checkpoint_orders, dict):
+            for order_id, order in checkpoint_orders.items():
+                if not isinstance(order, dict):
+                    continue
+                order_states.append(
+                    {
+                        "order_id": str(order.get("order_id") or order_id),
+                        "stage": str(order.get("stage") or "pending"),
+                        "status": str(order.get("status") or "pending"),
+                        "checkpoint_message": str(order.get("checkpoint_message") or ""),
+                        "upload_task_id": str(order.get("upload_task_id") or ""),
+                        "review_task_id": str(order.get("review_task_id") or ""),
+                        "arlp_task_id": str(order.get("arlp_task_id") or ""),
+                        "classification_task_id": str(order.get("classification_task_id") or ""),
+                        "operation_retry_counts": dict(order.get("operation_retry_counts") or {}),
+                    }
+                )
+        elif isinstance(task_payload.get("plans"), list):
+            for order in task_payload["plans"]:
+                if not isinstance(order, dict):
+                    continue
+                order_states.append(
+                    {
+                        "order_id": str(order.get("order_id") or ""),
+                        "stage": str(order.get("stage") or "pending"),
+                        "status": str(order.get("status") or "pending"),
+                        "checkpoint_message": str(order.get("checkpoint_message") or ""),
+                        "upload_task_id": str(order.get("upload_task_id") or order.get("task_id") or ""),
+                        "review_task_id": str(order.get("review_task_id") or ""),
+                        "arlp_task_id": str(order.get("arlp_task_id") or ""),
+                        "classification_task_id": str(order.get("classification_task_id") or ""),
+                        "operation_retry_counts": dict(order.get("operation_retry_counts") or {}),
+                    }
+                )
+
+        resumable = bool(checkpoint_path) and any(
+            order.get("stage") not in {"completed", "cid_backfilled_unreviewed"}
+            for order in order_states
+        )
+        cli_path = Path(__file__).resolve()
+        summary_payload = {
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "status": status,
+            "task_root": str(task_root),
+            "task_id": str(task_payload.get("task_id") or checkpoint_payload.get("task_id") or task_root.name),
+            "workflow": str(
+                (task_payload.get("config") or {}).get("workflow")
+                or checkpoint_payload.get("workflow")
+                or ""
+            ),
+            "summary": task_payload.get("summary") or {},
+            "orders": order_states,
+            "resume": {
+                "available": resumable,
+                "checkpoint": str(checkpoint_path) if checkpoint_path else "",
+                "command": (
+                    f'python "{cli_path}" --resume-task "{task_root}" --live --confirm-live'
+                    if resumable
+                    else ""
+                ),
+            },
+            "artifacts": {
+                "task_json": str(task_root / "task.json") if (task_root / "task.json").is_file() else "",
+                "run_log": str(task_root / "run.log") if (task_root / "run.log").is_file() else "",
+                "browser_run_log": str(task_root / "debug" / "run.log") if (task_root / "debug" / "run.log").is_file() else "",
+                "events_jsonl": str(task_root / "debug" / "events.jsonl") if (task_root / "debug" / "events.jsonl").is_file() else "",
+                "error_json": str(task_root / "error.json") if (task_root / "error.json").is_file() else "",
+                "error_log": str(task_root / "error.log") if (task_root / "error.log").is_file() else "",
+            },
+            "error": {
+                "type": type(exc).__name__ if exc is not None else "",
+                "message": str(exc) if exc is not None else "",
+            },
+        }
+        _atomic_write_json(task_root / "diagnostic_summary.json", summary_payload)
+    except Exception:
+        pass
+
+
+def _read_json_object(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_browser_restartable_failure(exc: BaseException) -> bool:
+    """判断断点续跑是否应重启浏览器继续，而不是把业务错误重复执行。"""
+    message = str(exc or "").lower()
+    restart_markers = (
+        "targetclosederror",
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "browser has been disconnected",
+        "browsercontext has been closed",
+        "net::err_",
+        "connection closed",
+        "connection reset",
+        "connection refused",
+        "timed out",
+        "timeout",
+    )
+    return any(marker in message for marker in restart_markers)
+
+
+def _is_auto_resume_retryable_failure(exc: BaseException) -> bool:
+    """允许页面操作失败做有限次断点续跑，但前置校验和输入错误必须直接停下。"""
+    message = str(exc or "").lower()
+    non_retryable_markers = (
+        "前置校验失败",
+        "等待用户修正",
+        "用户主动关闭浏览器",
+        "缺少账号密码",
+        "需要账号密码",
+        "找不到原始视频",
+        "未扫描到可处理视频",
+        "没有可处理的视频",
+        "没有提供可补录",
+        "不支持 workflow",
+        "重试 3 次后仍失败",
+        "行级重试失败",
+    )
+    return not any(marker in message for marker in non_retryable_markers)
+
+
+def _prepare_plans_for_automatic_resume(plans: Iterable[UserGrowthOrderPlan]) -> None:
+    """保留 stage、任务 ID 和成功项，只把本轮失败项恢复为待处理。"""
+    for plan in plans:
+        if plan.status == "failed":
+            plan.status = "pending"
+            plan.message = ""
+        for item in plan.items:
+            if item.status == "failed":
+                item.status = "pending"
+                item.message = ""
+
+
 def _write_task_error(
     task_root: Path,
     config: UserGrowthRunConfig,
@@ -1418,6 +1655,7 @@ def _write_task_error(
             trace.rstrip(),
         ]
         (task_root / "error.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _write_diagnostic_summary(task_root, status="failed", exc=exc)
     except Exception:
         pass
 

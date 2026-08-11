@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ass_fonts import AssFontError, validate_ass_font_config, validate_ass_font_family
+from alpha_safety import (
+    AlphaSafetyError,
+    SKILL_VERSION,
+    assert_safe_filter_graph,
+    inspect_embedded_alpha,
+    runtime_evidence,
+    validate_video_material_policy,
+)
 from caption_layout import (
     CaptionLayoutError,
     derive_caption_character_budget,
@@ -168,7 +176,14 @@ def require_binary(name: str) -> str:
 
 def run(command: list[str], *, label: str) -> None:
     print(f"[{label}] {' '.join(command)}")
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        command,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
     if result.returncode != 0:
         output = "\n".join(x for x in (result.stdout, result.stderr) if x)
         raise RenderError(f"{label} failed ({result.returncode}):\n{output}")
@@ -188,6 +203,8 @@ def ffprobe(path: Path) -> dict[str, Any]:
             str(path),
         ],
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
     )
@@ -272,6 +289,10 @@ def load_timeline(path: Path) -> dict[str, Any]:
             raise RenderError(
                 f"materials[{index}] must record matched_benefit_text from the benefit-point narration"
             )
+        try:
+            validate_video_material_policy(material, label=f"materials[{index}]")
+        except AlphaSafetyError as exc:
+            raise RenderError(str(exc)) from exc
     special_match_errors = special_match_metadata_errors(data.get("materials", []))
     if special_match_errors:
         raise RenderError("; ".join(special_match_errors))
@@ -1088,10 +1109,17 @@ def common_encode_args(config: dict[str, Any]) -> list[str]:
     ]
 
 
-def input_args(path: Path, kind: str, fps: int) -> list[str]:
+def input_args(
+    path: Path,
+    kind: str,
+    fps: int,
+    playback_mode: str = "once_hold_last",
+) -> list[str]:
     if kind == "image":
         return ["-loop", "1", "-framerate", str(fps), "-i", str(path)]
-    return ["-stream_loop", "-1", "-i", str(path)]
+    if playback_mode == "loop":
+        return ["-stream_loop", "-1", "-i", str(path)]
+    return ["-i", str(path)]
 
 
 def render_main(
@@ -1106,10 +1134,11 @@ def render_main(
     *,
     show_warning: bool,
     logo_mode: str,
-) -> None:
+) -> dict[str, Any]:
     width, height, fps = int(config.get("width", 1080)), int(config.get("height", 1920)), int(config.get("fps", 30))
     speed = float(config.get("speed", 1.1))
     font_file = assets["font"]
+    runtime_font_file = font_dir / ("body" + font_file.suffix)
     safe_margins = resolve_visual_policy(config)["material_safe_area"]
     safe_left = int(safe_margins["left"])
     safe_top = int(safe_margins["top"])
@@ -1121,7 +1150,14 @@ def render_main(
         if str(material.get("layout")) == "motion_alpha":
             command.extend(["-i", str(material["path"])])
         else:
-            command.extend(input_args(Path(material["path"]), str(material["kind"]), fps))
+            command.extend(
+                input_args(
+                    Path(material["path"]),
+                    str(material["kind"]),
+                    fps,
+                    str(material.get("playback_mode", "once_hold_last")),
+                )
+            )
 
     base_filters = [
         f"setpts=PTS/{speed}", f"fps={fps}", f"scale={width}:{height}", "setsar=1",
@@ -1144,14 +1180,37 @@ def render_main(
         logo_x = int(logo_config.get("x", 48))
         logo_y = int(logo_config.get("y", 72))
     current = "base"
+    material_media: dict[int, dict[str, Any]] = {}
+
+    def video_timing_chain(offset: int, material: dict[str, Any]) -> list[str]:
+        if str(material.get("kind", "")).casefold() != "video":
+            return []
+        info = media_summary(Path(material["path"]))
+        material_media[offset] = info
+        visible_duration = max(
+            0.0,
+            float(material["mapped_end"]) - float(material["mapped_start"]),
+        )
+        source_duration = max(0.0, float(info.get("duration") or 0.0))
+        playback_mode = str(material.get("playback_mode", "once_hold_last"))
+        play_duration = visible_duration if playback_mode == "loop" else min(visible_duration, source_duration)
+        chain = [f"trim=duration={play_duration:.6f}", "setpts=PTS-STARTPTS"]
+        if playback_mode == "once_hold_last" and visible_duration > play_duration:
+            chain.append(
+                f"tpad=stop_mode=clone:stop_duration={visible_duration - play_duration:.6f}"
+            )
+        chain.append(f"setpts=PTS+{float(material['mapped_start']):.6f}/TB")
+        return chain
+
     for offset, material in enumerate(materials, start=2):
         asset_label, next_label = f"asset{offset}", f"v{offset}"
         enable = half_open_enable(material["mapped_start"], material["mapped_end"])
         layout = material["layout"]
+        timing_chain = video_timing_chain(offset, material)
         if layout == "full_alpha":
             transform = material.get("safe_transform")
             if transform:
-                chain: list[str] = []
+                chain: list[str] = list(timing_chain)
                 crop = transform.get("crop")
                 if crop:
                     chain.append(f"crop={int(crop[2])}:{int(crop[3])}:{int(crop[0])}:{int(crop[1])}")
@@ -1167,7 +1226,9 @@ def render_main(
             else:
                 overlay_x = str(material.get("x", 0))
                 overlay_y = str(material.get("y", 0))
-                filters.append(f"[{offset}:v]setsar=1,format=rgba[{asset_label}]")
+                filters.append(
+                    f"[{offset}:v]" + ",".join([*timing_chain, "setsar=1", "format=rgba"]) + f"[{asset_label}]"
+                )
                 overlay = f"[{current}][{asset_label}]overlay=x={overlay_x}:y={overlay_y}:format=auto:enable='{enable}':eof_action=pass[{next_label}]"
         elif layout == "phone":
             transform = material.get("safe_transform")
@@ -1177,12 +1238,23 @@ def render_main(
                 overlay_x = str(int(transform["x"]))
                 overlay_y = str(int(transform["y"]))
                 filters.append(
-                    f"[{offset}:v]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,setsar=1,format=rgba[{asset_label}]"
+                    f"[{offset}:v]"
+                    + ",".join(
+                        [
+                            *timing_chain,
+                            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease",
+                            "setsar=1",
+                            "format=rgba",
+                        ]
+                    )
+                    + f"[{asset_label}]"
                 )
             else:
                 overlay_x = str(material.get("x", "(W-w)/2"))
                 overlay_y = str(material.get("y", 350))
-                filters.append(f"[{offset}:v]setsar=1,format=rgba[{asset_label}]")
+                filters.append(
+                    f"[{offset}:v]" + ",".join([*timing_chain, "setsar=1", "format=rgba"]) + f"[{asset_label}]"
+                )
             overlay = f"[{current}][{asset_label}]overlay=x={overlay_x}:y={overlay_y}:format=auto:enable='{enable}':eof_action=pass[{next_label}]"
         elif layout == "icon":
             transform = material.get("safe_transform")
@@ -1191,7 +1263,7 @@ def render_main(
             if not crop or len(crop) != 4:
                 raise RenderError(f"Missing source_crop for icon material: {material.get('path')}")
             crop_x, crop_y, crop_width, crop_height = (int(value) for value in crop)
-            chain = [f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}"]
+            chain = [*timing_chain, f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}"]
             if transform:
                 target_width = int(transform["width"])
                 target_height = int(transform["height"])
@@ -1220,12 +1292,18 @@ def render_main(
                 overlay_x = str(int(transform["x"]))
                 overlay_y = str(int(transform["y"]))
                 filters.append(
-                    f"[{offset}:v]scale={target_width}:{target_height},setsar=1,format=rgba[{asset_label}]"
+                    f"[{offset}:v]"
+                    + ",".join(
+                        [*timing_chain, f"scale={target_width}:{target_height}", "setsar=1", "format=rgba"]
+                    )
+                    + f"[{asset_label}]"
                 )
             else:
                 overlay_x = str(material.get("x", "(W-w)/2"))
                 overlay_y = str(material.get("y", 650))
-                filters.append(f"[{offset}:v]setsar=1,format=rgba[{asset_label}]")
+                filters.append(
+                    f"[{offset}:v]" + ",".join([*timing_chain, "setsar=1", "format=rgba"]) + f"[{asset_label}]"
+                )
             overlay = f"[{current}][{asset_label}]overlay=x={overlay_x}:y={overlay_y}:format=auto:enable='{enable}':eof_action=pass[{next_label}]"
         elif layout == "motion_alpha":
             motion = material.get("motion_effect", {})
@@ -1274,8 +1352,8 @@ def render_main(
         cta_config = config.get("cta", {})
         caption_filters.extend(
             [
-                drawtext(str(cta_config.get("title", "")), font_file=font_file, x="(w-text_w)/2", y="1010", size=74, color="0x3BFD42", enable=enable),
-                drawtext(str(cta_config.get("subtitle", "")), font_file=font_file, x="(w-text_w)/2", y="1110", size=42, color="white", enable=enable),
+                drawtext(str(cta_config.get("title", "")), font_file=runtime_font_file, x="(w-text_w)/2", y="1010", size=74, color="0x3BFD42", enable=enable),
+                drawtext(str(cta_config.get("subtitle", "")), font_file=runtime_font_file, x="(w-text_w)/2", y="1110", size=42, color="white", enable=enable),
             ]
         )
     filters.append(f"[{current}]" + ",".join(caption_filters) + "[captioned]")
@@ -1288,21 +1366,77 @@ def render_main(
             f"[logoed]"
             + drawtext(
                 str(config.get("warning_text", "本视频为广告创意，具体奖励金额以产品实际情况为准")),
-                font_file=font_file, x="(w-text_w)/2", y="1822", size=27,
+                font_file=runtime_font_file, x="(w-text_w)/2", y="1822", size=27,
                 color="white@0.92",
             )
             + "[vout]"
         )
     filters.append(
-        f"[0:a]atempo={speed},loudnorm=I=-16:LRA=7:TP=-1.5,aformat=sample_rates=44100:channel_layouts=stereo[aout]"
+        f"[0:a]atempo={speed},loudnorm=I=-16:LRA=7:TP=-1.5,aformat=sample_rates=44100:channel_layouts=stereo[main_audio]"
     )
+    material_audio_labels: list[str] = []
+    material_audio_report: list[dict[str, Any]] = []
+    for offset, material in enumerate(materials, start=2):
+        if (
+            str(material.get("kind", "")).casefold() != "video"
+            or not bool(material.get("include_audio", False))
+        ):
+            continue
+        info = material_media.get(offset) or media_summary(Path(material["path"]))
+        if not info.get("has_audio"):
+            raise RenderError(f"include_audio=true but material has no audio stream: {material['path']}")
+        visible_duration = max(
+            0.0,
+            float(material["mapped_end"]) - float(material["mapped_start"]),
+        )
+        source_duration = max(0.0, float(info.get("duration") or 0.0))
+        playback_mode = str(material.get("playback_mode", "once_hold_last"))
+        audio_duration = visible_duration if playback_mode == "loop" else min(visible_duration, source_duration)
+        delay_ms = max(0, round(float(material["mapped_start"]) * 1000))
+        gain_db = float(material.get("audio_gain_db", -3.0))
+        label = f"material_audio_{offset}"
+        filters.append(
+            f"[{offset}:a]atrim=0:{audio_duration:.6f},asetpts=PTS-STARTPTS,"
+            f"aformat=sample_rates=44100:channel_layouts=stereo,volume={gain_db:.3f}dB,"
+            f"adelay={delay_ms}|{delay_ms}[{label}]"
+        )
+        material_audio_labels.append(f"[{label}]")
+        material_audio_report.append(
+            {
+                "path": str(material["path"]),
+                "mapped_start": float(material["mapped_start"]),
+                "duration": audio_duration,
+                "audio_gain_db": gain_db,
+                "source_audio_codec": info.get("audio_codec"),
+                "playback_mode": playback_mode,
+            }
+        )
+    if material_audio_labels:
+        filters.append(
+            "[main_audio]"
+            + "".join(material_audio_labels)
+            + f"amix=inputs={1 + len(material_audio_labels)}:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[aout]"
+        )
+    else:
+        filters.append("[main_audio]anull[aout]")
+    filter_graph = ";".join(filters)
+    try:
+        assert_safe_filter_graph(filter_graph)
+    except AlphaSafetyError as exc:
+        raise RenderError(str(exc)) from exc
     command.extend(
         [
-            "-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]",
+            "-filter_complex", filter_graph, "-map", "[vout]", "-map", "[aout]",
             "-t", f"{main_duration:.3f}", *common_encode_args(config), str(output_path),
         ]
     )
     run(command, label="main-render")
+    return {
+        "filter_graph": filter_graph,
+        "command": command,
+        "material_audio": material_audio_report,
+        "forbidden_alpha_fallbacks": [],
+    }
 
 
 def render_tail(output_path: Path, config: dict[str, Any], tail_path: Path, tail_duration: float) -> None:
@@ -1350,17 +1484,12 @@ def mix_bgm_and_cues(
         "[0:a]aformat=sample_rates=44100:channel_layouts=stereo[base]",
         f"[1:a]atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo,loudnorm=I={bgm_target_lufs:.1f}:LRA=7:TP=-2.0,volume={bgm_volume:.3f},afade=t=in:st=0:d=0.8,afade=t=out:st={fade_out_start:.3f}:d=1.2[bgm]",
     ]
-    cue_labels: list[str] = []
-    for index, material in enumerate(cue_materials):
-        delay_ms = round(float(material["mapped_start"]) * 1000)
-        frequency = 760 + (index % 3) * 120
-        label = f"cue{index}"
-        filters.append(
-            f"sine=frequency={frequency}:sample_rate=44100:duration=0.12,volume=0.075,afade=t=out:st=0.02:d=0.10,adelay={delay_ms}|{delay_ms},aformat=sample_rates=44100:channel_layouts=stereo[{label}]"
-        )
-        cue_labels.append(f"[{label}]")
-    inputs = "[base][bgm]" + "".join(cue_labels)
-    filters.append(f"{inputs}amix=inputs={2 + len(cue_labels)}:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[outa]")
+    # Material AAC is already delayed and mixed into the timeline audio in
+    # render_main.  Do not synthesize a cue tone in its place.
+    filters.append(
+        "[base][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+        "alimiter=limit=0.95[outa]"
+    )
     run(
         [
             "ffmpeg", "-hide_banner", "-y", "-i", str(timeline_path), "-stream_loop", "-1", "-i", str(bgm_path),
@@ -1398,6 +1527,8 @@ def build_report(
 ) -> dict[str, Any]:
     return {
         "renderer": "standalone-ffmpeg",
+        "skill_version": SKILL_VERSION,
+        "runtime_evidence": runtime_evidence(),
         "input": str(input_path),
         "bgm": str(bgm_path),
         "bgm_target_lufs": bgm_target_lufs,
@@ -1420,6 +1551,12 @@ def build_report(
         "logo_layer": "above-materials-captions-and-cta",
         "warning_layer": "topmost-when-enabled",
         "layer_order": ["base", "materials", "captions_and_cta", "logo", "warning"],
+        "alpha_policy": {
+            "embedded_alpha_requires_real_decode_samples": True,
+            "sample_points": [0.1, 0.5, 0.9],
+            "forbidden_fallbacks": ["colorkey", "chromakey", "screen", "blend"],
+        },
+        "material_audio_policy": "source audio only when include_audio=true; no synthetic cue replacement",
         "tail_duration": tail_duration,
         "estimated_total_duration": main_duration + tail_duration,
         "logo_variant": logo_variant,
@@ -1505,6 +1642,20 @@ def main() -> int:
         asset_root,
     )
     validate_files(input_path, bgm_path, assets)
+    alpha_checks: list[dict[str, Any]] = []
+    for material in assets["materials"]:
+        if (
+            str(material.get("kind", "")).casefold() == "video"
+            and str(material.get("transparency_mode", "")).casefold() == "embedded_alpha"
+        ):
+            alpha = inspect_embedded_alpha(Path(material["path"]))
+            alpha_checks.append(alpha)
+            if not alpha["ok"]:
+                raise RenderError(
+                    "embedded_alpha material failed decoded alpha gate; "
+                    "colorkey/chromakey/Screen/blend fallback is forbidden: "
+                    + str(material["path"])
+                )
     logo_info = media_summary(assets["logo"])
     logo_mode = resolve_logo_mode(config, logo_info)
     caption_style = resolve_caption_style(
@@ -1566,6 +1717,7 @@ def main() -> int:
     }
     report["material_timeline"] = timeline_handoffs
     report["motion_effects"] = motion_plan
+    report["alpha_checks"] = alpha_checks
     if motion_plan.get("status") == "planned":
         report["renderer"] = "standalone-ffmpeg-remotion-effects"
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1613,7 +1765,7 @@ def main() -> int:
             brand_color=str(config["font"].get("brand_color", "#3BFD42")),
             caption_style=caption_style,
         )
-        render_main(
+        main_render_evidence = render_main(
             input_path,
             ass_path,
             main_path,
@@ -1625,23 +1777,17 @@ def main() -> int:
             show_warning=args.show_warning,
             logo_mode=logo_mode,
         )
+        report["main_render_evidence"] = main_render_evidence
         render_tail(tail_path, config, assets["tail"], tail_duration)
         concat_parts([main_path, tail_path], concat_list, timeline_video)
         actual_duration = media_summary(timeline_video)["duration"] or report["estimated_total_duration"]
-        cue_materials: list[dict[str, Any]] = []
-        seen: set[float] = set()
-        for item in materials:
-            start = round(float(item["mapped_start"]), 3)
-            if start not in seen:
-                seen.add(start)
-                cue_materials.append(item)
         mix_bgm_and_cues(
             timeline_video,
             bgm_path,
             output_path,
             actual_duration,
             config,
-            cue_materials,
+            [],
             bgm_target_lufs,
             bgm_volume,
         )

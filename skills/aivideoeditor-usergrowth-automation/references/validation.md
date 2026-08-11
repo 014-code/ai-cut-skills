@@ -19,6 +19,33 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts
 python -m py_compile C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\usergrowth_upload.py
 ```
 
+For Tomato Music post-upload BID tagging, validate both a single JSON batch and the original multi-sheet Excel in dry-run mode:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py --help
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py `
+  --input 'D:\Users\Donson\Downloads\番茄音乐_bid_cid_dry_run.json' `
+  --customer-id 3681575 `
+  --bid 7330415052329061438
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py `
+  --input 'D:\Users\Donson\Downloads\番茄音乐每日打标表.xlsx' `
+  --customer-id 3681575
+```
+
+Keep both commands in dry-run mode. Confirm the first plan is split into chunks of at most 50 CIDs and the Excel plan reads every eligible sheet without modifying the workbook.
+
+For the Feishu-backed path, first run a read-only preflight against a mock API or an authorized real token. Do not pass either writeback flag during the real-token preflight:
+
+```powershell
+$env:FEISHU_ACCESS_TOKEN = '<token>'
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py `
+  --feishu-source-url 'https://donsontech.feishu.cn/wiki/W5jwwHoxei11cjkWzxZciWJWnCh?sheet=snQZ1w' `
+  --feishu-library-url 'https://donsontech.feishu.cn/wiki/GuUUwCVeoiJLS8k2kTxcBS9Cngh?sheet=be5f4d' `
+  --customer-id 3681575
+```
+
+Confirm Wiki token resolution, worksheet enumeration, cross-sheet song/BID matching, repeated-song reuse, conflict reporting, rightmost-column BID insertion planning, BID/CID batch counts, and zero online writes. For mock writeback validation, cover column expansion, `values_batch_update`, and reread verification. A real writeback requires explicit authorization plus `--feishu-writeback --confirm-feishu-writeback`.
+
 Validate the skill structure:
 
 ```powershell
@@ -48,13 +75,19 @@ If desktop tests exist in the checkout, prefer targeted runs such as `tests\desk
   Verify cancellation, summary counts, `task.json`, `run.log`, dry-run result path, live original-Excel path, and same-path backfill lock behavior.
 
 - Browser changes
-  Use `headless=False` for diagnosis, collect `debug/` artifacts, and test against a safe order before production. Check login, work-order search, create creative unit, upload input, chameleon modal, cascaders, chameleon tag strategy (`reuse_all`, common-tags-plus-per-card-song-id, and per-card full fill), review, task polling, CID extraction, and Excel write callback.
+  Use `headless=False` for diagnosis, collect `debug/` artifacts, and test against a safe order before production. Check login, work-order search, create creative unit, upload input, chameleon modal, cascaders, chameleon tag strategy (`reuse_all`, common-tags-plus-per-card-song-id, and per-card full fill), review, task polling, CID extraction, and Excel write callback. For existing creative units, cover the `已录入为素材` dialog with multiple `创意id/cid` pairs and verify the branch exits immediately with CIDs mapped by `existing_material_id`.
 
 - Standalone CLI changes
   Run `--help`, `py_compile`, and a dry-run using temporary `.mp4` placeholders plus temporary song/backfill workbooks. Confirm only selected videos appear in `task.json` and `result.xlsx`.
 
 - Standalone batch CLI changes
-  Run a dry-run manifest with at least two `batches`, one batch using explicit `videos`, one using `all_videos=true`, and one `--split-by-song` or `split_by_song=true` case. Confirm `batch_runs/<timestamp>/batch_summary.json`, aggregate `run.log`, and each child `task.json/run.log/result.xlsx` exist. Also confirm the recorded concurrency is at least `2` when there are multiple batches.
+  Run a dry-run manifest with at least two `batches`, one batch using explicit `videos`, one using `all_videos=true`, and one `--split-by-song` or `split_by_song=true` case. Confirm `batch_runs/<timestamp>/batch_summary.json`, aggregate `run.log`, and each child `task.json/run.log/result.xlsx` exist. When concurrency is omitted, confirm the recorded concurrency is at least `2` for multiple batches. Also run `--concurrency 1`: confirm ordered execution, a failed batch does not block later batches, and cancellation/manual browser close prevents later serial batches from starting.
+
+- Tomato Music tagging changes
+  Run `--help`, `py_compile`, one JSON BID dry-run, and one original multi-sheet Excel dry-run. Confirm CID normalization/de-duplication, `bid_<BID>` labels, maximum 50-CID chunks, `task.json`, `run.log`, and no workbook writes. Live validation still requires explicit user confirmation and must accept a chunk only when the operation task total/success/failure counts reconcile exactly.
+
+- Feishu Tomato Music changes
+  Mock Wiki resolution, worksheet listing, range reads, a library song duplicated with the same BID, a conflicting song with multiple BIDs, a source sheet without a BID column, an existing-BID conflict, column expansion, batch update, and writeback reread verification. Also run an API read-only preflight when an authorized token is available. Never replace failed API authorization with browser spreadsheet automation.
 
 ## Reporting
 

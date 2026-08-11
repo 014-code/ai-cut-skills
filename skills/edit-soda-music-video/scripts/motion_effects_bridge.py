@@ -137,7 +137,11 @@ def inspect_motion_skill(config: dict[str, Any]) -> dict[str, Any]:
         missing.append("chrome")
     for dependency in dependencies:
         if not dependency.exists():
-            missing.append(str(dependency.relative_to(root)) if root.exists() else str(dependency))
+            missing.append(
+                dependency.relative_to(root).as_posix()
+                if root.exists()
+                else str(dependency)
+            )
 
     effects: list[dict[str, Any]] = []
     list_error: str | None = None

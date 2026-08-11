@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import wave
+import sync_feishu_keyword_policy as FEISHU_POLICY_MOD
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -179,6 +181,77 @@ KEYWORD_GROUPS: Dict[str, Sequence[str]] = {
         "芒果",
     ),
 }
+
+DEFAULT_POLICY_PATH = Path(__file__).resolve().parent.parent / "references" / "feishu_keyword_policy.json"
+KEYWORD_POLICY_INFO: Dict[str, Any] = {
+    "source_type": "builtin_fallback",
+    "version": "builtin",
+    "path": None,
+}
+
+
+def _dedupe_keywords(values: Iterable[Any]) -> Tuple[str, ...]:
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        keyword = str(value or "").strip()
+        if not keyword:
+            continue
+        normalized = re.sub(r"\s+", "", keyword).casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(keyword)
+    return tuple(output)
+
+
+def configure_keyword_policy(path: Path | str | None = None) -> Dict[str, Any]:
+    """Load a versioned Feishu policy snapshot while keeping built-ins as fallback."""
+    global KEYWORD_GROUPS, KEYWORD_POLICY_INFO
+
+    configured = path or os.environ.get("AIVIDEOEDITOR_KEYWORD_POLICY")
+    policy_path = Path(configured).expanduser() if configured else DEFAULT_POLICY_PATH
+    if not policy_path.is_file():
+        KEYWORD_POLICY_INFO = {
+            "source_type": "builtin_fallback",
+            "version": "builtin",
+            "path": None,
+            "group_counts": {category: len(values) for category, values in KEYWORD_GROUPS.items()},
+        }
+        return dict(KEYWORD_POLICY_INFO)
+
+    payload = json.loads(policy_path.read_text(encoding="utf-8"))
+    raw_groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(raw_groups, dict) or not raw_groups:
+        raise ValueError(f"Keyword policy has no groups: {policy_path}")
+
+    supplements = payload.get("local_supplements") if isinstance(payload, dict) else {}
+    supplements = supplements if isinstance(supplements, dict) else {}
+    merged: Dict[str, Sequence[str]] = {}
+    for category, values in raw_groups.items():
+        if not isinstance(values, list):
+            raise ValueError(f"Keyword policy group must be a list: {category}")
+        extra = supplements.get(category, [])
+        if not isinstance(extra, list):
+            raise ValueError(f"Keyword policy supplements must be a list: {category}")
+        merged[str(category)] = _dedupe_keywords([*values, *extra])
+
+    KEYWORD_GROUPS = merged
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    KEYWORD_POLICY_INFO = {
+        "source_type": source.get("type") or "feishu_snapshot",
+        "source_url": source.get("url"),
+        "source_title": source.get("title"),
+        "source_last_modified": source.get("last_modified"),
+        "synced_at": payload.get("synced_at"),
+        "version": payload.get("version") or "unversioned",
+        "path": str(policy_path.resolve()),
+        "group_counts": {category: len(values) for category, values in KEYWORD_GROUPS.items()},
+    }
+    return dict(KEYWORD_POLICY_INFO)
+
+
+configure_keyword_policy()
 
 @dataclass(frozen=True)
 class Hit:
@@ -489,6 +562,7 @@ def analyze_segments(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
             "subtitle_mask": "all 必杀词 hits",
             "audio_mute": "all subtitle_mask hits",
             "mute_granularity": "word-level when words/tokens are available, otherwise segment-level",
+            "keyword_source": dict(KEYWORD_POLICY_INFO),
         },
         "segments": output_segments,
         "subtitle_redactions": subtitle_redactions,
@@ -652,9 +726,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Simulate keyword-based subtitle masking and audio muting.")
     parser.add_argument("--transcript", type=Path, help="JSON transcript with start_time/end_time/text segments.")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--policy-json", type=Path, help="Versioned Feishu keyword policy snapshot JSON.")
+    parser.add_argument(
+        "--refresh-feishu-policy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Refresh the keyword snapshot through official Feishu Wiki/Docx APIs before planning.",
+    )
+    parser.add_argument("--feishu-wiki-url", default=os.environ.get("FEISHU_KEYWORD_POLICY_URL") or FEISHU_POLICY_MOD.DEFAULT_WIKI_URL)
+    parser.add_argument("--feishu-api-base-url", default=os.environ.get("FEISHU_API_BASE_URL") or FEISHU_POLICY_MOD.DEFAULT_FEISHU_BASE_URL)
     parser.add_argument("--render-preview", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
+    policy_path = args.policy_json or DEFAULT_POLICY_PATH
+    refresh_feishu_policy = args.refresh_feishu_policy if args.refresh_feishu_policy is not None else not args.policy_json
+    if refresh_feishu_policy:
+        try:
+            FEISHU_POLICY_MOD.sync_keyword_policy(
+                wiki_url=args.feishu_wiki_url,
+                output_path=Path(policy_path),
+                base_url=args.feishu_api_base_url,
+            )
+        except Exception as exc:
+            raise SystemExit(f"Feishu policy API refresh failed: {exc}") from exc
+    configure_keyword_policy(policy_path)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     segments = load_segments(args.transcript)

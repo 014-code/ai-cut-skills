@@ -99,6 +99,7 @@ class UserGrowthOrderPlan:
     review_task_id: str = ""
     arlp_task_id: str = ""
     classification_task_id: str = ""
+    operation_retry_counts: dict[str, int] = field(default_factory=dict)
     stage: str = "pending"
     checkpoint_message: str = ""
     upload_limit: int | None = None
@@ -114,6 +115,7 @@ class UserGrowthOrderPlan:
             "review_task_id": self.review_task_id,
             "arlp_task_id": self.arlp_task_id,
             "classification_task_id": self.classification_task_id,
+            "operation_retry_counts": self.operation_retry_counts,
             "stage": self.stage,
             "checkpoint_message": self.checkpoint_message,
             "upload_limit": self.upload_limit,

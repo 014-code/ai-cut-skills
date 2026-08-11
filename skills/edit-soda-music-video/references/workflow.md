@@ -21,6 +21,8 @@
 
 使用 `scripts/soda_pipeline.py preflight` 检查 FFmpeg、FFprobe、BGM、时间轴 JSON、字体、logo、尾帧、通用物料和字幕安全布局。预检报告必须列出每条字幕的显式换行结果、行数、每行估算宽度与可用宽度；任一行越界或超过三行都必须在渲染前失败。原始视频和原始物料保持不变，在副本路径输出中间文件。
 
+Windows 视频物料还必须声明 `transparency_mode`。对 `embedded_alpha` 在 10%、50%、90% 三点真实解码 Alpha 平面，任一点无法取得统计、整体 Alpha 恒定 255 或解码格式不带 Alpha 时立即阻止 preflight/render。门禁以实际 FFmpeg 解码结果为准，不按版本号或 `ffprobe` 的颜色层 `pix_fmt` 猜测；禁止用黑色抠像、Screen、`colorkey`、`chromakey` 或 blend 继续。
+
 ## 3. 去气口
 
 先用 `detect-pauses` 运行 `-35dB/-30dB/-25dB` 多阈值交叉检测；固定使用本地 Whisper `tiny` 增加逐词时间戳。Whisper 文本不负责最终字幕文字，但它的实际词级时间戳必须负责字幕时序。严格阈值默认检查 0.35 秒以上静音，动态阈值补充 0.18 秒以上停顿。只把多阈值相互印证，或音量检测与 Whisper 相互印证的区间列为稳定候选。
@@ -38,6 +40,8 @@ Skill 不提供固定物料映射或样片时间码。使用 Whisper 时，必�
 先运行 `preflight --asset-manifest ...`。预检会阻止以下情况：Manifest 缺失、Manifest 与当前 `asset_root` 不一致、任意图片/视频 description/effective_region 为空或无效、时间轴视觉素材未被 Manifest 跟踪、普通素材没有明确绑定利益点，以及未知 `special_match_rule`。预检不使用 SHA-256 判断特殊素材；执行模型必须在生成前 Read 并确认画面符合对应规则。门禁失败时回到素材理解、利益点标注或特殊匹配步骤，不能用参数绕过。
 
 渲染只能使用 `scripts/soda_pipeline.py render` 进入 Skill 内置 `scripts/standalone_renderer.py`。禁止新建 `build_mix.py`、自写 renderer 或直接用 FFmpeg 生成可被称为正式成片的文件。内置 renderer 通过 Python 标准库和 FFmpeg/FFprobe 完成 ASS 字幕、媒体信息读取、调用方素材叠加、封面提取、BGM 混音和 JSON 报告，默认输出 1080×1920、30fps、H.264/AAC。BGM 先归一化到默认 `-28 LUFS`，再使用默认 `1.0` 的后置微调倍率；禁止把旧的 `0.22` 原始衰减值继续用于新流程。
+
+视频物料先执行 `setpts=PTS-STARTPTS+mapped_start/TB`，确保动画从显示入点的第一帧起播。`once_hold_last` 播放一次后保持尾帧，`once` 播完返回主画面，只有 `loop` 循环。`include_audio=true` 时使用素材自身音轨，按 `mapped_start` 延迟并应用 `audio_gain_db`；不得用合成正弦提示音替代。渲染报告保存 FFmpeg/FFprobe 路径和版本、Skill 版本、Alpha 抽样、完整 filter graph 与素材音轨混合证据。
 
 时间线 `motion_effects.mode` 默认为 `auto`。已安装的 `video-motion-effects` 可用时，为合格图片随机选择 Remotion 入场效果，生成短透明 ProRes 4444 片段；FFmpeg 延长稳定帧，在素材上方绘制字幕与 CTA，再叠加 logo，最后绘制警示语。随机选择必须记录种子，具体配置见 [motion-effects.md](motion-effects.md)。
 

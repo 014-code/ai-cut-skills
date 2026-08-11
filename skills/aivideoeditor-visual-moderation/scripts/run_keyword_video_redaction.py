@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sys
@@ -31,6 +32,7 @@ def load_module(path: Path, name: str) -> Any:
 KEYWORD_MOD = load_module(HERE / "simulate_keyword_text_audio_redaction.py", "keyword_redaction_impl")
 MASK_MOD = load_module(HERE / "run_aliyun_review_mask_rereview.py", "keyword_video_mask_impl")
 ASR_MOD = load_module(HERE / "run_high_accuracy_asr.py", "keyword_high_accuracy_asr")
+FEISHU_POLICY_MOD = load_module(HERE / "sync_feishu_keyword_policy.py", "keyword_feishu_policy_sync")
 
 SUBTITLE_SEARCH_BBOX = [0.04, 0.54, 0.96, 0.94]
 FALLBACK_SUBTITLE_LINE_BBOX = [0.22, 0.80, 0.78, 0.91]
@@ -582,13 +584,59 @@ def scan_full_video_ocr(
         else:
             fallback_count += 1
 
+    coarse_observations = list(observations)
+    existing_times = {round(float(item.get("time", 0.0)), 3) for item in observations}
+    boundary_times: List[float] = []
+    frame_step = 1.0 / fps if fps > 0 else min(0.04, interval_seconds / 6.0)
+    for left, right in zip(coarse_observations, coarse_observations[1:]):
+        left_text = str(left.get("text") or "")
+        right_text = str(right.get("text") or "")
+        left_hits = {hit.keyword for hit in KEYWORD_MOD.find_hits(left_text)}
+        right_hits = {hit.keyword for hit in KEYWORD_MOD.find_hits(right_text)}
+        if not (left_hits or right_hits):
+            continue
+        text_changed = text_match_score(left_text, right_text) < 0.72
+        if left_hits == right_hits and not text_changed:
+            continue
+        left_time = float(left.get("time", 0.0))
+        right_time = float(right.get("time", left_time))
+        timestamp = left_time + frame_step
+        while timestamp < right_time - frame_step * 0.35:
+            rounded = round(timestamp, 3)
+            if rounded not in existing_times:
+                boundary_times.append(timestamp)
+                existing_times.add(rounded)
+            timestamp += frame_step
+
+    adaptive_localized_count = 0
+    adaptive_fallback_count = 0
+    for timestamp in boundary_times:
+        frame = frame_at_time(capture, timestamp, fps)
+        if frame is None:
+            continue
+        observation = detect_subtitle_observation(frame)
+        observation["time"] = round(float(timestamp), 3)
+        observation["line_bbox"] = normalize_bbox(observation.get("line_bbox"))
+        observations.append(observation)
+        if observation.get("status") == "localized" and observation.get("line_bbox"):
+            adaptive_localized_count += 1
+        else:
+            adaptive_fallback_count += 1
+
+    observations.sort(key=lambda item: float(item.get("time", 0.0)))
+    localized_count += adaptive_localized_count
+    fallback_count += adaptive_fallback_count
+
     return observations, {
         "enabled": True,
-        "method": "full_video_fixed_interval_ocr",
+        "method": "full_video_fixed_interval_ocr_with_frame_boundary_refinement",
         "ocr_backend": "rapidocr_onnxruntime",
         "scan_interval_seconds": interval_seconds,
         "scan_duration_seconds": round(duration, 3),
-        "scan_frame_count": scanned_frame_count,
+        "scan_frame_count": scanned_frame_count + len(boundary_times),
+        "coarse_scan_frame_count": scanned_frame_count,
+        "adaptive_boundary_frame_count": len(boundary_times),
+        "adaptive_boundary_step_seconds": round(frame_step, 4),
         "localized_sample_count": localized_count,
         "fallback_sample_count": fallback_count,
     }
@@ -651,10 +699,56 @@ def full_ocr_hit_clusters(
         )
 
     for cluster in clusters:
-        cluster["start_time"] = round(max(0.0, cluster["first_time"] - interval_seconds * 1.05), 3)
-        cluster["end_time"] = round(cluster["last_time"] + interval_seconds * 1.05, 3)
+        cluster["start_time"], cluster["end_time"] = refine_ocr_cluster_window(
+            cluster,
+            observations,
+            interval_seconds=interval_seconds,
+        )
         cluster["timing_source"] = "full_video_ocr_frames"
     return clusters
+
+
+def refine_ocr_cluster_window(
+    cluster: Dict[str, Any],
+    observations: Sequence[Dict[str, Any]],
+    *,
+    interval_seconds: float,
+) -> Tuple[float, float]:
+    """Extend only a localized keyword box across subtitle visibility boundaries.
+
+    A coarse OCR scan can observe the first subtitle frame late. Extend across a
+    preceding empty OCR sample, or across a following empty sample, but never
+    across a different visible subtitle sentence. The renderer still receives
+    only the matched character bbox, so this cannot become a full-line mask.
+    """
+    first_time = float(cluster["first_time"])
+    last_time = float(cluster["last_time"])
+    source_text = str(cluster.get("source_text") or "")
+    ordered = sorted(observations, key=lambda item: float(item.get("time", 0.0)))
+    previous = next(
+        (item for item in reversed(ordered) if float(item.get("time", 0.0)) < first_time - 0.001),
+        None,
+    )
+    following = next(
+        (item for item in ordered if float(item.get("time", 0.0)) > last_time + 0.001),
+        None,
+    )
+
+    start = max(0.0, first_time - 0.06)
+    if previous is not None:
+        previous_text = str(previous.get("text") or "").strip()
+        if not previous_text:
+            start = max(0.0, float(previous.get("time", first_time)) - 0.015)
+        elif text_match_score(previous_text, source_text) >= 0.35:
+            start = max(0.0, float(previous.get("time", first_time)) - 0.015)
+
+    end = last_time + 0.10
+    if following is not None:
+        following_text = str(following.get("text") or "").strip()
+        if not following_text or text_match_score(following_text, source_text) >= 0.35:
+            end = float(following.get("time", last_time)) + 0.02
+
+    return round(max(0.0, start), 3), round(end, 3)
 
 
 def select_anchor_observation(
@@ -738,6 +832,21 @@ def locate_subtitle_hit_keyframes(
         active_end_time = max(float(item.get("time", end_time)) for item in active_observations)
     anchor_observation = select_anchor_observation(observations, target_time, keyword, preferred_text)
     anchor_line_bbox = normalize_bbox(anchor_observation.get("line_bbox")) if anchor_observation else None
+    anchor_text = str(anchor_observation.get("text") or "") if anchor_observation else ""
+    if not anchor_text or not keyword_norm or keyword_norm not in normalize_keyword_token(anchor_text):
+        anchor_text = preferred_text or anchor_text or keyword
+    anchor_start, anchor_end, _ = find_keyword_span(
+        anchor_text,
+        keyword,
+        preferred_start,
+        preferred_end,
+        preferred_text,
+    )
+    anchor_keyword_bbox = (
+        keyword_bbox_from_line(anchor_line_bbox, anchor_text, anchor_start, anchor_end)
+        if anchor_line_bbox and anchor_text
+        else None
+    )
     for observation in active_observations:
         timestamp = float(observation.get("time", start_time))
         line_bbox = anchor_line_bbox or normalize_bbox(observation.get("line_bbox")) or last_line_bbox or normalize_bbox(fallback_line_bbox)
@@ -758,7 +867,7 @@ def locate_subtitle_hit_keyframes(
             start, end, _ = find_keyword_span(preferred_text, keyword, preferred_start, preferred_end, preferred_text)
         if end <= start:
             end = min(len(chosen_text), start + max(1, len(keyword)))
-        keyword_bbox = keyword_bbox_from_line(line_bbox, chosen_text, start, end)
+        keyword_bbox = anchor_keyword_bbox or keyword_bbox_from_line(line_bbox, chosen_text, start, end)
         keyframes.append({"time": round(float(timestamp), 3), "bbox": keyword_bbox})
         diagnostics.append(
             {
@@ -768,6 +877,8 @@ def locate_subtitle_hit_keyframes(
                 "method": observation.get("method"),
                 "line_bbox": line_bbox,
                 "anchor_line_bbox": anchor_line_bbox,
+                "anchor_keyword_bbox": anchor_keyword_bbox,
+                "bbox_mode": "fixed_anchor_keyword_bbox" if anchor_keyword_bbox else "per_observation_keyword_bbox",
                 "keyword_bbox": keyword_bbox,
                 "text": sample_text,
                 "source_text": preferred_text,
@@ -1025,8 +1136,14 @@ def build_redactions(video: Path, plan: Dict[str, Any], fallback_subtitle_bbox: 
                 mask_start_time = max(0.0, float(hit.get("start_time", start_time)) - 0.12)
                 mask_end_time = float(hit.get("end_time", end_time)) + 0.08
             elif active_start is not None and active_end is not None:
-                mask_start_time = max(0.0, float(active_start) - 0.06)
-                mask_end_time = min(duration, float(active_end) + 0.10)
+                mask_start_time = max(
+                    0.0,
+                    min(float(hit.get("start_time", start_time)), float(active_start)) - 0.06,
+                )
+                mask_end_time = min(
+                    duration,
+                    max(float(hit.get("end_time", end_time)), float(active_end)) + 0.10,
+                )
             else:
                 mask_start_time = max(0.0, float(hit.get("start_time", start_time)) - SUBTITLE_TIME_PAD_SECONDS)
                 mask_end_time = float(hit.get("end_time", end_time)) + 0.04
@@ -1039,7 +1156,7 @@ def build_redactions(video: Path, plan: Dict[str, Any], fallback_subtitle_bbox: 
                     "bbox_keyframes": keyframes,
                     "bbox_interpolation": "step",
                     "replacement": "[已处理]",
-                    "reason": "keyword subtitle masking from business policy; localized to OCR subtitle text and hit character span; subtitle masks use step keyframes with a fixed anchor bbox so they appear immediately instead of sliding",
+                    "reason": "keyword subtitle masking from business policy; localized to OCR subtitle text and hit character span; subtitle masks use step keyframes with a fixed anchor keyword bbox so they appear immediately instead of sliding",
                     "keywords": [str(hit.get("keyword") or "")],
                     "char_start": hit.get("char_start"),
                     "char_end": hit.get("char_end"),
@@ -1077,16 +1194,8 @@ def build_redactions(video: Path, plan: Dict[str, Any], fallback_subtitle_bbox: 
             fallback_subtitle_bbox,
             last_line_bbox,
         )
-        active_start = localization.get("active_start_time")
-        active_end = localization.get("active_end_time")
-        start_time = round(
-            max(0.0, float(active_start) - 0.06) if active_start is not None else max(0.0, float(cluster["start_time"])),
-            3,
-        )
-        end_time = round(
-            min(duration, float(active_end) + 0.10) if active_end is not None else min(duration, float(cluster["end_time"])),
-            3,
-        )
+        start_time = round(max(0.0, float(cluster["start_time"])), 3)
+        end_time = round(min(duration, float(cluster["end_time"])), 3)
         existing = next(
             (
                 item
@@ -1196,6 +1305,8 @@ def write_human_report(path: Path, report: Dict[str, Any]) -> None:
         "",
         f"源视频: {report['source']}",
         f"输出视频: {report['output']}",
+        f"违禁词策略版本: {(report.get('keyword_policy') or {}).get('version', 'unknown')}",
+        f"违禁词策略来源: {(report.get('keyword_policy') or {}).get('source_url') or '内置兜底'}",
         f"字幕打码数量: {report['subtitle_redaction_count']}",
         f"音频消音数量: {report['audio_mute_count']}",
         "- 任一字幕打码范围都会被对应音频消音覆盖；OCR 补充打码会同步扩展消音范围。",
@@ -1286,6 +1397,15 @@ def main() -> int:
     parser.add_argument("--transcript", type=Path, help="Timestamped transcript JSON. If omitted, open-source ASR generates one first.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--policy-json", type=Path, help="Versioned Feishu keyword policy snapshot JSON.")
+    parser.add_argument(
+        "--refresh-feishu-policy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Refresh the keyword snapshot through official Feishu Wiki/Docx APIs before processing.",
+    )
+    parser.add_argument("--feishu-wiki-url", default=os.environ.get("FEISHU_KEYWORD_POLICY_URL") or FEISHU_POLICY_MOD.DEFAULT_WIKI_URL)
+    parser.add_argument("--feishu-api-base-url", default=os.environ.get("FEISHU_API_BASE_URL") or FEISHU_POLICY_MOD.DEFAULT_FEISHU_BASE_URL)
     parser.add_argument(
         "--subtitle-bbox",
         type=parse_bbox,
@@ -1300,6 +1420,23 @@ def main() -> int:
     parser.add_argument("--asr-keep-audio", action="store_true")
     parser.add_argument("--copy-when-clean", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
+
+    policy_path = args.policy_json or KEYWORD_MOD.DEFAULT_POLICY_PATH
+    policy_refresh: Dict[str, Any] = {"enabled": False}
+    refresh_feishu_policy = args.refresh_feishu_policy if args.refresh_feishu_policy is not None else not args.policy_json
+    if refresh_feishu_policy:
+        try:
+            policy_refresh = {
+                "enabled": True,
+                **FEISHU_POLICY_MOD.sync_keyword_policy(
+                    wiki_url=args.feishu_wiki_url,
+                    output_path=Path(policy_path),
+                    base_url=args.feishu_api_base_url,
+                ),
+            }
+        except Exception as exc:
+            raise SystemExit(f"Feishu policy API refresh failed: {exc}") from exc
+    keyword_policy = KEYWORD_MOD.configure_keyword_policy(policy_path)
 
     video = args.video.resolve()
     if not video.is_file():
@@ -1369,6 +1506,8 @@ def main() -> int:
         "source": str(video),
         "transcript": str(transcript),
         "transcript_generated": transcript_generated,
+        "keyword_policy": keyword_policy,
+        "keyword_policy_refresh": policy_refresh,
         "output": str(output),
         "plan_path": str(plan_path),
         "subtitle_bbox_normalized": list(args.subtitle_bbox),
