@@ -24,10 +24,12 @@ from .usergrowth_redfruit import is_redfruit_workflow
 ProgressCallback = Callable[[str], None]
 _BACKFILL_LOCKS_GUARD = threading.Lock()
 _BACKFILL_LOCKS: dict[str, threading.Lock] = {}
+ARTIFACT_SCHEMA_VERSION = 1
+WORKFLOW_CONTRACT_VERSION = "stable-v1"
 
 
 def _clamp_batch_concurrency(value: Any, batch_count: int) -> int:
-    """多批任务必须并行；默认按批次数启动，最高 10 个 worker。"""
+    """默认多批并行；显式传 1 时按队列串行，最高 10 个 worker。"""
     safe_batch_count = max(int(batch_count or 0), 1)
     if value is None or str(value).strip() == "":
         requested_workers = safe_batch_count
@@ -37,7 +39,8 @@ def _clamp_batch_concurrency(value: Any, batch_count: int) -> int:
         except (TypeError, ValueError):
             requested_workers = safe_batch_count
     worker_count = max(1, min(requested_workers, 10, safe_batch_count))
-    if safe_batch_count > 1:
+    # 用户显式指定 1 表示串行。其他情况保留原有多批默认并发行为。
+    if safe_batch_count > 1 and requested_workers != 1:
         worker_count = max(2, worker_count)
     return worker_count
 
@@ -101,6 +104,29 @@ def run_usergrowth_batches(
                 status="failed",
                 message=str(exc),
             )
+
+    if worker_count == 1:
+        for index, config in enumerate(configs):
+            result = run_one(index, config)
+            results[index] = result
+            if result.status == "failed" and index < len(configs) - 1:
+                _emit(
+                    progress,
+                    f"[{_batch_label(index, config)}] 已达到本批重试上限，"
+                    f"串行模式跳过当前批，继续第 {index + 2} 批",
+                )
+            if result.status == "cancelled":
+                for remaining_index in range(index + 1, len(configs)):
+                    remaining = configs[remaining_index]
+                    results[remaining_index] = UserGrowthBatchResult(
+                        index=remaining_index,
+                        order_id=remaining.order_id,
+                        video_folder=str(remaining.video_folder),
+                        status="cancelled",
+                        message="前一批已取消，串行队列停止",
+                    )
+                break
+        return [result for result in results if result is not None]
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
@@ -221,6 +247,9 @@ def _build_payload(
 ) -> dict:
     """组装 task.json 中保存的任务配置、统计和明细。"""
     return {
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
         "task_id": task_id,
         "task_root": str(task_root),
         "mode": "dry_run" if config.dry_run else "browser_upload",

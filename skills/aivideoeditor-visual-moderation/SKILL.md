@@ -21,7 +21,7 @@ Provider-backed video review workflow:
 Business-keyword subtitle/audio workflow:
 
 1. Prepare timestamped dialogue/subtitle segments as JSON, or generate them with `scripts/run_high_accuracy_asr.py`.
-2. Refresh the Feishu policy snapshot from the configured `素材尺度规范` wiki before a batch when the user is authenticated in Feishu. Keep the URL, document title, last-modified value, sync time, and policy version in `references/feishu_keyword_policy.json`; never store the Feishu password or browser tokens.
+2. Refresh the Feishu policy snapshot from the configured `素材尺度规范` wiki before every batch through the official Feishu Open API. Do not use browser automation for policy reading. Keep the URL, document title, last-modified value, sync time, API source, and policy version in `references/feishu_keyword_policy.json`; never store the Feishu password, app secret, access token, or browser tokens.
 3. Run `scripts/run_keyword_text_audio_redaction.py` or `scripts/run_keyword_video_redaction.py`.
 4. Mask every hit from the current Feishu-backed keyword policy in subtitles.
 5. Mute the matching dialogue span for every subtitle-masked hit.
@@ -68,13 +68,17 @@ Do not ask for a multimodal model key for this skill. This workflow is provider-
 
 For keyword subtitle/audio redaction:
 
+- Feishu Open API credentials: `FEISHU_ACCESS_TOKEN`, or both `FEISHU_APP_ID` and `FEISHU_APP_SECRET`.
+- For an externally shared/personal Wiki document that cannot add an application as a collaborator, use the user OAuth flow in `scripts/sync_feishu_keyword_policy_oauth.py`; the signed-in user's read permission is used and the temporary user token is never written to disk.
+- Feishu Wiki URL: `FEISHU_KEYWORD_POLICY_URL`, or the default `素材尺度规范` URL.
 - Timestamped dialogue/subtitle JSON, or omit `--transcript` to run the built-in demo.
 - For source-video redaction, omit `--transcript` to auto-generate one with `run_high_accuracy_asr.py` before keyword matching.
 - If available, `words` / `tokens` / `frontend.words` word-level timestamps are consumed automatically for tighter audio mute spans and better subtitle timing.
 - Output directory: `--output-dir`.
 - Policy snapshot: `references/feishu_keyword_policy.json` by default, or pass `--policy-json` explicitly.
 - `rapidocr_onnxruntime` must be available for precise OCR subtitle-line localization.
-- Do not require Aliyun, DashScope, or Qwen credentials.
+- Do not require Aliyun, DashScope, or Qwen credentials for this keyword workflow.
+- A live policy refresh requires Feishu credentials and is the default when `--policy-json` is omitted; use `--no-refresh-feishu-policy` only for an explicit offline/reproducible run.
 
 ## Evidence Rules
 
@@ -140,8 +144,11 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run
 Run keyword subtitle masking and synchronized audio mute planning:
 
 ```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\sync_feishu_keyword_policy.py
+
 python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_keyword_text_audio_redaction.py `
   --transcript D:\path\dialogue_segments.json `
+  --refresh-feishu-policy `
   --output-dir D:\path\keyword_redaction_output
 ```
 
@@ -159,8 +166,21 @@ Run actual source-video keyword masking and synchronized audio mute:
 python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\run_keyword_video_redaction.py `
   --video D:\path\source.mp4 `
   --output D:\path\processed.mp4 `
+  --refresh-feishu-policy `
   --output-dir D:\path\keyword_video_redaction_output
 ```
+
+`sync_feishu_keyword_policy.py` uses only official APIs: `wiki/v2/spaces/get_node` resolves the Wiki node and `docx/v1/documents/{document_id}/blocks` reads the cloud document blocks. It uses `FEISHU_ACCESS_TOKEN` when supplied, otherwise obtains a tenant token from `FEISHU_APP_ID` and `FEISHU_APP_SECRET`. The snapshot is written atomically only after all four required keyword groups are parsed successfully.
+
+For an external/personal Wiki node where tenant-token access returns `131006 node permission denied`, configure the app's OAuth redirect URL (default `http://127.0.0.1:8765/callback`) in the Feishu developer console, then run:
+
+```powershell
+$env:FEISHU_APP_ID = "..."
+$env:FEISHU_APP_SECRET = "..."
+python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\sync_feishu_keyword_policy_oauth.py
+```
+
+The script opens the official Feishu authorization page with user scopes `wiki:wiki:readonly docx:document:readonly`, validates `state`, exchanges the one-time code at `authen/v2/oauth/token`, and passes the user access token directly to the same Wiki/Docx reader. It does not persist the access token or refresh token. Configure these user-identity permissions in the developer console; application-identity permissions alone do not make them valid OAuth scopes. The redirect URL must exactly match the one configured in the app.
 
 The actual source-video workflow writes:
 

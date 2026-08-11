@@ -60,7 +60,7 @@ write_back_results(config.order_excel, config.order_excel, plan.items, include_r
 
 The runner serializes writes per resolved Excel path, which protects same-process multi-batch writes. It does not protect against Excel/WPS having the file open.
 
-For `workflow=redfruit_short_drama`, the browser phase does not write a song Excel. After review it opens the task-created material list, adds ARLP, and waits for the separate ARLP operation task to report that every selected material succeeded. A partial or failed ARLP task is retried from a fresh `点第一张素材 -> 全选所有 -> 增加ARLP` selection cycle until the task row's successful count equals its total count or the user cancels the run. Once ARLP is complete, the same material set goes through `编辑 -> 修改分类标签`; its operation task is checked with the same counters, and any partial result is retried from a fresh full-selection cycle until every material reports success.
+For `workflow=redfruit_short_drama`, the browser phase does not write a song Excel. After review it opens the task-created material list, adds ARLP, and waits for the separate ARLP operation task to report that every selected material succeeded. A partial or failed ARLP task is retried from a fresh `点第一张素材 -> 全选所有 -> 增加ARLP` selection cycle until the task row's successful count equals its total count or the user cancels the run. Once ARLP is complete, the same material set goes through `编辑 -> 修改分类标签` and finishes when the material-page save succeeds; classification does not open or wait for an ARLP-style operation task page.
 
 ## Batch Runs
 
@@ -68,8 +68,8 @@ The vendored desktop runner still provides `run_usergrowth_batches` for whole-fo
 
 1. Read top-level defaults and each `batches[]` entry.
 2. Resolve `videos`, `video_globs`, `video_list`, or explicit `all_videos=true` per batch.
-3. Clamp `concurrency` to `1..10`, but default to the batch count when omitted and lift multi-batch runs to at least `2` workers.
-4. Run each batch in a `ThreadPoolExecutor`; each batch creates its own task folder and browser run in live mode.
+3. Clamp `concurrency` to `1..10`; when omitted, default to the batch count and keep multi-batch runs concurrent, while explicit `concurrency=1` selects serial queue execution.
+4. In serial mode, run batches in order. This applies equally to `soda_music` and `redfruit_short_drama`: a batch that reaches its retry limit is recorded as `failed`, skipped, and the next batch starts. A user cancellation/manual browser close stops the serial queue without opening the next browser. In concurrent mode, run each batch in a `ThreadPoolExecutor`; each batch creates its own task folder and browser run in live mode.
 5. Write aggregate `batch_summary.json` and `run.log` under `<output-root>/batch_runs/<timestamp>_<task-name>/`.
 
 Same-process writes to the same backfill Excel still use `_backfill_lock`, so live batch completion writes are serialized inside this CLI process. It does not protect against Excel/WPS having the file open.
@@ -78,12 +78,16 @@ Same-process writes to the same backfill Excel still use `_backfill_lock`, so li
 
 - `task.json`: machine-readable config, summary, result path, duplicate song workbook path, and plans/items.
 - `run.log`: summary, selected template fields in config, `[song_matches]`, and per-item status/type/song/CID/tags.
-- Soda Music and Redfruit live runs additionally update a workflow checkpoint (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`) at each order stage. The file stores per-order stage, platform task IDs, item retry metadata, and CID/status so `--resume-task` can continue without recreating completed upload, review, CID backfill, ARLP, or classification work.
+- Soda Music and Redfruit live runs additionally update a workflow checkpoint (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`) at each order stage. The file stores per-order stage, platform task IDs, operation-task retry counts, item retry metadata, and CID/status so `--resume-task` can continue without recreating completed upload, review, CID backfill, ARLP, or classification work. Soda specifically records `review_submitting -> review_submitted -> cid_backfilling`; resuming these stages skips upload, and an exact failed review row retains its consumed retry count across browser restarts.
 - `error.json` and `error.log`: task-level failure records when execution fails after the task folder is created.
 - `<output_root>/_cli_errors/*.json` and `*.log`: early CLI failures before a task folder exists, when `output_root` was already parsed.
 - `batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log`: aggregate multi-batch status, child task folders, and child error log pointers.
 - `debug/run.log`: browser-level timing and error-snapshot metadata.
+- `debug/events.jsonl`: append-only structured browser events for run start/end, checkpoints, row-scoped upload retry, duplicate-material deferral, and error snapshots. This is diagnostic-only and never controls browser decisions.
 - `debug/*.txt` and `debug/*.png`: only written by error snapshots in current code because normal `_snapshot(..., screenshot=False)` returns early.
+- `diagnostic_summary.json`: compact task status, workflow, order stages, task IDs, checkpoint path, artifact paths, latest error, and a resume command when the checkpoint is resumable.
+
+Checkpoint JSON keeps the existing `version` contract and additionally records `artifact_schema_version`, `workflow_contract_version`, selected-video count, and order IDs. These fields are informational and backward-compatible; they do not alter stage transitions.
 
 ## Status Values
 

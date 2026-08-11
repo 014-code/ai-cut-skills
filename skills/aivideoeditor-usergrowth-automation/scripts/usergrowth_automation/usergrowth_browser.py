@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import json
+import os
 import re
 import threading
 import time
 import traceback
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .usergrowth_captcha import UserGrowthCaptchaSolver
 from .usergrowth_models import UserGrowthCancelled, UserGrowthOrderPlan, UserGrowthVideoItem
@@ -43,6 +48,7 @@ WORK_ORDER_URL = "https://usergrowth.com.cn/aigc/manage/order"
 
 # 操作速度
 USERGROWTH_OPERATION_SPEED_FACTOR = 1.0
+OPERATION_TASK_RETRY_LIMIT = 3
 
 # 投放信息弹窗选择器：定位 Arco Modal / Dialog / Drawer 等弹窗容器
 DELIVERY_MODAL_SELECTOR = ".arco-modal, .arco-modal-content, [role='dialog'], .arco-drawer"
@@ -61,6 +67,10 @@ DROPDOWN_OPTION_SELECTOR = ".arco-select-option, .arco-cascader-option, [role='o
 
 class UserGrowthFatalPageError(RuntimeError):
     """页面明确给出不可重试原因时直接中止当前重试。"""
+
+
+class UserGrowthOperationTaskFailed(RuntimeError):
+    """操作任务明确失败且已达到行级重试边界，禁止 CID 兜底绕过。"""
 
 
 class UserGrowthBrowserClient:
@@ -95,6 +105,11 @@ class UserGrowthBrowserClient:
         self.cancel_event = cancel_event
         self.operation_speed_factor = max(float(USERGROWTH_OPERATION_SPEED_FACTOR or 1.0), 0.1)
         self._captcha_solver: UserGrowthCaptchaSolver | None = None
+        self._browser_process_id: int | None = None
+        self._browser_process_handle: int | None = None
+        self._tracked_browser = None
+        self._browser_disconnected = False
+        self._browser_disconnected_at = 0.0
 
     async def run(self, plans: list[UserGrowthOrderPlan], progress: ProgressCallback | None = None) -> None:
         """启动浏览器并按订单计划逐单处理上传流程。"""
@@ -107,6 +122,11 @@ class UserGrowthBrowserClient:
         start_ts = datetime.now().isoformat(timespec="seconds")
         self._write_run_log(
             f"[{start_ts}] run start, plans={len(plans)}"
+        )
+        self._write_event(
+            "run_start",
+            plan_count=len(plans),
+            order_ids=[plan.order_id for plan in plans],
         )
 
         self._raise_if_cancelled()
@@ -129,7 +149,8 @@ class UserGrowthBrowserClient:
                         await self._login(page, progress)
                         break
                     except Exception as exc:
-                        if not self._is_recoverable_session_exception(exc):
+                        loading_stalled = await self._page_is_blank_or_loading(page)
+                        if not self._is_recoverable_session_exception(exc) and not loading_stalled:
                             raise
                         page = await self._wait_for_network_recovery(
                             page,
@@ -162,7 +183,8 @@ class UserGrowthBrowserClient:
                                 await self._process_order(page, plan, progress)
                             break
                         except Exception as exc:
-                            if not self._is_recoverable_session_exception(exc):
+                            loading_stalled = await self._page_is_blank_or_loading(page)
+                            if not self._is_recoverable_session_exception(exc) and not loading_stalled:
                                 raise
                             page = await self._wait_for_network_recovery(
                                 page,
@@ -182,6 +204,7 @@ class UserGrowthBrowserClient:
             except Exception as exc:
                 if self._cancel_requested():
                     raise UserGrowthCancelled("任务已取消") from exc
+                await self._raise_if_user_closed_browser(exc, progress)
                 raise
             finally:
                 cancel_task.cancel()
@@ -195,11 +218,24 @@ class UserGrowthBrowserClient:
                     f"[{end_ts}] run finished, elapsed={elapsed:.2f}s, "
                     f"plans={len(plans)}"
                 )
+                self._write_event(
+                    "run_finished",
+                    elapsed_seconds=round(elapsed, 2),
+                    plans=[
+                        {
+                            "order_id": plan.order_id,
+                            "stage": plan.stage,
+                            "status": plan.status,
+                        }
+                        for plan in plans
+                    ],
+                )
                 try:
                     current_browser = session.get("browser", browser)
                     await current_browser.close()
                 except Exception:
                     pass
+                self._close_browser_process_probe()
 
     async def run_existing_creative_units(
             self,
@@ -230,6 +266,25 @@ class UserGrowthBrowserClient:
         except Exception as exc:
             print(f"[run.log] 写入失败: {exc}")
 
+    def _write_event(self, event_type: str, **fields) -> None:
+        """追加结构化诊断事件；写入失败不得影响浏览器业务流程。"""
+        event_path = (
+            (self.debug_dir / "events.jsonl")
+            if self.debug_dir
+            else Path("events.jsonl")
+        )
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event": event_type,
+            **fields,
+        }
+        try:
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(event_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
     def _checkpoint(
             self,
             plan: UserGrowthOrderPlan,
@@ -247,6 +302,18 @@ class UserGrowthBrowserClient:
             f"review_task_id={plan.review_task_id}, arlp_task_id={plan.arlp_task_id}, "
             f"classification_task_id={plan.classification_task_id}, message={plan.checkpoint_message}"
         )
+        self._write_event(
+            "checkpoint",
+            order_id=plan.order_id,
+            stage=stage,
+            status=plan.status,
+            upload_task_id=plan.upload_task_id or plan.task_id,
+            review_task_id=plan.review_task_id,
+            arlp_task_id=plan.arlp_task_id,
+            classification_task_id=plan.classification_task_id,
+            operation_retry_counts=dict(plan.operation_retry_counts),
+            message=plan.checkpoint_message,
+        )
         if self.checkpoint_callback:
             try:
                 self.checkpoint_callback(plan)
@@ -261,13 +328,139 @@ class UserGrowthBrowserClient:
         last_error: Exception | None = None
         for channel in ("msedge", "chrome"):
             try:
-                return await playwright.chromium.launch(
+                browser = await playwright.chromium.launch(
                     channel=channel, headless=self.headless, slow_mo=self._scale_ms(self.browser_slow_mo_ms)
                 )
+                await self._track_browser_process(browser)
+                return browser
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 continue
         raise RuntimeError(f"启动浏览器失败：{last_error}")
+
+    async def _track_browser_process(self, browser) -> None:
+        """记录 Chromium 主进程，区分用户正常关闭与浏览器异常退出。"""
+        self._close_browser_process_probe()
+        self._tracked_browser = browser
+        self._browser_disconnected = False
+        self._browser_disconnected_at = 0.0
+        browser.on("disconnected", lambda *_: self._mark_browser_disconnected(browser))
+        if os.name != "nt":
+            return
+
+        cdp_session = None
+        try:
+            cdp_session = await browser.new_browser_cdp_session()
+            process_payload = await cdp_session.send("SystemInfo.getProcessInfo")
+            browser_row = next(
+                row for row in process_payload.get("processInfo", [])
+                if str(row.get("type") or "").lower() == "browser"
+            )
+            browser_pid = int(browser_row.get("id") or 0)
+            if browser_pid <= 0:
+                return
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, browser_pid)
+            if not handle:
+                return
+            self._browser_process_id = browser_pid
+            self._browser_process_handle = int(handle)
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] browser process tracked: "
+                f"pid={browser_pid}"
+            )
+        except Exception as exc:
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] browser process probe unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            if cdp_session is not None:
+                try:
+                    await cdp_session.detach()
+                except Exception:
+                    pass
+
+    def _mark_browser_disconnected(self, browser) -> None:
+        """记录浏览器断开，让没有立即抛异常的轮询也能结束或恢复。"""
+        if browser is not self._tracked_browser:
+            return
+        self._browser_disconnected = True
+        self._browser_disconnected_at = time.monotonic()
+
+    def _read_browser_process_exit_code(self) -> int | None:
+        """读取已跟踪浏览器的退出码；259 表示进程仍在运行。"""
+        if os.name != "nt" or not self._browser_process_handle:
+            return None
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            exit_code = wintypes.DWORD(0)
+            if not kernel32.GetExitCodeProcess(
+                    wintypes.HANDLE(self._browser_process_handle),
+                    ctypes.byref(exit_code),
+            ):
+                return None
+            return int(exit_code.value)
+        except Exception:
+            return None
+
+    async def _wait_for_browser_process_exit_code(self, wait_seconds: float = 2.0) -> int | None:
+        """短暂等待浏览器进程退出，避免断开事件早于退出码更新。"""
+        deadline = time.monotonic() + max(wait_seconds, 0.0)
+        while True:
+            exit_code = self._read_browser_process_exit_code()
+            if exit_code is None or exit_code != 259:
+                return exit_code
+            if time.monotonic() >= deadline:
+                return exit_code
+            await asyncio.sleep(0.1)
+
+    async def _raise_if_user_closed_browser(
+            self,
+            exc: BaseException,
+            progress: ProgressCallback | None = None,
+    ) -> None:
+        """Chrome 正常退出视为用户关闭；异常退出仍交给断点恢复。"""
+        if not self._is_session_closed_exception(exc):
+            return
+        exit_code = await self._wait_for_browser_process_exit_code()
+        self._write_run_log(
+            f"[{datetime.now().isoformat(timespec='seconds')}] browser disconnected: "
+            f"pid={self._browser_process_id or ''}, exit_code={exit_code}"
+        )
+        if exit_code != 0:
+            return
+        message = "检测到用户主动关闭浏览器，任务已停止，不自动重启"
+        self._emit(progress, message)
+        self._write_event(
+            "browser_closed_by_user",
+            browser_pid=self._browser_process_id,
+            exit_code=exit_code,
+        )
+        raise UserGrowthCancelled(message) from exc
+
+    def _close_browser_process_probe(self) -> None:
+        """释放用于读取 Chromium 退出码的 Windows 进程句柄。"""
+        handle = self._browser_process_handle
+        self._browser_process_handle = None
+        self._browser_process_id = None
+        self._tracked_browser = None
+        self._browser_disconnected = False
+        self._browser_disconnected_at = 0.0
+        if os.name != "nt" or not handle:
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+        except Exception:
+            pass
 
     async def _login(self, page, progress: ProgressCallback | None) -> None:
         """打开登录页，填写账号密码并自动识别图片验证码。"""
@@ -279,6 +472,10 @@ class UserGrowthBrowserClient:
             return
 
         for attempt in range(1, 6):
+            await self._wait_login_form_ready(page, progress)
+            if await self._looks_logged_in(page):
+                self._emit(progress, "当前浏览器上下文已登录")
+                return
             self._emit(progress, f"填写账号密码并识别验证码，第 {attempt} 次")
             await self._fill_first(
                 page,
@@ -299,7 +496,37 @@ class UserGrowthBrowserClient:
                 self._emit(progress, "登录成功")
                 return
             await self._snapshot_error(page, f"login_failed_{attempt}")
+            await self._safe_goto(page, LOGIN_URL)
         raise RuntimeError("UserGrowth 登录失败：验证码或账号密码未通过")
+
+    async def _wait_login_form_ready(self, page, progress: ProgressCallback | None) -> None:
+        """登录页白屏或延迟渲染时保持浏览器打开，直到账号和密码输入框都出现。"""
+        attempt = 0
+        delay_seconds = 2.0
+        while True:
+            self._raise_if_cancelled()
+            if await self._looks_logged_in(page):
+                return
+            try:
+                account_box = page.locator("input[placeholder='请输入注册邮箱'], input[type='text']").first
+                password_box = page.locator("input[type='password'], input[placeholder*='密码']").first
+                if (
+                        await account_box.count()
+                        and await password_box.count()
+                        and await account_box.is_visible()
+                        and await password_box.is_visible()
+                ):
+                    return
+            except Exception as exc:
+                if self._is_session_closed_exception(exc):
+                    raise
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                self._emit(progress, f"登录页仍在加载，保持浏览器打开继续等待（第 {attempt} 次）")
+            if attempt % 5 == 0:
+                await self._safe_goto(page, LOGIN_URL)
+            await self._sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, 30.0)
 
     async def _fill_captcha_until_available(self, page, progress: ProgressCallback | None) -> None:
         """验证码图片截图失败时刷新登录页，一直重试到成功或用户取消。"""
@@ -332,16 +559,56 @@ class UserGrowthBrowserClient:
             await route.continue_()
 
         await context.route("**/*", handle_route)
-        self._emit(progress, "已开启登录后静态资源拦截：图片、字体、favicon")
+        self._emit(progress, "已开启登录后非业务资源拦截：图片、字体、视频、favicon、第三方埋点和广告")
 
     @staticmethod
     def _should_block_static_resource(request) -> bool:
-        """判断登录后的请求是否属于可拦截静态资源。"""
+        """判断登录后的请求是否属于可拦截的非业务资源。"""
         resource_type = getattr(request, "resource_type", "")
-        if resource_type in {"image", "font"}:
+        if resource_type in {"image", "font", "media"}:
             return True
-        url = str(getattr(request, "url", "") or "").lower()
-        return "favicon.ico" in url
+        raw_url = str(getattr(request, "url", "") or "")
+        url = raw_url.lower()
+        if "favicon.ico" in url:
+            return True
+
+        parts = urlsplit(raw_url)
+        hostname = (parts.hostname or "").lower()
+        third_party_tracking_hosts = (
+            "google-analytics.com",
+            "googletagmanager.com",
+            "googlesyndication.com",
+            "doubleclick.net",
+            "facebook.net",
+            "clarity.ms",
+            "hotjar.com",
+            "mixpanel.com",
+            "amplitude.com",
+            "sentry.io",
+            "bugsnag.com",
+            "hm.baidu.com",
+            "cnzz.com",
+            "umeng.com",
+        )
+        if any(hostname == host or hostname.endswith(f".{host}") for host in third_party_tracking_hosts):
+            return True
+
+        # 只对非 UserGrowth 主站的明确采集/广告路径做保守拦截，避免误伤业务 API。
+        if hostname and not hostname.endswith("usergrowth.com.cn"):
+            tracking_path_markers = (
+                "/collect",
+                "/analytics",
+                "/tracking",
+                "/track.",
+                "/pixel",
+                "/beacon",
+                "/adservice",
+                "/ads/",
+                "/advertising/",
+            )
+            if any(marker in parts.path.lower() for marker in tracking_path_markers):
+                return True
+        return False
 
     async def _looks_logged_in(self, page) -> bool:
         """根据 URL 和页面文本判断当前是否已登录。"""
@@ -429,8 +696,70 @@ class UserGrowthBrowserClient:
             plan.status = "success"
             plan.message = "红果短剧流程已完成，断点续跑跳过"
             return
+
+        # ARLP/分类标签阶段如果已经把本批 CID 写入 checkpoint，旧的上传/送审
+        # 任务就不再是恢复入口。直接去素材管理按 CID 搜索，避免被历史任务状态
+        # 卡住，也避免误回到上传流程。
+        if stage in {
+                "review_submitted",
+                "arlp_submitting",
+                "arlp_success",
+                "classification_submitting",
+        } and self._redfruit_checkpoint_has_all_cids(items):
+            self._emit(
+                progress,
+                f"红果断点续跑：本批 {len(items)} 个 CID 已存在，跳过旧任务，直接进入素材管理搜索",
+            )
+            material_page = await self._open_redfruit_material_management_by_cids(
+                page,
+                items,
+                progress,
+            )
+            await self._process_redfruit_material_stages(material_page, plan, items, progress)
+            return
+
         task_id = str(plan.review_task_id or plan.upload_task_id or plan.task_id or "").strip()
         if not task_id:
+            if stage == "upload_processing":
+                existing_items = [
+                    item for item in items
+                    if item.status not in {"success", "skipped"}
+                    and self._existing_creative_unit_id_for_item(item)
+                ]
+                already_done = [item for item in items if item.status in {"success", "skipped"}]
+                if existing_items:
+                    self._emit(
+                        progress,
+                        f"红果断点续跑：上传任务号缺失，已记录 {len(existing_items)}/{len(items)} 个原创意单元，"
+                        "跳过重新上传，直接进入创意单元补录",
+                    )
+                    await self._open_work_order_management(page, progress)
+                    await self._process_existing_creative_unit_items(page, plan, existing_items, progress)
+                    remaining = [item for item in items if item.status not in {"success", "skipped"}]
+                    if not remaining:
+                        plan.status = "success"
+                        plan.message = "红果原创意单元补录流程完成"
+                        self._checkpoint(
+                            plan,
+                            "completed",
+                            "红果断点补录完成；平台提示已录入为素材时直接结束",
+                        )
+                        return
+                    plan.status = "failed"
+                    plan.message = (
+                        f"红果断点已补录 {len(items) - len(remaining)}/{len(items)} 个素材，"
+                        f"仍有 {len(remaining)} 个素材未恢复；已阻止重新上传"
+                    )
+                    self._checkpoint(plan, "upload_processing", plan.message)
+                    raise RuntimeError(plan.message)
+                if already_done and len(already_done) == len(items):
+                    plan.status = "success"
+                    plan.message = "红果原创意单元补录流程已完成"
+                    self._checkpoint(plan, "completed", "红果断点补录已完成，跳过重复补录")
+                    return
+                plan.status = "failed"
+                plan.message = "红果断点缺少上传任务号和原创意单元 ID，已阻止重新上传"
+                raise RuntimeError(plan.message)
             self._write_run_log(
                 f"[{datetime.now().isoformat(timespec='seconds')}] redfruit resume: "
                 f"order_id={plan.order_id}, stage={stage}, task_id missing; restart upload path"
@@ -454,23 +783,21 @@ class UserGrowthBrowserClient:
                 )
             stage = plan.stage
 
-        if stage == "classification_submitting" and plan.classification_task_id:
-            await self._search_task_by_id(page, plan.classification_task_id)
-            result = await self._wait_redfruit_arlp_task_result(page, progress, "修改分类标签")
-            if self._redfruit_operation_all_expected_success(result, len(items)):
-                self._checkpoint(plan, "classification_success", "断点恢复确认分类标签已全部成功")
-                plan.status = "success"
-                self._checkpoint(plan, "completed", "断点恢复后红果流程全部完成")
-                return
-            self._emit(progress, "断点恢复发现分类标签任务未覆盖全部素材，将重新全选本批素材后补改")
-            stage = plan.stage
+        if stage == "classification_submitting":
+            # 修改分类标签保存后不会提供稳定的任务详情入口。断点恢复时直接回到
+            # 本批素材列表重新全选并保存，保持操作幂等且不再等待 ARLP 任务页。
+            plan.classification_task_id = ""
+            self._emit(progress, "断点恢复修改分类标签：直接回素材管理重新保存，不进入任务详情页")
 
-        if stage in {"upload_task_created", "upload_success"}:
+        if stage in {"upload_processing", "upload_task_created", "upload_success"}:
+            if stage == "upload_processing":
+                self._emit(progress, f"红果短剧已记录上传任务 {task_id}，断点续跑跳过重复上传")
             detail_page = await self._open_task_detail_for_task_id(
                 page,
                 task_id,
                 progress,
                 expected_attempts=max(len(items), 1),
+                retry_failed_task=True,
             )
             plan.upload_task_id = task_id
             plan.task_id = task_id
@@ -509,6 +836,13 @@ class UserGrowthBrowserClient:
         plan.stage = "preflight_done"
         await self._process_order(page, plan, progress)
 
+    @staticmethod
+    def _redfruit_checkpoint_has_all_cids(items: list[UserGrowthVideoItem]) -> bool:
+        """判断断点中的 CID 是否足够直接恢复素材管理后半段。"""
+        active_items = [item for item in items if item.status != "skipped"]
+        cids = [str(item.cid or "").strip().lower() for item in active_items]
+        return bool(cids) and all(cids) and len(set(cids)) == len(cids)
+
     async def _resume_soda_order(
             self,
             page,
@@ -540,7 +874,10 @@ class UserGrowthBrowserClient:
         self._emit(progress, f"汽水音乐断点续跑：订单 {plan.order_id}，当前阶段 {stage}，任务 {task_id}")
         await self._open_work_order_management(page, progress)
 
-        if stage in {"upload_task_created", "upload_success"}:
+        detail_page = None
+        if stage in {"upload_processing", "upload_task_created"}:
+            if stage == "upload_processing":
+                self._emit(progress, f"汽水音乐已记录上传任务 {task_id}，断点续跑跳过重复上传")
             detail_page = await self._open_task_detail_for_task_id(
                 page,
                 task_id,
@@ -550,11 +887,35 @@ class UserGrowthBrowserClient:
             plan.task_id = task_id
             plan.upload_task_id = task_id
             self._checkpoint(plan, "upload_success", f"断点恢复确认上传任务 {task_id} 全部成功")
-            await self._submit_review(detail_page)
-            plan.review_task_id = task_id
-            self._checkpoint(plan, "review_submitted", f"断点恢复后完成送审，任务 ID：{task_id}")
+
+        if stage in {"upload_success", "review_submitting"} or plan.stage == "upload_success":
+            if detail_page is None:
+                detail_page = await self._open_task_detail_for_task_id(
+                    page,
+                    task_id,
+                    progress,
+                    expected_attempts=max(len(items), 1),
+                    retry_failed_task=stage == "review_submitting",
+                    operation_name="汽水音乐送审",
+                    plan=plan,
+                )
+            await self._submit_soda_review(
+                detail_page,
+                plan,
+                task_id,
+                progress,
+                allow_already_submitted=stage == "review_submitting",
+            )
             self._checkpoint(plan, "cid_backfilling", f"开始读取任务 {task_id} 的 CID 并回填")
-            await self._fill_cids_for_task(detail_page, items, task_id, progress)
+            await self._fill_cids_for_task(
+                detail_page,
+                items,
+                task_id,
+                progress,
+                retry_failed_task=True,
+                operation_name="汽水音乐送审",
+                plan=plan,
+            )
             plan.status = "success"
             plan.message = "汽水音乐断点恢复、送审和 CID 回填完成"
             self._checkpoint(plan, "completed", "汽水音乐流程全部完成")
@@ -564,7 +925,15 @@ class UserGrowthBrowserClient:
             plan.task_id = task_id
             plan.review_task_id = task_id
             self._checkpoint(plan, "cid_backfilling", f"断点恢复后继续读取任务 {task_id} 的 CID")
-            await self._fill_cids_for_task(page, items, task_id, progress)
+            await self._fill_cids_for_task(
+                page,
+                items,
+                task_id,
+                progress,
+                retry_failed_task=True,
+                operation_name="汽水音乐送审",
+                plan=plan,
+            )
             plan.status = "success"
             plan.message = "汽水音乐断点恢复 CID 回填完成"
             self._checkpoint(plan, "completed", "汽水音乐流程全部完成")
@@ -588,13 +957,23 @@ class UserGrowthBrowserClient:
         upload_items = [
             item for item in original_active_items
             if item.status not in {"success", "deferred_existing_creative_unit"}
+            and not self._existing_creative_unit_id_for_item(item)
         ]
         redfruit_flow = self._is_redfruit_items(active_items)
 
-        if redfruit_flow and plan.stage not in {"pending", "preflight_done", "upload_processing"}:
+        redfruit_recorded_task_id = str(
+            plan.review_task_id or plan.upload_task_id or plan.task_id or ""
+        ).strip()
+        if redfruit_flow and plan.stage not in {"pending", "preflight_done"}:
             await self._resume_redfruit_order(page, plan, active_items, progress)
             return
-        if not redfruit_flow and plan.stage not in {"pending", "upload_processing"}:
+        soda_recorded_task_id = str(
+            plan.review_task_id or plan.upload_task_id or plan.task_id or ""
+        ).strip()
+        if not redfruit_flow and (
+                plan.stage not in {"pending", "upload_processing"}
+                or (plan.stage == "upload_processing" and soda_recorded_task_id)
+        ):
             await self._resume_soda_order(page, plan, active_items, progress)
             return
 
@@ -614,7 +993,12 @@ class UserGrowthBrowserClient:
                 await self._process_existing_creative_unit_items(
                     page,
                     plan,
-                    [item for item in original_active_items if self._existing_creative_unit_id_for_item(item)],
+                    [
+                        item
+                        for item in original_active_items
+                        if item.status not in {"success", "skipped"}
+                        and self._existing_creative_unit_id_for_item(item)
+                    ],
                     progress,
                 )
                 plan.status = "success"
@@ -636,7 +1020,8 @@ class UserGrowthBrowserClient:
             existing_unit_items = [
                 item
                 for item in original_active_items
-                if self._existing_creative_unit_id_for_item(item)
+                if item.status not in {"success", "skipped"}
+                and self._existing_creative_unit_id_for_item(item)
             ]
             if upload_items:
                 plan.task_id = await self._read_current_task_id(page, progress=progress)
@@ -652,18 +1037,29 @@ class UserGrowthBrowserClient:
                     expected_attempts=max(len(upload_items), 1),
                     plan=None if redfruit_flow else plan,
                     items=[] if redfruit_flow else upload_items,
-                    task_id="" if redfruit_flow else plan.task_id,
+                    task_id=plan.task_id,
+                    retry_failed_task=redfruit_flow,
+                    operation_name="素材上传",
                 )
                 if wait_result != "cid_backed_up":
                     self._checkpoint(plan, "upload_success", f"上传任务 {plan.task_id} 全部成功")
-                    await self._submit_review(page)
-                    plan.review_task_id = plan.task_id
-                    self._checkpoint(plan, "review_submitted", f"已完成送审，任务 ID：{plan.review_task_id}")
                     if redfruit_flow:
+                        await self._submit_review(page)
+                        plan.review_task_id = plan.task_id
+                        self._checkpoint(plan, "review_submitted", f"已完成送审，任务 ID：{plan.review_task_id}")
                         await self._process_redfruit_after_review(page, plan, upload_items, plan.task_id, progress)
                     else:
+                        await self._submit_soda_review(page, plan, plan.task_id, progress)
                         self._checkpoint(plan, "cid_backfilling", f"开始读取任务 {plan.task_id} 的 CID 并回填")
-                        await self._fill_cids_for_task(page, upload_items, plan.task_id, progress)
+                        await self._fill_cids_for_task(
+                            page,
+                            upload_items,
+                            plan.task_id,
+                            progress,
+                            retry_failed_task=True,
+                            operation_name="汽水音乐送审",
+                            plan=plan,
+                        )
                         self._checkpoint(plan, "completed", "汽水音乐上传、送审和 CID 回填全部完成")
                 else:
                     self._checkpoint(plan, "cid_backfilled_unreviewed", "CID 已备份回填，当前任务尚未送审")
@@ -1672,6 +2068,12 @@ class UserGrowthBrowserClient:
                             f"[{datetime.now().isoformat(timespec='seconds')}] upload retry clicked "
                             f"file={item.file_name}, reason={reason}"
                         )
+                        self._write_event(
+                            "upload_row_retry_clicked",
+                            order_id=item.order_id,
+                            file_name=item.file_name,
+                            reason=reason,
+                        )
                         if plan is not None:
                             self._checkpoint(
                                 plan,
@@ -1721,6 +2123,14 @@ class UserGrowthBrowserClient:
             self._write_run_log(
                 f"[{datetime.now().isoformat(timespec='seconds')}] upload duplicate recovered "
                 f"file={item.file_name}, creative_unit={unit_id}, material={material_id or ''}, reason={reason}"
+            )
+            self._write_event(
+                "upload_duplicate_deferred",
+                order_id=item.order_id,
+                file_name=item.file_name,
+                creative_unit_id=unit_id,
+                material_id=material_id or "",
+                reason=reason,
             )
             if plan is not None:
                 self._checkpoint(
@@ -2539,12 +2949,37 @@ class UserGrowthBrowserClient:
         """只点击录入变色龙投放信息弹窗里的确认按钮。"""
         await self._close_open_delivery_dropdown_if_needed(page)
         root = await self._delivery_modal_root(page)
+        clicked = False
         if root:
             for button in await self._visible_locators(root.locator("button"), limit=20):
                 text = _compact_text(await self._locator_text(button, timeout_ms=1000))
                 if text in {"确认", "确定"} and await self._click_locator(button):
-                    return
-        await self._click_first(page, ("button:has-text('确认')", "button:has-text('确定')"))
+                    clicked = True
+                    break
+        if not clicked:
+            await self._click_first(page, ("button:has-text('确认')", "button:has-text('确定')"))
+        await self._wait_chameleon_modal_closed(page)
+
+    async def _wait_chameleon_modal_closed(self, page) -> None:
+        """等待投放信息弹窗真正关闭，再操作背景素材卡片。"""
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            modal_visible = False
+            for root in await self._visible_locators(page.locator(DELIVERY_MODAL_SELECTOR), limit=30):
+                text = _compact_text(await self._locator_text(root, timeout_ms=1000))
+                if "投放产品" in text and "投放平台" in text:
+                    modal_visible = True
+                    break
+            if not modal_visible:
+                return
+            attempt += 1
+            if attempt == 1 or attempt % 20 == 0:
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] "
+                    f"waiting chameleon delivery modal closed, attempt={attempt}"
+                )
+            await self._sleep(0.5)
 
     @staticmethod
     def _delivery_value_visible(body: str, value_text: str) -> bool:
@@ -2556,7 +2991,9 @@ class UserGrowthBrowserClient:
         if self._is_redfruit_item(item):
             return await self._fill_redfruit_card_defaults(page, item)
 
-        await self._select_dropdown_value(page, "请选择UGC内容", "不包含")
+        if not await self._ensure_dropdown_value(page, "UGC内容", "不包含"):
+            await self._snapshot_error(page, "soda_music_ugc_select_failed")
+            raise RuntimeError("汽水音乐 UGC 内容选择失败")
         await self._select_dropdown_value(page, "分类标签")
         # 进入到弹窗进行级联选择
         await self._select_cascader(
@@ -2601,6 +3038,7 @@ class UserGrowthBrowserClient:
         await page.wait_for_timeout(1000)
         await self._click_if_present(page, "全选")
         await page.wait_for_timeout(800)
+        await self._return_material_page_to_first_page(page)
         await self._click_if_present(page, "一键复用")
         await page.wait_for_timeout(1000)
         await self._click_if_present(page, "提交")
@@ -2619,9 +3057,7 @@ class UserGrowthBrowserClient:
         if not await self._ensure_dropdown_value(page, "UGC内容", "不包含"):
             await self._snapshot_error(page, "redfruit_ugc_select_failed")
             raise RuntimeError("红果短剧 UGC 内容选择失败")
-        if not await self._ensure_dropdown_value(page, "制作团队", "素材供应商/千沧"):
-            await self._snapshot_error(page, "redfruit_team_select_failed")
-            raise RuntimeError("红果短剧制作团队选择失败")
+        await self._snapshot(page, "redfruit_ugc_selected")
         if not await self._ensure_dropdown_value(page, "创意源", "原创"):
             await self._snapshot_error(page, "redfruit_creative_source_select_failed")
             raise RuntimeError("红果短剧创意源选择失败")
@@ -2634,6 +3070,10 @@ class UserGrowthBrowserClient:
                 continue
             if not await self._select_cascader(page, str(path[0]), list(path)):
                 raise RuntimeError(f"红果分类标签选择失败：{path[0]}")
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] redfruit classification selected: "
+                f"{' > '.join(str(value) for value in path)}"
+            )
         await self._click_if_present(page, "确定")
 
         for tag in item.custom_tags:
@@ -2643,7 +3083,7 @@ class UserGrowthBrowserClient:
 
         await self._click_radio_near_text(page, "未成年人内容", "已授权")
         await self._click_radio_near_text(page, "影视内容", "已授权")
-        return await self._reuse_all_submit_and_open_task_detail(page)
+        return await self._reuse_all_submit_and_open_task_detail(page, item)
 
     async def _ensure_dropdown_value(self, page, field_text: str, value_text: str) -> bool:
         """普通下拉字段已是目标值时跳过，否则选择目标值。"""
@@ -2713,7 +3153,11 @@ class UserGrowthBrowserClient:
                 return control
         return None
 
-    async def _reuse_all_submit_and_open_task_detail(self, page):
+    async def _reuse_all_submit_and_open_task_detail(
+            self,
+            page,
+            item: UserGrowthVideoItem | None = None,
+    ):
         """复用首卡标签，提交并跨标签页进入任务详情。"""
         before_pages = list(page.context.pages)
         before_url = page.url
@@ -2721,6 +3165,11 @@ class UserGrowthBrowserClient:
         await page.wait_for_timeout(200)
         await self._select_all_visible_pages(page)
         await page.wait_for_timeout(800)
+        # 跨页全选后页面停在最后一页；最后一次“一键复用”必须回到首卡，
+        # 否则会把最后一页的空卡片当作复用源，覆盖掉首卡已填写的分类标签。
+        await self._return_material_page_to_first_page(page)
+        if item and self._is_redfruit_item(item):
+            await self._assert_redfruit_classification_selected(page, item)
         await self._click_if_present(page, "一键复用")
         await page.wait_for_timeout(1000)
         await self._click_if_present(page, "提交")
@@ -2733,6 +3182,64 @@ class UserGrowthBrowserClient:
             before_pages,
             before_url,
         )
+
+    async def _return_material_page_to_first_page(self, page) -> None:
+        """跨页全选后回到录入页第 1 页，确保首卡仍是复用来源。"""
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            before_signature = await self._material_page_signature(page)
+            pagers = await self._visible_locators(page.locator(".arco-pagination"), limit=20)
+            moved = False
+            found_pager = False
+            for pager in pagers:
+                controls = await self._visible_locators(
+                    pager.locator("li, button, a, [role='button']"),
+                    limit=80,
+                )
+                numeric: list[tuple[int, object, bool]] = []
+                for control in controls:
+                    text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+                    if not re.fullmatch(r"\d{1,4}", text):
+                        continue
+                    value = int(text)
+                    class_name = str(await control.get_attribute("class") or "").lower()
+                    aria_current = str(await control.get_attribute("aria-current") or "").lower()
+                    active = "active" in class_name or "current" in class_name or aria_current == "page"
+                    numeric.append((value, control, active))
+                if not numeric:
+                    continue
+                found_pager = True
+                active_values = [value for value, _, active in numeric if active]
+                current = max(active_values) if active_values else min(value for value, _, _ in numeric)
+                if current <= 1:
+                    return
+                first = next((control for value, control, _ in numeric if value == 1), None)
+                if first and (await self._click_locator_center(page, first) or await self._click_locator(first)):
+                    moved = True
+                    self._write_run_log(
+                        f"[{datetime.now().isoformat(timespec='seconds')}] material card pagination: "
+                        f"{current} -> 1"
+                    )
+                    break
+            if not found_pager:
+                # 单页时没有分页条，首卡天然就是复用来源。
+                return
+            if moved:
+                while True:
+                    self._raise_if_cancelled()
+                    current_signature = await self._material_page_signature(page)
+                    if current_signature and current_signature != before_signature:
+                        break
+                    await self._sleep(0.5)
+                continue
+            if attempt == 1 or attempt % 10 == 0:
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] waiting material card page 1, "
+                    f"attempt={attempt}"
+                )
+            await self._sleep(1)
 
     async def _wait_and_click_task_detail_after_submit(
             self,
@@ -2763,6 +3270,23 @@ class UserGrowthBrowserClient:
                 if "/aigc/manage/task" in candidate_url:
                     return candidate
 
+                if "/aigc/creatives/upload" in candidate_url:
+                    try:
+                        body = _compact_text(await self._body_text(candidate, timeout_ms=2000))
+                    except Exception:
+                        body = ""
+                    validation_errors = [
+                        text for text in (
+                            "请选择分类标签",
+                            "请选择UGC内容",
+                            "请选择创意源",
+                        ) if text in body
+                    ]
+                    if validation_errors:
+                        message = "提交被页面校验拦截：" + "、".join(validation_errors)
+                        await self._snapshot_error(candidate, "chameleon_submit_validation_failed", extra=message)
+                        raise RuntimeError(message)
+
                 try:
                     detail = candidate.get_by_text("查看任务详情", exact=True).first
                     if await detail.count() and await detail.is_visible():
@@ -2786,6 +3310,36 @@ class UserGrowthBrowserClient:
                     f"attempt={attempt}, before_url={before_url}, before_pages={len(before_ids)}"
                 )
             await self._sleep(1)
+
+    async def _assert_redfruit_classification_selected(
+            self,
+            page,
+            item: UserGrowthVideoItem,
+    ) -> None:
+        """提交前确认首卡分类标签不是空值，且包含预检得到的叶子标签。"""
+        expected = [
+            _compact_text(str(path[-1]))
+            for path in (item.classification_paths or item.workflow_metadata.get("classification_paths", []))
+            if path and str(path[-1]).strip()
+        ]
+        label = page.get_by_text("分类标签", exact=True).first
+        if not await label.count():
+            raise RuntimeError("红果短剧提交前未找到首卡分类标签字段")
+        form_item = label.locator(
+            "xpath=ancestor::*[contains(@class,'arco-form-item') or contains(@class,'form-item')][1]"
+        ).first
+        text = _compact_text(await self._locator_text(form_item, timeout_ms=3000))
+        missing = [value for value in expected if value not in text]
+        if "请选择分类标签" in text or missing:
+            await self._snapshot_error(
+                page,
+                "redfruit_classification_not_selected_before_reuse",
+                extra=f"missing={missing}; field_text={text}",
+            )
+            raise RuntimeError(
+                "红果短剧首卡分类标签未填写完整，停止提交："
+                + ("、".join(missing) if missing else "请选择分类标签")
+            )
 
     async def _select_cascader(
             self,
@@ -3270,7 +3824,7 @@ class UserGrowthBrowserClient:
             seen.add(key)
             try:
                 text = _compact_text(await self._locator_text(locator, timeout_ms=1000))
-                if wanted in text:
+                if "请选择" not in text and wanted in text:
                     return True
             except Exception:
                 continue
@@ -3375,14 +3929,40 @@ class UserGrowthBrowserClient:
             await input_box.press("Enter")
             await page.wait_for_timeout(500)
 
-    async def _submit_review(self, page) -> None:
+    async def _submit_review(self, page, *, allow_already_submitted: bool = False) -> bool:
         """发起送审，并确认送审弹窗。"""
-        await self._click_text(page, "送审")
+        if not await self._click_text_or_locator(page, "送审"):
+            body = _compact_text(await self._body_text(page, timeout_ms=5000))
+            submitted_markers = ("已送审", "送审中", "审核中", "审核通过", "审核完成")
+            if allow_already_submitted and any(marker in body for marker in submitted_markers):
+                return False
+            raise RuntimeError("未找到送审按钮，且页面没有已送审状态")
         await page.wait_for_timeout(2000)
         # await self._ensure_chameleon_modal(page)
         await self._click_text(page, "确定")
         await page.wait_for_timeout(3500)
         await self._click_if_present(page, "查看任务详情")
+        return True
+
+    async def _submit_soda_review(
+            self,
+            page,
+            plan: UserGrowthOrderPlan,
+            task_id: str,
+            progress: ProgressCallback | None,
+            *,
+            allow_already_submitted: bool = False,
+    ) -> None:
+        """汽水送审先落断点；恢复时允许识别已送审页面并继续。"""
+        plan.review_task_id = task_id
+        self._checkpoint(plan, "review_submitting", f"准备送审任务 {task_id}")
+        submitted_now = await self._submit_review(
+            page,
+            allow_already_submitted=allow_already_submitted,
+        )
+        if not submitted_now:
+            self._emit(progress, f"汽水音乐任务 {task_id} 已处于送审状态，断点恢复跳过重复点击送审")
+        self._checkpoint(plan, "review_submitted", f"已完成送审，任务 ID：{task_id}")
 
     async def _wait_task_success(
             self,
@@ -3393,10 +3973,13 @@ class UserGrowthBrowserClient:
             plan: UserGrowthOrderPlan | None = None,
             items: list[UserGrowthVideoItem] | None = None,
             task_id: str | None = None,
+            retry_failed_task: bool = False,
+            operation_name: str = "素材上传",
     ) -> str:
-        """轮询任务状态，直到全部成功、明确失败或用户取消。"""
+        """轮询任务状态；红果任务明确失败时可在目标任务行重试三次。"""
         backup_after_attempts = max(expected_attempts or self.max_status_retries, 1) + 2
         backup_attempted = False
+        task_failure_retries = 0
         # 间隔减半，最小 3s，避免空转
         interval_ms = max(int(self.refresh_interval_seconds * 500), 3000)
         attempt = 0
@@ -3404,9 +3987,28 @@ class UserGrowthBrowserClient:
             self._raise_if_cancelled()
             attempt += 1
             body = await page.locator("body").inner_text(timeout=5000)
-            if "全部成功" in body:
+            status_text = _compact_text(body)
+            if retry_failed_task and task_id:
+                row = await self._find_task_row(page, task_id)
+                status_text = (
+                    _compact_text(await self._locator_text(row, timeout_ms=3000))
+                    if row else ""
+                )
+            if "全部成功" in status_text:
                 return "success"
-            if "已失败" in body:
+            if "失败" in status_text:
+                if retry_failed_task and task_id and task_failure_retries < 3:
+                    task_failure_retries += 1
+                    await self._retry_failed_operation_task(
+                        page,
+                        task_id,
+                        progress,
+                        operation_name=operation_name,
+                        retry_number=task_failure_retries,
+                    )
+                    continue
+                if retry_failed_task and task_id:
+                    raise RuntimeError(f"{operation_name}任务 {task_id} 重试 3 次后仍失败")
                 raise RuntimeError("任务执行失败")
             if (
                     not backup_attempted
@@ -3479,6 +4081,10 @@ class UserGrowthBrowserClient:
             items: list[UserGrowthVideoItem],
             task_id: str,
             progress: ProgressCallback | None,
+            *,
+            retry_failed_task: bool = False,
+            operation_name: str = "素材上传",
+            plan: UserGrowthOrderPlan | None = None,
     ) -> None:
         """按任务ID进入任务详情与素材页，读取 CID 后回填到素材条目。"""
         try:
@@ -3487,9 +4093,14 @@ class UserGrowthBrowserClient:
                 task_id,
                 progress,
                 expected_attempts=max(len(items), 1),
+                retry_failed_task=retry_failed_task,
+                operation_name=operation_name,
+                plan=plan,
             )
             material_page = await self._open_material_list_page(page)
             cids = await self._read_cids_from_search_input(material_page)
+        except UserGrowthOperationTaskFailed:
+            raise
         except Exception as exc:
             await self._snapshot_error(
                 page,
@@ -3545,7 +4156,16 @@ class UserGrowthBrowserClient:
         else:
             self._emit(progress, f"红果短剧任务 {task_id}：未读取到 CID，继续执行 ARLP 和分类标签修改")
 
-        material_page = cid_page
+        await self._process_redfruit_material_stages(cid_page, plan, items, progress)
+
+    async def _process_redfruit_material_stages(
+            self,
+            material_page,
+            plan: UserGrowthOrderPlan,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+    ) -> None:
+        """在已定位到本批素材的素材管理页继续 ARLP 和后审分类标签。"""
         if plan.stage not in {"arlp_success", "classification_submitting", "classification_success", "completed"}:
             self._checkpoint(plan, "arlp_submitting", "开始增加 ARLP")
             await self._ensure_redfruit_arlp_all_success(material_page, plan, items, progress)
@@ -3691,6 +4311,7 @@ class UserGrowthBrowserClient:
         task_id = await self._read_current_task_id(task_page, progress)
         interval_ms = max(int(self.refresh_interval_seconds * 500), 3000)
         attempt = 0
+        task_failure_retries = 0
         while True:
             self._raise_if_cancelled()
             attempt += 1
@@ -3701,9 +4322,28 @@ class UserGrowthBrowserClient:
                 total = int(progress_data["total"])
                 success = int(progress_data["success"])
                 failed = int(progress_data["failed"])
-                status = str(progress_data["status"])
+                status = _compact_text(str(progress_data["status"]))
                 if total > 0 and success >= total:
                     return progress_data
+                task_failed = (
+                    "已失败" in status
+                    or (total > 0 and success == 0 and failed >= total and "失败" in status)
+                )
+                if task_failed:
+                    if task_failure_retries >= 3:
+                        raise RuntimeError(
+                            f"{operation_name}任务 {task_id} 重试 3 次后仍失败："
+                            f"成功 {success}/{total}，失败 {failed}"
+                        )
+                    task_failure_retries += 1
+                    await self._retry_failed_operation_task(
+                        task_page,
+                        task_id,
+                        progress,
+                        operation_name=operation_name,
+                        retry_number=task_failure_retries,
+                    )
+                    continue
                 if total > 0 and success + failed >= total:
                     return progress_data
                 if failed > 0 and any(token in status for token in ("失败", "部分")):
@@ -3823,46 +4463,14 @@ class UserGrowthBrowserClient:
             await self._run_material_edit_action(material_page, "修改分类标签")
             await self._fill_redfruit_post_review_classifications(material_page, items, progress)
 
-            before_pages = list(material_page.context.pages)
-            before_url = material_page.url
             await self._click_redfruit_modal_action(material_page, ("保存", "确定", "确认"))
-            task_page = await self._wait_redfruit_arlp_task_page(
-                material_page,
-                before_pages,
-                before_url,
-                progress,
-            )
-            plan.classification_task_id = await self._read_current_task_id(task_page, progress)
-            self._checkpoint(
-                plan,
-                "classification_submitting",
-                f"已记录分类标签任务 ID：{plan.classification_task_id}",
-            )
-            result = await self._wait_redfruit_arlp_task_result(
-                task_page,
-                progress,
-                "修改分类标签",
-            )
-            plan.classification_task_id = str(result.get("task_id") or "")
-            self._emit(
-                progress,
-                f"红果短剧修改分类标签第 {attempt} 轮结果：任务 {result['task_id']}，"
-                f"成功 {result['success']}/{result['total']}，失败 {result['failed']}",
-            )
+            plan.classification_task_id = ""
             await self._close_redfruit_result_dialog(material_page)
-
-            if self._redfruit_operation_all_expected_success(result, len(items)):
-                self._emit(
-                    progress,
-                    f"红果短剧修改分类标签全部成功：{result['success']}/{result['total']}",
-                )
-                return
-
             self._emit(
                 progress,
-                f"红果短剧修改分类标签未覆盖整批：{result['success']}/{result['total']}，目标 {len(items)} 条，"
-                "将刷新素材列表并重新补改遗漏素材",
+                f"红果短剧修改分类标签已保存：本批 {len(items)} 条，不进入任务详情页",
             )
+            return
 
     @staticmethod
     def _redfruit_operation_all_expected_success(
@@ -3979,22 +4587,55 @@ class UserGrowthBrowserClient:
         await page.wait_for_timeout(1200)
 
     async def _wait_material_items_ready(self, page, items: list[UserGrowthVideoItem]) -> None:
-        """等待素材/文案列表里出现本批次素材卡片。"""
+        """等待素材/文案列表出现可操作的素材项，并周期性纠正页面状态。"""
         tokens = self._material_card_tokens(items)
+        attempt = 0
 
         async def material_ready() -> bool:
             body = await self._body_text(page, timeout_ms=2000)
             compact_body = _compact_text(body)
+            material_markers = (
+                "素材/文案列表",
+                "素材管理",
+                "全局搜索",
+                "全选所有",
+                "增加ARLP",
+            )
+            if not any(marker in compact_body for marker in material_markers):
+                return False
             if any(token and token in compact_body for token in tokens):
                 return True
-            card_count = await page.locator(
+            item_count = await page.locator(
+                ".arco-table-tbody tr:visible, .arco-table-tr:visible, [role='row']:visible, "
+                ".waterfall-item:visible, [class*='waterfall-item']:visible, "
+                ".common-card-item-eVVh45:visible, [class*='common-card-item']:visible, "
                 ".arco-card:visible, [class*='material-card']:visible, [class*='material-item']:visible, "
-                "[class*='creative-card']:visible, img:visible, video:visible"
+                "[class*='creative-card']:visible"
             ).count()
-            return card_count > 0 and "暂无数据" not in compact_body
+            return item_count > 0 and "暂无数据" not in compact_body
 
         while not await material_ready():
             self._raise_if_cancelled()
+            attempt += 1
+            if attempt == 1 or attempt % 10 == 0:
+                body = _compact_text(await self._body_text(page, timeout_ms=2000))
+                item_count = await page.locator(
+                    ".arco-table-tbody tr:visible, .arco-table-tr:visible, [role='row']:visible, "
+                    ".waterfall-item:visible, [class*='waterfall-item']:visible, "
+                    ".common-card-item-eVVh45:visible, [class*='common-card-item']:visible, "
+                    ".arco-card:visible, [class*='material-card']:visible, [class*='material-item']:visible"
+                ).count()
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] waiting material list items, "
+                    f"attempt={attempt}, url={page.url}, item_count={item_count}, "
+                    f"body_tail={body[-240:]}"
+                )
+            if attempt % 20 == 0:
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] "
+                    "material list still not actionable; reload current material page"
+                )
+                await self._refresh_material_list_page(page, force_reload=True)
             await page.wait_for_timeout(1500)
 
     @staticmethod
@@ -4016,10 +4657,22 @@ class UserGrowthBrowserClient:
         selected_any = False
         seen_pages: set[str] = set()
         while True:
-            if await self._click_table_select_all_now(page):
-                selected_any = True
-            elif await self._click_text_or_locator(page, "全选"):
-                selected_any = True
+            wait_attempt = 0
+            while True:
+                self._raise_if_cancelled()
+                if await self._click_table_select_all_now(page):
+                    selected_any = True
+                    break
+                if await self._click_text_or_locator(page, "全选"):
+                    selected_any = True
+                    break
+                wait_attempt += 1
+                if wait_attempt == 1 or wait_attempt % 10 == 0:
+                    self._write_run_log(
+                        f"[{datetime.now().isoformat(timespec='seconds')}] "
+                        f"waiting selectable list items, attempt={wait_attempt}"
+                    )
+                await self._sleep(1)
             await page.wait_for_timeout(600)
             page_signature = await self._material_page_signature(page)
             if page_signature and page_signature in seen_pages:
@@ -4030,7 +4683,7 @@ class UserGrowthBrowserClient:
                 break
             await page.wait_for_timeout(1000)
         if not selected_any:
-            raise RuntimeError("未找到可全选的列表项")
+            raise RuntimeError("未完成列表全选")
 
     async def _wait_redfruit_material_drawer_visible(self, page) -> bool:
         """等待红果素材列表右侧抽屉出现。"""
@@ -4057,7 +4710,7 @@ class UserGrowthBrowserClient:
         return "|".join(texts)
 
     async def _open_material_management_page(self, page):
-        """从任务详情侧栏打开素材管理页。"""
+        """从当前墨攻AI页面侧栏打开素材管理页。"""
         await self._click_text(page, "素材管理")
 
         async def material_page_ready():
@@ -4075,6 +4728,98 @@ class UserGrowthBrowserClient:
             return None
 
         return await self._wait_for_result(material_page_ready, timeout_ms=None, interval_ms=800)
+
+    async def _open_redfruit_material_management_by_cids(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+    ):
+        """断点恢复时直接进入素材管理，并按 checkpoint CID 定位本批素材。"""
+        cids = [str(item.cid or "").strip().lower() for item in items if item.status != "skipped"]
+        if not cids or not all(cids) or len(set(cids)) != len(cids):
+            raise RuntimeError("红果断点恢复缺少完整且唯一的 CID，不能直接进入素材管理")
+        if len(cids) > 50:
+            raise RuntimeError(f"红果断点恢复单批 CID 超过素材管理搜索上限：{len(cids)} > 50")
+
+        await self._open_work_order_management(page, progress)
+        self._emit(progress, f"进入素材管理，按 {len(cids)} 个 CID 搜索本批素材")
+        material_page = await self._open_material_management_page(page)
+        await self._search_redfruit_materials_by_cids(material_page, cids, progress)
+        return material_page
+
+    async def _search_redfruit_materials_by_cids(
+            self,
+            page,
+            cids: list[str],
+            progress: ProgressCallback | None,
+    ) -> None:
+        """用换行分隔的 CID 精确筛选素材管理页，并等待命中数覆盖整批。"""
+        expected = {str(cid or "").strip().lower() for cid in cids if str(cid or "").strip()}
+        if not expected:
+            raise RuntimeError("素材管理 CID 搜索条件为空")
+
+        # 素材管理的可见输入框占位文案是“关键字搜索”，但多 CID 搜索真正
+        # 依赖 URL 的 q 参数。直接复用番茄音乐已验证的换行 CID URL 规则，
+        # 避免因占位文案变化或 input 不接收换行而一直等不到搜索框。
+        parts = urlsplit(str(page.url or ""))
+        params = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != "q"
+        ]
+        params.append(("q", "\n".join(cids)))
+        search_url = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment)
+        )
+        await self._safe_goto(page, search_url)
+
+        attempt = 0
+        while True:
+            self._raise_if_cancelled()
+            attempt += 1
+            body = await self._body_text(page, timeout_ms=3000)
+            body_cids = set(self._extract_cids(body))
+            result_counts = [
+                int(value.replace(",", ""))
+                for value in re.findall(r"共\s*([0-9,]+)\s*条", body)
+            ]
+            matched_count = result_counts[-1] if result_counts else 0
+            exact_count_ready = matched_count == len(expected)
+            visible_cids_ready = expected.issubset(body_cids)
+            if exact_count_ready or visible_cids_ready:
+                self._emit(progress, f"素材管理 CID 搜索已命中本批 {len(expected)} 条素材")
+                return
+
+            if matched_count > len(expected):
+                await self._snapshot_error(
+                    page,
+                    "redfruit_material_cid_search_too_broad",
+                    extra=f"expected={len(expected)}, matched={matched_count}",
+                )
+                raise RuntimeError(
+                    f"素材管理 CID 搜索结果过多：期望 {len(expected)} 条，实际 {matched_count} 条，已停止全选"
+                )
+            if "暂无数据" in body and attempt >= 5:
+                await self._snapshot_error(
+                    page,
+                    "redfruit_material_cid_search_empty",
+                    extra=f"expected={len(expected)}",
+                )
+                raise RuntimeError(f"素材管理未检索到本批 {len(expected)} 个 CID")
+
+            if attempt == 1 or attempt % 10 == 0:
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] redfruit material CID search wait: "
+                    f"attempt={attempt}, expected={len(expected)}, matched={matched_count}, "
+                    f"visible_cids={len(expected.intersection(body_cids))}, counts={result_counts}, "
+                    f"url={page.url}"
+                )
+                self._emit(
+                    progress,
+                    f"等待素材管理返回本批 {len(expected)} 条结果，第 {attempt} 次",
+                )
+            await self._sleep(1)
 
     async def _close_redfruit_material_drawer(self, page) -> bool:
         """关闭红果素材列表右侧抽屉，避免遮挡全选与分页控件。"""
@@ -4120,6 +4865,96 @@ class UserGrowthBrowserClient:
         metadata = item.workflow_metadata if isinstance(item.workflow_metadata, dict) else {}
         return str(metadata.get("existing_creative_unit_id") or "").strip()
 
+    @staticmethod
+    def _parse_already_recorded_material_cids(text: str) -> dict[str, str]:
+        """解析“已录入为素材”弹窗中的素材 ID 与 CID 映射。"""
+        compact = _compact_text(text)
+        pairs = re.findall(
+            r"创意(?:id|ID)[:=：]?(\d+).*?(?:cid|CID)[:=：]?([0-9a-fA-F]{32})",
+            compact,
+        )
+        return {material_id: cid.lower() for material_id, cid in pairs}
+
+    @staticmethod
+    def _parse_already_recorded_material_ids(text: str) -> set[str]:
+        """解析弹窗中所有已录入创意 ID；CID 缺失时仍可识别对应素材。"""
+        compact = _compact_text(text)
+        return set(re.findall(r"创意id[:=：]?(\d+)", compact, flags=re.IGNORECASE))
+
+    async def _consume_already_recorded_materials(
+            self,
+            page,
+            items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+    ) -> list[UserGrowthVideoItem] | None:
+        """消费已录入弹窗并返回明确命中的素材；未出现弹窗返回 None。"""
+        body = await self._body_text(page, timeout_ms=3000)
+        compact = _compact_text(body)
+        if "已录入为素材" not in compact and "已录入,cid" not in compact.lower():
+            return None
+
+        cid_by_material_id = self._parse_already_recorded_material_cids(body)
+        recorded_material_ids = self._parse_already_recorded_material_ids(body)
+        if not recorded_material_ids:
+            await self._snapshot_error(
+                page,
+                "existing_already_recorded_ids_unparsed",
+                extra="已录入弹窗未解析到创意 ID，已阻止整批误判完成",
+            )
+            raise RuntimeError("已录入为素材弹窗未解析到具体创意 ID，无法安全继续补录")
+
+        matched_items: list[UserGrowthVideoItem] = []
+        matched_material_ids: set[str] = set()
+        for item in items:
+            metadata = item.workflow_metadata if isinstance(item.workflow_metadata, dict) else {}
+            material_id = str(metadata.get("existing_material_id") or "").strip()
+            if not material_id or material_id not in recorded_material_ids:
+                continue
+            cid = cid_by_material_id.get(material_id, "")
+            if cid:
+                item.cid = cid
+                item.cid_material_type = item.material_type
+                item.message = "原创意单元已录入，CID 已读取"
+            else:
+                item.message = "原创意单元已录入，无需重复录入"
+            item.status = "success"
+            matched_items.append(item)
+            matched_material_ids.add(material_id)
+
+        unmatched_material_ids = recorded_material_ids - matched_material_ids
+        if unmatched_material_ids:
+            await self._snapshot_error(
+                page,
+                "existing_already_recorded_ids_unmatched",
+                extra=f"unmatched_material_ids={','.join(sorted(unmatched_material_ids))}",
+            )
+            raise RuntimeError(
+                "已录入弹窗中的创意 ID 无法与本批素材对应："
+                + ",".join(sorted(unmatched_material_ids))
+            )
+
+        remaining_count = len(items) - len(matched_items)
+        self._emit(
+            progress,
+            f"原创意单元已录入为素材：命中 {len(matched_items)}/{len(items)}，"
+            f"剩余待补录 {remaining_count}",
+        )
+        self._write_run_log(
+            f"[{datetime.now().isoformat(timespec='seconds')}] existing recovery already recorded: "
+            f"recorded={len(matched_items)}/{len(items)}, remaining={remaining_count}, "
+            f"matched_cids={sum(1 for item in matched_items if item.cid)}"
+        )
+        self._write_event(
+            "existing_creative_units_already_recorded",
+            item_count=len(items),
+            recorded_count=len(matched_items),
+            remaining_count=remaining_count,
+            matched_cid_count=sum(1 for item in matched_items if item.cid),
+            material_cids=cid_by_material_id,
+        )
+        await self._click_if_present(page, "确定")
+        return matched_items
+
     async def _process_existing_creative_unit_items(
             self,
             page,
@@ -4128,6 +4963,9 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
     ):
         """上传检测重复时，回到创意单元列表按原创意单元 ID 补录素材。"""
+        items = [item for item in items if item.status not in {"success", "skipped"}]
+        if not items:
+            return page
         unit_ids = []
         for item in items:
             unit_id = self._existing_creative_unit_id_for_item(item)
@@ -4154,11 +4992,16 @@ class UserGrowthBrowserClient:
         ]
         await self._select_creative_units_for_items(page, pseudo_items)
         self._emit(progress, "创意单元已选中，准备进入录入素材")
-        entry_page = await self._enter_chameleon_from_selected_creative_units(page, items, progress)
+        entry_page, pending_items = await self._enter_chameleon_from_selected_creative_units(
+            page,
+            plan,
+            items,
+            progress,
+        )
         if entry_page is None:
-            for item in items:
-                item.status = "success"
-                item.message = "原创意单元已录入，无需重复录入"
+            unresolved = [item for item in items if item.status != "success"]
+            if unresolved:
+                raise RuntimeError(f"补录结束后仍有 {len(unresolved)} 个素材未处理")
             return page
 
         self._emit(progress, "已进入录入素材页，准备读取任务ID")
@@ -4174,23 +5017,34 @@ class UserGrowthBrowserClient:
         wait_result = await self._wait_task_success(
             entry_page,
             progress,
-            expected_attempts=max(len(items), 1),
+            expected_attempts=max(len(pending_items), 1),
             plan=None if redfruit_flow else plan,
-            items=[] if redfruit_flow else items,
-            task_id="" if redfruit_flow else task_id,
+            items=[] if redfruit_flow else pending_items,
+            task_id=task_id,
+            retry_failed_task=redfruit_flow,
+            operation_name="素材上传",
         )
         if wait_result == "cid_backed_up":
             self._checkpoint(plan, "cid_backfilled_unreviewed", "补录任务 CID 已备份回填，当前任务尚未送审")
             return entry_page
         self._checkpoint(plan, "upload_success", f"补录任务 {task_id} 全部成功")
-        await self._submit_review(entry_page)
-        plan.review_task_id = task_id
-        self._checkpoint(plan, "review_submitted", f"补录任务已送审，任务 ID：{task_id}")
         if redfruit_flow:
-            await self._process_redfruit_after_review(entry_page, plan, items, task_id, progress)
+            await self._submit_review(entry_page)
+            plan.review_task_id = task_id
+            self._checkpoint(plan, "review_submitted", f"补录任务已送审，任务 ID：{task_id}")
+            await self._process_redfruit_after_review(entry_page, plan, pending_items, task_id, progress)
         else:
+            await self._submit_soda_review(entry_page, plan, task_id, progress)
             self._checkpoint(plan, "cid_backfilling", f"开始读取补录任务 {task_id} 的 CID 并回填")
-            await self._fill_cids_for_task(entry_page, items, task_id, progress)
+            await self._fill_cids_for_task(
+                entry_page,
+                pending_items,
+                task_id,
+                progress,
+                retry_failed_task=True,
+                operation_name="汽水音乐送审",
+                plan=plan,
+            )
             self._checkpoint(plan, "completed", "汽水音乐补录、送审和 CID 回填全部完成")
         return entry_page
 
@@ -4230,6 +5084,7 @@ class UserGrowthBrowserClient:
     async def _enter_chameleon_from_selected_creative_units(
             self,
             page,
+            plan: UserGrowthOrderPlan,
             items: list[UserGrowthVideoItem],
             progress: ProgressCallback | None = None,
     ):
@@ -4263,13 +5118,35 @@ class UserGrowthBrowserClient:
                 "录入素材按钮已点击，等待录入页"
             )
             await self._log_after_entry_materials_click(page)
+            recorded_items = await self._consume_already_recorded_materials(page, items, progress)
+            if recorded_items is not None:
+                return await self._continue_partial_existing_recovery(
+                    page,
+                    plan,
+                    items,
+                    recorded_items,
+                    progress,
+                )
         except Exception as exc:
+            recorded_items = await self._consume_already_recorded_materials(page, items, progress)
+            if recorded_items is not None:
+                return await self._continue_partial_existing_recovery(
+                    page,
+                    plan,
+                    items,
+                    recorded_items,
+                    progress,
+                )
             body = await self._body_text(page, timeout_ms=3000)
             combined = f"{before_body}\n{body}"
             if any(text in combined for text in ("已录入", "已经录入", "无需再进行", "无需重复")):
-                self._emit(progress, "原创意单元已录入，跳过补录素材步骤")
-                await self._click_if_present(page, "确定")
-                return None
+                await self._snapshot_error(
+                    page,
+                    "existing_already_recorded_unparsed",
+                    exc=exc,
+                    extra="页面出现已录入提示，但未解析到具体创意 ID",
+                )
+                raise RuntimeError("页面提示素材已录入，但无法识别具体素材，已停止整批误判") from exc
             await self._snapshot_error(page, "existing_creative_units_enter_chameleon_failed", exc=exc)
             raise
 
@@ -4280,9 +5157,7 @@ class UserGrowthBrowserClient:
             before_url=before_url,
         )
         if entry_page is None:
-            self._emit(progress, "原创意单元已录入，跳过补录素材步骤")
-            await self._click_if_present(page, "确定")
-            return None
+            raise RuntimeError("补录页面返回已录入状态，但未获得可解析的弹窗页面")
         self._wrap_page_speed(entry_page)
         # 新标签页可能持续保持 loading 状态，但页面内容已经可以交互；
         # 补录流程只等待真实业务条件，避免被浏览器导航事件永久卡住。
@@ -4364,9 +5239,22 @@ class UserGrowthBrowserClient:
                 if not pending_task.done():
                     pending_task.cancel()
         if entry_state == "already":
-            self._emit(progress, "原创意单元已录入，跳过补录素材步骤")
-            await self._click_if_present(entry_page, "确定")
-            return None
+            recorded_items = await self._consume_already_recorded_materials(entry_page, items, progress)
+            if recorded_items is None:
+                await self._snapshot_error(
+                    entry_page,
+                    "existing_entry_already_recorded_unparsed",
+                    extra="录入页出现已录入提示，但未解析到具体创意 ID",
+                )
+                raise RuntimeError("录入页提示素材已录入，但无法识别具体素材")
+            return await self._continue_partial_existing_recovery(
+                page,
+                plan,
+                items,
+                recorded_items,
+                progress,
+                recorded_page=entry_page,
+            )
 
         self._write_run_log(
             f"[{datetime.now().isoformat(timespec='seconds')}] "
@@ -4378,7 +5266,47 @@ class UserGrowthBrowserClient:
         await self._click_chameleon_modal_confirm(entry_page)
         await entry_page.wait_for_timeout(350)
         task_page = await self._fill_card_defaults(entry_page, items[0])
-        return task_page or entry_page
+        return task_page or entry_page, items
+
+    async def _continue_partial_existing_recovery(
+            self,
+            page,
+            plan: UserGrowthOrderPlan,
+            items: list[UserGrowthVideoItem],
+            recorded_items: list[UserGrowthVideoItem],
+            progress: ProgressCallback | None,
+            *,
+            recorded_page=None,
+    ):
+        """已录入仅覆盖部分素材时，取消这些勾选并继续补录剩余素材。"""
+        recorded_ids = {id(item) for item in recorded_items}
+        remaining_items = [item for item in items if id(item) not in recorded_ids]
+        self._checkpoint(
+            plan,
+            "upload_processing",
+            f"补录发现已录入 {len(recorded_items)}/{len(items)}，剩余 {len(remaining_items)} 个继续录入",
+        )
+        if recorded_page is not None and recorded_page is not page:
+            try:
+                await recorded_page.close()
+            except Exception:
+                pass
+        if not remaining_items:
+            self._emit(progress, f"本次补录 {len(items)} 个素材均已录入，结束补录分支")
+            return None, []
+
+        self._emit(
+            progress,
+            f"部分素材已录入：确认后取消勾选 {len(recorded_items)} 个，"
+            f"其余 {len(remaining_items)} 个继续录入",
+        )
+        await self._deselect_recorded_creative_units(page, recorded_items, len(remaining_items))
+        return await self._enter_chameleon_from_selected_creative_units(
+            page,
+            plan,
+            remaining_items,
+            progress,
+        )
 
     def _attach_entry_network_diagnostics(self, context) -> None:
         """记录录入页主文档、失败请求和页面 JS 异常。"""
@@ -4581,7 +5509,7 @@ class UserGrowthBrowserClient:
                     body = ""
                 compact_body = _compact_text(body)
                 if any(text in compact_body for text in ("已录入", "已经录入", "无需再进行", "无需重复")):
-                    return None
+                    return candidate
                 try:
                     if await self._first_existing(
                             candidate,
@@ -4751,6 +5679,182 @@ class UserGrowthBrowserClient:
             ):
                 matched.add(matched_key)
         return matched
+
+    async def _deselect_recorded_creative_units(
+            self,
+            page,
+            recorded_items: list[UserGrowthVideoItem],
+            expected_remaining_count: int,
+    ) -> None:
+        """跨页取消已录入素材对应的创意单元勾选，并校验剩余数量。"""
+        targets: dict[str, list[str]] = {}
+        for item in recorded_items:
+            metadata = item.workflow_metadata if isinstance(item.workflow_metadata, dict) else {}
+            unit_id = str(metadata.get("existing_creative_unit_id") or "").strip()
+            material_id = str(metadata.get("existing_material_id") or "").strip()
+            file_name = str(item.file_name or "").strip()
+            tokens = [
+                _compact_text(value).lower()
+                for value in (unit_id, material_id, file_name, Path(file_name).stem)
+                if _compact_text(value)
+            ]
+            key = _compact_text(unit_id or material_id or file_name).lower()
+            if key and tokens:
+                targets[key] = list(dict.fromkeys(tokens))
+        if len(targets) != len(recorded_items):
+            raise RuntimeError("部分已录入素材缺少创意单元 ID，无法安全取消勾选")
+
+        await self._return_creative_unit_page_to_first_page(page)
+        matched: set[str] = set()
+        seen_pages: set[str] = set()
+        for page_index in range(1, 101):
+            self._raise_if_cancelled()
+            await self._wait_creative_unit_table_ready(page, timeout_ms=None)
+            signature = await self._creative_unit_page_signature(page)
+            if signature and signature in seen_pages:
+                break
+            if signature:
+                seen_pages.add(signature)
+            matched.update(
+                await self._deselect_creative_unit_rows_on_current_page(
+                    page,
+                    {key: value for key, value in targets.items() if key not in matched},
+                )
+            )
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] existing recovery deselect: "
+                f"page={page_index}, matched={len(matched)}/{len(targets)}"
+            )
+            if len(matched) >= len(targets):
+                break
+            if not await self._click_creative_unit_next_page(page):
+                break
+
+            async def page_changed() -> bool:
+                await self._wait_creative_unit_table_ready(page, timeout_ms=None)
+                current = await self._creative_unit_page_signature(page)
+                return bool(current and current != signature)
+
+            await self._wait_for_result(page_changed, timeout_ms=None, interval_ms=500)
+
+        missing = set(targets) - matched
+        if missing:
+            await self._snapshot_error(
+                page,
+                "existing_recorded_deselect_incomplete",
+                extra=f"missing={','.join(sorted(missing))}",
+            )
+            raise RuntimeError("未能取消全部已录入素材的勾选：" + ",".join(sorted(missing)))
+
+        async def remaining_count_matches() -> bool:
+            return await self._selected_count(page) == expected_remaining_count
+
+        if not await self._wait_for_result(remaining_count_matches, timeout_ms=10000, interval_ms=500):
+            actual = await self._selected_count(page)
+            await self._snapshot_error(
+                page,
+                "existing_recorded_deselect_count_mismatch",
+                extra=f"expected_remaining={expected_remaining_count}, actual={actual}",
+            )
+            raise RuntimeError(
+                f"取消已录入素材勾选后数量不一致：期望剩余 {expected_remaining_count}，实际 {actual}"
+            )
+
+    async def _deselect_creative_unit_rows_on_current_page(
+            self,
+            page,
+            targets: dict[str, list[str]],
+    ) -> set[str]:
+        """取消当前页中目标创意单元的复选框；已取消的行也视为完成。"""
+        matched: set[str] = set()
+        if not targets:
+            return matched
+        rows = page.locator(
+            ".arco-table-tbody tr, .arco-table-tr:not(.arco-table-tr-th), "
+            "[class*='arco-table-row']:not([class*='header']), tr, [role='row']"
+        )
+        checkbox_selector = (
+            "label.arco-checkbox, .arco-checkbox-mask-wrapper, "
+            ".arco-checkbox-mask, .arco-checkbox"
+        )
+        for row in await self._visible_locators(rows, limit=200):
+            row_text = _compact_text(await self._locator_text(row, timeout_ms=1000)).lower()
+            if not row_text:
+                continue
+            matched_key = next(
+                (
+                    key for key, tokens in targets.items()
+                    if key not in matched and any(token and token in row_text for token in tokens)
+                ),
+                "",
+            )
+            if not matched_key:
+                continue
+            boxes = row.locator(checkbox_selector)
+            for box in await self._visible_locators(boxes, limit=20):
+                if not await self._checkbox_box_is_checked(box):
+                    matched.add(matched_key)
+                    break
+                if not await self._click_locator(box):
+                    continue
+                await self._sleep(0.2)
+                if not await self._checkbox_box_is_checked(box):
+                    matched.add(matched_key)
+                    break
+        return matched
+
+    async def _return_creative_unit_page_to_first_page(self, page) -> None:
+        """回到创意单元列表第 1 页，便于跨页精确取消勾选。"""
+        while True:
+            self._raise_if_cancelled()
+            before_signature = await self._creative_unit_page_signature(page)
+            pagers = await self._visible_locators(page.locator(".arco-pagination"), limit=20)
+            moved = False
+            found_pager = False
+            for pager in pagers:
+                controls = await self._visible_locators(
+                    pager.locator("li, button, a, [role='button']"),
+                    limit=80,
+                )
+                numeric: list[tuple[int, object, bool]] = []
+                for control in controls:
+                    text = _compact_text(await self._locator_text(control, timeout_ms=1000))
+                    if not re.fullmatch(r"\d{1,4}", text):
+                        continue
+                    value = int(text)
+                    class_name = str(await control.get_attribute("class") or "").lower()
+                    aria_current = str(await control.get_attribute("aria-current") or "").lower()
+                    active = "active" in class_name or "current" in class_name or aria_current == "page"
+                    numeric.append((value, control, active))
+                if not numeric:
+                    continue
+                found_pager = True
+                active_values = [value for value, _, active in numeric if active]
+                current = max(active_values) if active_values else min(value for value, _, _ in numeric)
+                if current <= 1:
+                    return
+                previous = [(value, control) for value, control, _ in numeric if value < current]
+                if not previous:
+                    continue
+                target_value, target = min(previous, key=lambda pair: pair[0])
+                if await self._click_locator_center(page, target) or await self._click_locator(target):
+                    moved = True
+                    self._write_run_log(
+                        f"[{datetime.now().isoformat(timespec='seconds')}] "
+                        f"creative unit pagination: {current} -> {target_value}"
+                    )
+                    break
+            if not found_pager:
+                return
+            if not moved:
+                raise RuntimeError("无法返回创意单元列表第 1 页")
+
+            async def page_changed() -> bool:
+                await self._wait_creative_unit_table_ready(page, timeout_ms=None)
+                current = await self._creative_unit_page_signature(page)
+                return bool(current and current != before_signature)
+
+            await self._wait_for_result(page_changed, timeout_ms=None, interval_ms=500)
 
     async def _creative_unit_page_signature(self, page) -> str:
         """读取当前创意单元表格可见行签名，用于避免分页循环。"""
@@ -5054,6 +6158,10 @@ class UserGrowthBrowserClient:
             ".common-card-item-eVVh45",
             "[class*='waterfall-item']",
             "[class*='common-card-item']",
+            ".arco-card",
+            "[class*='material-card']",
+            "[class*='material-item']",
+            "[class*='creative-card']",
         )
         for selector in selectors:
             try:
@@ -5061,6 +6169,21 @@ class UserGrowthBrowserClient:
                 for card in await self._visible_locators(cards, limit=20):
                     if await self._click_redfruit_material_card_select_hotspot(page, card):
                         return True
+            except Exception:
+                continue
+        rows = page.locator(".arco-table-tbody tr, .arco-table-tr, [role='row']")
+        for row in await self._visible_locators(rows, limit=80):
+            try:
+                before = await self._selected_count(page)
+                if not await self._click_visible_checkbox_box(
+                        row,
+                        "label.arco-checkbox, .arco-checkbox-mask-wrapper, .arco-checkbox-mask, "
+                        ".arco-checkbox, input[type='checkbox'], label",
+                ):
+                    continue
+                await page.wait_for_timeout(600)
+                if await self._selected_count(page) > before:
+                    return True
             except Exception:
                 continue
         return False
@@ -5297,6 +6420,9 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
             *,
             expected_attempts: int | None = None,
+            retry_failed_task: bool = False,
+            operation_name: str = "素材上传",
+            plan: UserGrowthOrderPlan | None = None,
     ):
         """根据任务ID定位任务行，等待成功后点击查看详情。"""
         await self._search_task_by_id(page, task_id)
@@ -5305,6 +6431,9 @@ class UserGrowthBrowserClient:
             task_id,
             progress,
             expected_attempts=expected_attempts,
+            retry_failed_task=retry_failed_task,
+            operation_name=operation_name,
+            plan=plan,
         )
         row = await self._find_task_row(page, task_id)
         if not row:
@@ -5412,11 +6541,16 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
             *,
             expected_attempts: int | None = None,
+            retry_failed_task: bool = False,
+            operation_name: str = "素材上传",
+            plan: UserGrowthOrderPlan | None = None,
     ) -> None:
-        """轮询指定任务行状态，直到全部成功、明确失败或用户取消。"""
+        """轮询指定任务行状态；需要时只重试该任务行，累计最多三次。"""
         _ = expected_attempts
         interval_ms = max(int(self.refresh_interval_seconds * 500), 3000)
         attempt = 0
+        retry_key = f"{operation_name}:{task_id}"
+        task_failure_retries = int(plan.operation_retry_counts.get(retry_key, 0)) if plan else 0
         while True:
             self._raise_if_cancelled()
             attempt += 1
@@ -5425,11 +6559,103 @@ class UserGrowthBrowserClient:
             if "全部成功" in row_text:
                 return
             if "失败" in row_text:
+                if retry_failed_task and task_failure_retries < OPERATION_TASK_RETRY_LIMIT:
+                    task_failure_retries += 1
+                    if plan:
+                        plan.operation_retry_counts[retry_key] = task_failure_retries
+                        self._checkpoint(
+                            plan,
+                            plan.stage,
+                            f"{operation_name}任务 {task_id} 准备执行第 {task_failure_retries}/"
+                            f"{OPERATION_TASK_RETRY_LIMIT} 次行级重试",
+                        )
+                    try:
+                        await self._retry_failed_operation_task(
+                            page,
+                            task_id,
+                            progress,
+                            operation_name=operation_name,
+                            retry_number=task_failure_retries,
+                        )
+                    except Exception as exc:
+                        if self._is_recoverable_session_exception(exc):
+                            raise
+                        raise UserGrowthOperationTaskFailed(
+                            f"{operation_name}任务 {task_id} 第 {task_failure_retries}/"
+                            f"{OPERATION_TASK_RETRY_LIMIT} 次行级重试失败：{exc}"
+                        ) from exc
+                    continue
+                if retry_failed_task:
+                    raise UserGrowthOperationTaskFailed(
+                        f"{operation_name}任务 {task_id} 重试 {OPERATION_TASK_RETRY_LIMIT} 次后仍失败"
+                    )
                 raise RuntimeError(f"任务 {task_id} 执行失败")
             self._emit(progress, f"等待任务 {task_id} 完成，第 {attempt} 次")
             await self._click_if_present(page, "刷新列表")
             await page.wait_for_timeout(interval_ms)
             await self._search_task_by_id(page, task_id)
+
+    async def _retry_failed_operation_task(
+            self,
+            page,
+            task_id: str,
+            progress: ProgressCallback | None,
+            *,
+            operation_name: str,
+            retry_number: int,
+    ) -> None:
+        """只点击指定失败任务行的重试操作，最多由调用方执行三次。"""
+        row = await self._find_task_row(page, task_id)
+        if not row:
+            await self._search_task_by_id(page, task_id)
+            row = await self._find_task_row(page, task_id)
+        if not row:
+            raise RuntimeError(f"未找到失败任务 {task_id} 对应行，无法重试")
+
+        if not await self._click_first_visible_locator(
+                row.get_by_text("重试", exact=True).first,
+                row.locator("a:has-text('重试')").first,
+                row.locator("button:has-text('重试')").first,
+        ):
+            raise RuntimeError(f"{operation_name}任务 {task_id} 已失败，但未找到该行重试按钮")
+
+        await page.wait_for_timeout(500)
+        dialogs = page.locator(".arco-modal:visible, [role='dialog']:visible")
+        try:
+            dialog_count = await dialogs.count()
+        except Exception:
+            dialog_count = 0
+        for index in range(dialog_count - 1, -1, -1):
+            dialog = dialogs.nth(index)
+            dialog_text = _compact_text(await self._locator_text(dialog, timeout_ms=1500))
+            if "重试" not in dialog_text:
+                continue
+            await self._click_first_visible_locator(
+                dialog.get_by_text("确定", exact=True).first,
+                dialog.get_by_text("重试", exact=True).first,
+                dialog.locator("button:has-text('确定')").first,
+            )
+            break
+
+        self._emit(
+            progress,
+            f"{operation_name}任务 {task_id} 已失败，已点击该任务行重试"
+            f"（{retry_number}/{OPERATION_TASK_RETRY_LIMIT}）",
+        )
+        self._write_run_log(
+            f"[{datetime.now().isoformat(timespec='seconds')}] failed operation task retry: "
+            f"operation={operation_name}, task_id={task_id}, "
+            f"retry={retry_number}/{OPERATION_TASK_RETRY_LIMIT}"
+        )
+        self._write_event(
+            "failed_operation_task_retry",
+            operation=operation_name,
+            task_id=task_id,
+            retry_number=retry_number,
+            retry_limit=OPERATION_TASK_RETRY_LIMIT,
+        )
+        await page.wait_for_timeout(2000)
+        await self._search_task_by_id(page, task_id)
 
     async def _open_material_list_page(self, page):
         """从任务详情中打开素材/文案列表页，兼容新标签页和当前页跳转。"""
@@ -5667,6 +6893,40 @@ class UserGrowthBrowserClient:
                 await self._sleep(delay_seconds)
                 delay_seconds = min(delay_seconds * 2, 30.0)
 
+    async def _page_is_blank_or_loading(self, page) -> bool:
+        """识别白屏、根节点空白或持续加载状态，避免误判为业务失败后关闭浏览器。"""
+        try:
+            if page.is_closed():
+                return True
+        except Exception:
+            return True
+        try:
+            url = str(page.url or "").lower()
+            if url in {"", "about:blank"} or url.startswith("chrome-error://"):
+                return True
+        except Exception:
+            return True
+        try:
+            body_text = _compact_text(await self._body_text(page, timeout_ms=2500))
+            if not body_text or body_text in {"加载中", "正在加载", "loading"}:
+                return True
+            root = page.locator("#root").first
+            if await root.count():
+                root_text = _compact_text(await self._locator_text(root, timeout_ms=1500))
+                if not root_text:
+                    return True
+            for selector in (
+                    ".arco-spin-loading",
+                    ".arco-spin-dot-loading",
+                    "[class*='loading'][class*='spin']",
+            ):
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    return True
+        except Exception:
+            return True
+        return False
+
     @staticmethod
     def _is_network_transient_exception(exc: BaseException) -> bool:
         """判断异常是否属于应无限等待的网络/导航抖动。"""
@@ -5757,6 +7017,7 @@ class UserGrowthBrowserClient:
                     try:
                         page = await context.new_page()
                     except Exception as exc:
+                        await self._raise_if_user_closed_browser(exc, progress)
                         if not self._is_session_closed_exception(exc) or playwright is None:
                             raise
                         old_browser = (session or {}).get("browser")
@@ -6379,6 +7640,18 @@ class UserGrowthBrowserClient:
                 traceback.format_exception(type(exc), exc, exc.__traceback__)
             ).rstrip())
         self._write_run_log("\n".join(lines))
+        try:
+            page_url = page.url if page is not None else ""
+        except Exception:
+            page_url = ""
+        self._write_event(
+            "error_snapshot",
+            name=name,
+            url=page_url,
+            context=extra or "",
+            error_type=type(exc).__name__ if exc is not None else "",
+            error_message=str(exc) if exc is not None else "",
+        )
 
     def _emit(self, progress: ProgressCallback | None, message: str) -> None:
         """向调用方发送一条进度消息。"""
@@ -6391,6 +7664,16 @@ class UserGrowthBrowserClient:
     def _raise_if_cancelled(self) -> None:
         if self._cancel_requested():
             raise UserGrowthCancelled("任务已取消")
+        if not self._browser_disconnected:
+            return
+        exit_code = self._read_browser_process_exit_code()
+        if exit_code == 0:
+            raise UserGrowthCancelled("检测到用户主动关闭浏览器，任务已停止，不自动重启")
+        if exit_code != 259 or time.monotonic() - self._browser_disconnected_at >= 2.0:
+            raise RuntimeError(
+                "Browser has been disconnected unexpectedly; "
+                f"exit_code={exit_code if exit_code is not None else 'unknown'}"
+            )
 
     async def _watch_cancel(self, session: dict, progress: ProgressCallback | None = None) -> None:
         """后台监听取消事件，取消时关闭浏览器以打断 Playwright 无限等待。"""

@@ -9,6 +9,7 @@ import math
 import os
 import re
 import wave
+import sync_feishu_keyword_policy as FEISHU_POLICY_MOD
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -726,10 +727,29 @@ def main() -> int:
     parser.add_argument("--transcript", type=Path, help="JSON transcript with start_time/end_time/text segments.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--policy-json", type=Path, help="Versioned Feishu keyword policy snapshot JSON.")
+    parser.add_argument(
+        "--refresh-feishu-policy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Refresh the keyword snapshot through official Feishu Wiki/Docx APIs before planning.",
+    )
+    parser.add_argument("--feishu-wiki-url", default=os.environ.get("FEISHU_KEYWORD_POLICY_URL") or FEISHU_POLICY_MOD.DEFAULT_WIKI_URL)
+    parser.add_argument("--feishu-api-base-url", default=os.environ.get("FEISHU_API_BASE_URL") or FEISHU_POLICY_MOD.DEFAULT_FEISHU_BASE_URL)
     parser.add_argument("--render-preview", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
-    configure_keyword_policy(args.policy_json)
+    policy_path = args.policy_json or DEFAULT_POLICY_PATH
+    refresh_feishu_policy = args.refresh_feishu_policy if args.refresh_feishu_policy is not None else not args.policy_json
+    if refresh_feishu_policy:
+        try:
+            FEISHU_POLICY_MOD.sync_keyword_policy(
+                wiki_url=args.feishu_wiki_url,
+                output_path=Path(policy_path),
+                base_url=args.feishu_api_base_url,
+            )
+        except Exception as exc:
+            raise SystemExit(f"Feishu policy API refresh failed: {exc}") from exc
+    configure_keyword_policy(policy_path)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     segments = load_segments(args.transcript)

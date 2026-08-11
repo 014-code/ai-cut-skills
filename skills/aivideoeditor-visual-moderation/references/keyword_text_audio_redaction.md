@@ -4,11 +4,11 @@ Use this reference for business-rule subtitle masking and synchronized audio mut
 
 ## Policy Source
 
-The current policy snapshot is synchronized from the Feishu document `素材尺度规范`:
+The current policy snapshot is synchronized from the Feishu document `素材尺度规范` through the official Feishu Open API:
 
 `https://donsontech.feishu.cn/wiki/MQi5w9llgi2J3UkcOR5c3Ukvn8g`
 
-The versioned snapshot is `references/feishu_keyword_policy.json`. The runtime loads that snapshot first and falls back to the built-in list only when the snapshot is unavailable. Local supplements such as `省政府` and `装13` are intentionally merged after the Feishu groups so previously confirmed business terms are not lost.
+The sync entrypoint is `scripts/sync_feishu_keyword_policy.py`. It resolves the Wiki node with `wiki/v2/spaces/get_node`, reads the cloud document with `docx/v1/documents/{document_id}/blocks`, validates all four required groups, and atomically writes `references/feishu_keyword_policy.json`. Browser automation is not part of this workflow. Local supplements such as `省政府` and `装13` are intentionally merged after the Feishu groups so previously confirmed business terms are not lost.
 
 ## Scope
 

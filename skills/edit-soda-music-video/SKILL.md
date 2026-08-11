@@ -17,6 +17,10 @@ description: Create, revise, or validate Soda Music portrait talking-head mixed-
 
 正式 render 会生成 `delivery_report.json`，只有环境、通用 Manifest、Whisper 字幕修复、合规、preflight、内置 renderer 报告和完整技术 QA 全部通过时才写入 `formal_delivery_ready=true`。单独运行 `qa` 只验证媒体结构、解码和响度，固定输出 `scope=technical_media_only`、`formal_delivery_ready=false`。
 
+Windows 上的透明视频必须走 Alpha 安全链路。视频时间轴条目必须显式声明 `transparency_mode=opaque|embedded_alpha`；`embedded_alpha` 在 preflight 和 render 前都要用当前 FFmpeg 对 10%、50%、90% 三个时间点做真实解码，确认解码格式带 Alpha 且 Alpha 不是恒定 255。失败必须停止，严禁用黑色抠像、`colorkey`、`chromakey`、Screen 或 blend 模式代替。报告必须记录 Skill 版本、FFmpeg/FFprobe 绝对路径与版本、解码像素格式、Alpha min/max、抽样命令和正式 filter graph。
+
+视频动画必须按 `mapped_start` 重置 PTS 后起播。`playback_mode` 支持 `once`、`once_hold_last`、`loop`，默认 `once_hold_last`；只有 `loop` 可以使用输入流循环。`include_audio=true` 时把素材自身音轨按 `mapped_start` 延迟并按 `audio_gain_db` 混入，不再生成正弦提示音冒充素材音效。
+
 保留原始视频、BGM 和素材包，只输出新文件。除 [special-material-matches.md](references/special-material-matches.md) 中由用户明确批准的特殊匹配外，Skill 内不得保存或假设具体素材名称、文件名、绝对路径、固定时间码或样片脚本；只维护素材种类、输入契约和剪辑规则。特殊匹配只保存参考相对路径、画面识别条件和触发规则，不保存文件哈希，也不能把素材文件复制进 Skill。所有任务视觉素材仍必须由调用方提供并进入当前工作区 Manifest。
 
 字幕中的“汽水音乐”和“汽水”必须使用调用方提供的 SodaFont，并显示为品牌绿 `#3BFD42`；同一字幕中的其他文字立即恢复为调用方提供的方正兰亭和普通字幕颜色。字体规范属于品牌规则，可以写入 Skill；字体文件和路径仍由调用方提供。
@@ -115,6 +119,19 @@ PIPE="$SKILL_DIR/scripts/soda_pipeline.py"
 ```
 
 必须检查 `ok=true`。`--environment-report` 省略时默认读取时间轴同目录的 `video_environment.json`；带台词的预检增加 `--require-whisper`。`--asset-root`、`--bgm` 和 `--timeline-json` 没有 CLI 默认值，必须按任务显式传入；用户没有指定 BGM 时，由执行模型先从任务内候选自主选定路径再传给 `--bgm`，不要把参数必填转化成对用户的追问。
+
+### Windows Alpha 素材审计
+
+在正式时间轴前可对整个新素材目录执行独立审计；该命令不绕过 Manifest，只用于验证当前 Windows 解码器和输出三背景视觉证据：
+
+```bash
+"$PY" "$PIPE" alpha-audit \
+  --asset-root /absolute/path/assets \
+  --qa-dir /absolute/path/workspace/alpha_qa \
+  --output-json /absolute/path/workspace/alpha_audit.json
+```
+
+报告必须满足全部视频 `alpha.ok=true`；棋盘格、浅色、深色背景抽帧用于复核黑色 UI 仍为不透明内容，不能作为脚本自动黑色抠像的依据。
 
 可复制 `$SKILL_DIR/references/timeline-template.json` 到任务输出目录，填写调用方实际提供的路径、字幕、物料和时间点，再通过 `--timeline-json` 传入。模板只描述字段结构，不包含现有素材信息。
 

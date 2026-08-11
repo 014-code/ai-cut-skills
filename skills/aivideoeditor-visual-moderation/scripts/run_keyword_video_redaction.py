@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sys
@@ -31,6 +32,7 @@ def load_module(path: Path, name: str) -> Any:
 KEYWORD_MOD = load_module(HERE / "simulate_keyword_text_audio_redaction.py", "keyword_redaction_impl")
 MASK_MOD = load_module(HERE / "run_aliyun_review_mask_rereview.py", "keyword_video_mask_impl")
 ASR_MOD = load_module(HERE / "run_high_accuracy_asr.py", "keyword_high_accuracy_asr")
+FEISHU_POLICY_MOD = load_module(HERE / "sync_feishu_keyword_policy.py", "keyword_feishu_policy_sync")
 
 SUBTITLE_SEARCH_BBOX = [0.04, 0.54, 0.96, 0.94]
 FALLBACK_SUBTITLE_LINE_BBOX = [0.22, 0.80, 0.78, 0.91]
@@ -1397,6 +1399,14 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--policy-json", type=Path, help="Versioned Feishu keyword policy snapshot JSON.")
     parser.add_argument(
+        "--refresh-feishu-policy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Refresh the keyword snapshot through official Feishu Wiki/Docx APIs before processing.",
+    )
+    parser.add_argument("--feishu-wiki-url", default=os.environ.get("FEISHU_KEYWORD_POLICY_URL") or FEISHU_POLICY_MOD.DEFAULT_WIKI_URL)
+    parser.add_argument("--feishu-api-base-url", default=os.environ.get("FEISHU_API_BASE_URL") or FEISHU_POLICY_MOD.DEFAULT_FEISHU_BASE_URL)
+    parser.add_argument(
         "--subtitle-bbox",
         type=parse_bbox,
         default=FALLBACK_SUBTITLE_LINE_BBOX,
@@ -1411,7 +1421,22 @@ def main() -> int:
     parser.add_argument("--copy-when-clean", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
-    keyword_policy = KEYWORD_MOD.configure_keyword_policy(args.policy_json)
+    policy_path = args.policy_json or KEYWORD_MOD.DEFAULT_POLICY_PATH
+    policy_refresh: Dict[str, Any] = {"enabled": False}
+    refresh_feishu_policy = args.refresh_feishu_policy if args.refresh_feishu_policy is not None else not args.policy_json
+    if refresh_feishu_policy:
+        try:
+            policy_refresh = {
+                "enabled": True,
+                **FEISHU_POLICY_MOD.sync_keyword_policy(
+                    wiki_url=args.feishu_wiki_url,
+                    output_path=Path(policy_path),
+                    base_url=args.feishu_api_base_url,
+                ),
+            }
+        except Exception as exc:
+            raise SystemExit(f"Feishu policy API refresh failed: {exc}") from exc
+    keyword_policy = KEYWORD_MOD.configure_keyword_policy(policy_path)
 
     video = args.video.resolve()
     if not video.is_file():
@@ -1482,6 +1507,7 @@ def main() -> int:
         "transcript": str(transcript),
         "transcript_generated": transcript_generated,
         "keyword_policy": keyword_policy,
+        "keyword_policy_refresh": policy_refresh,
         "output": str(output),
         "plan_path": str(plan_path),
         "subtitle_bbox_normalized": list(args.subtitle_bbox),

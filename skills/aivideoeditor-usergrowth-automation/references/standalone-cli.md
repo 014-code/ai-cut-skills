@@ -2,6 +2,37 @@
 
 Use `scripts/usergrowth_upload.py` when the user wants the skill itself to perform UserGrowth planning or upload. The script vendors the UserGrowth automation package inside this skill, so it does not import from the project repo at runtime.
 
+## Tomato Music BID/CID Tagging
+
+Use `scripts/tomato_music_tagging.py` after the Tomato Music upload/CID collection flow when each BID batch must be applied as a custom tag in 墨攻AI素材管理. Prefer online Feishu input through the official Wiki + Sheets OpenAPI; see `references/feishu-sheets-api.md`. Do not use browser simulation for Feishu table reads or writes.
+
+The compatible local input path accepts dry-run JSON (`batches[].bid` + `batches[].cids`) or an `.xlsx/.xlsm` containing `bid`/`bookid` and `cid` columns across multiple sheets. Excel rows with invalid/non-hex-32 CID values are ignored; duplicate CIDs within a BID are de-duplicated.
+
+First create and inspect a dry-run plan:
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py `
+  --input 'D:\Users\Donson\Downloads\番茄音乐_bid_cid_dry_run.json' `
+  --customer-id 3681575 `
+  --max-batches 1 `
+  --output-root 'D:\Users\Donson\Downloads\番茄音乐打标输出'
+```
+
+The live run requires both `--live --confirm-live`, and credentials should come from environment variables. The customer ID is the 客户列表 ID, not a work-order ID:
+
+```powershell
+$env:USERGROWTH_ACCOUNT = '<account>'
+$env:USERGROWTH_PASSWORD = '<password>'
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py `
+  --input 'D:\Users\Donson\Downloads\番茄音乐_bid_cid_dry_run.json' `
+  --customer-id 3681575 `
+  --max-batches 1 `
+  --live --confirm-live `
+  --output-root 'D:\Users\Donson\Downloads\番茄音乐打标输出'
+```
+
+The platform accepts newline-separated CID search values. The runner encodes the newline search in the URL and caps each search chunk at 50 CIDs, because comma-separated values and larger chunks are not reliable on the current 素材管理 page. It verifies the visible result count before `全选所有`, writes `bid_<BID>`, opens the resulting operation task, and requires `总任务数 == 批次实际命中数`, `执行成功数量 == 总任务数`, and `执行失败数量 == 0` before marking that chunk complete. Each chunk is checkpointed in `tomato_music_tagging_checkpoint.json`.
+
 ## Install Runtime Dependencies
 
 Use the Python environment that will run the automation:
@@ -38,7 +69,7 @@ On failure after a task folder is created, read `<output-root>/<timestamp>_<task
 
 ## Resume
 
-Live Soda Music and Redfruit runs write `task.json` plus a workflow checkpoint incrementally (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`). The checkpoint is per order, so concurrent batches do not overwrite each other. Soda stages include `pending`, `upload_processing`, `upload_task_created`, `upload_success`, `review_submitted`, `cid_backfilling`, `cid_backfilled_unreviewed`, and `completed`; Redfruit adds its ARLP/classification stages. During `upload_processing`, each duplicate-upload recovery and row-scoped `点击重试` action is persisted, so a resume does not blindly repeat already-handled upload rows.
+Live Soda Music and Redfruit runs write `task.json` plus a workflow checkpoint incrementally (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`). The checkpoint is per order, so concurrent batches do not overwrite each other. Soda stages include `pending`, `upload_processing`, `upload_task_created`, `upload_success`, `review_submitted`, `cid_backfilling`, `cid_backfilled_unreviewed`, and `completed`; Redfruit adds its ARLP/classification stages. During `upload_processing`, each duplicate-upload recovery and row-scoped `点击重试` action is persisted, so a resume does not blindly repeat already-handled upload rows. If `upload_processing` already contains an upload task ID, both workflows resume from that task and skip the file-upload stage; Soda does not run Redfruit's post-review classification stage.
 
 After an interruption, resume from the task folder, `task.json`, or `redfruit_checkpoint.json`:
 
@@ -51,6 +82,10 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts
 ```
 
 Resume supports `soda_music` and `redfruit_short_drama`. Credentials are read again from CLI arguments or environment variables and are never stored in the checkpoint. A `completed` or `cid_backfilled_unreviewed` checkpoint returns the saved result without opening a browser; earlier stages are resumed from their saved task IDs and item metadata.
+
+For Redfruit, when the checkpoint already contains a unique CID for every active material and the stage is `review_submitted`, `arlp_submitting`, `arlp_success`, or `classification_submitting`, resume skips the historical upload/review task and goes directly to `墨攻AI -> 素材管理`. It searches the batch CIDs (newline-separated), verifies that the result count covers the batch, then continues `增加 ARLP` and `修改分类标签`. It must not wait for an old upload task in this case.
+
+For Redfruit `upload_processing` checkpoints without a task ID, resume never falls back to file upload. It only uses saved original creative-unit IDs to enter `工单管理 -> 创意单元 -> 录入素材`; if those IDs are missing, it stops with a checkpoint error instead of risking a duplicate upload.
 
 ## Selectors
 
@@ -184,7 +219,7 @@ Run it:
 
 Batch mode writes a total summary to `<output-root>/batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log`. Each child batch still writes its own `<output-root>/<timestamp>_<batch-task-name>/task.json`, `run.log`, `result.xlsx` in dry-run mode, and `debug/` in live mode.
 
-Multi-batch execution always runs in parallel when there is more than one batch. If `concurrency` is omitted, it defaults to the number of batches, capped at 10. Even if `concurrency` is set to `1`, a run with two or more batches is lifted to at least `2` workers.
+Multi-batch execution remains parallel by default. If `concurrency` is omitted, it defaults to the number of batches, capped at 10. Explicit `concurrency=1` or `--concurrency 1` selects ordered serial execution. In serial mode, a batch that exhausts its retries is written as failed and skipped, then the next batch starts; a user cancellation/manual browser close stops the queue instead of opening the next batch.
 
 In the desktop app, the automatic song splitter produces the same shape conceptually: one batch per recognized song, with explicit selected video paths for that song. The browser layer still fills the first chameleon card and uses `一键复用`, so different songs should be split before live upload.
 

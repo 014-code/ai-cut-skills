@@ -24,6 +24,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ass_fonts import AssFontError, validate_ass_font_config
+from alpha_safety import (
+    AlphaSafetyError,
+    inspect_embedded_alpha,
+    render_alpha_qa_frames,
+    runtime_evidence,
+    validate_video_material_policy,
+)
 from caption_layout import (
     CaptionLayoutError,
     count_caption_characters,
@@ -78,6 +85,8 @@ def run_command(
         command,
         cwd=str(cwd) if cwd else None,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         check=False,
@@ -291,6 +300,19 @@ def detect_embedded_black_bars(path: Path) -> dict[str, Any]:
     }
 
 
+def detect_material_black_bars(path: Path, transparency_mode: str) -> dict[str, Any]:
+    if str(transparency_mode).casefold() == "embedded_alpha":
+        return {
+            "ok": True,
+            "status": "managed_by_alpha_gate",
+            "reason": (
+                "transparent perimeter is intentional for embedded-alpha material; "
+                "three-point decoded-alpha validation and visual QA apply instead"
+            ),
+        }
+    return detect_embedded_black_bars(path)
+
+
 def load_timeline_config(path: Path) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     if not resolved.exists():
@@ -332,6 +354,10 @@ def load_timeline_config(path: Path) -> dict[str, Any]:
             raise PipelineError(
                 f"materials[{index}] must record matched_benefit_text from the benefit-point narration"
             )
+        try:
+            validate_video_material_policy(material, label=f"materials[{index}]")
+        except AlphaSafetyError as exc:
+            raise PipelineError(str(exc)) from exc
     special_match_errors = special_match_metadata_errors(config.get("materials", []))
     if special_match_errors:
         raise PipelineError("; ".join(special_match_errors))
@@ -719,6 +745,7 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
     asset_understanding: dict[str, Any] | None = None
     material_timeline: dict[str, Any] | None = None
     caption_layout: dict[str, Any] | None = None
+    alpha_checks: list[dict[str, Any]] = []
 
     def check(name: str, path: Path, required: bool = True) -> None:
         checks.append(
@@ -778,7 +805,10 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
                 path = resolve_timeline_asset(asset_root, str(item["path"]))
                 if not path.exists():
                     continue
-                result = detect_embedded_black_bars(path)
+                result = detect_material_black_bars(
+                    path,
+                    str(item.get("transparency_mode", "")),
+                )
                 result.update(
                     {
                         "name": f"material_{index}_{item.get('name', 'unnamed')}",
@@ -795,6 +825,53 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
                         visual_errors.append(message)
                     else:
                         visual_warnings.append(message)
+        if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+            for index, item in enumerate(config["materials"]):
+                if str(item.get("kind", "")).casefold() != "video":
+                    continue
+                mode = str(item.get("transparency_mode", "")).casefold()
+                path = resolve_timeline_asset(asset_root, str(item["path"]))
+                if not path.exists():
+                    continue
+                source_media = media_summary(path)
+                if mode != "embedded_alpha":
+                    alpha_checks.append(
+                        {
+                            "name": f"material_{index}_{item.get('name', 'unnamed')}",
+                            "path": str(path),
+                            "transparency_mode": mode or None,
+                            "ok": mode == "opaque",
+                            "status": "opaque_declared",
+                            "source_media": source_media,
+                        }
+                    )
+                    if bool(item.get("include_audio", False)) and not source_media.get("audio_codec"):
+                        visual_errors.append(
+                            f"素材声明 include_audio=true 但没有可用音轨：{path}"
+                        )
+                    continue
+                alpha = inspect_embedded_alpha(path)
+                alpha.update(
+                    {
+                        "name": f"material_{index}_{item.get('name', 'unnamed')}",
+                        "transparency_mode": mode,
+                        "playback_mode": item.get("playback_mode", "once_hold_last"),
+                        "include_audio": item.get("include_audio", False),
+                        "audio_gain_db": item.get("audio_gain_db", -3),
+                        "source_media": source_media,
+                    }
+                )
+                alpha_checks.append(alpha)
+                if not alpha["ok"]:
+                    visual_errors.append(
+                        "embedded_alpha 素材未通过真实解码 Alpha 门禁："
+                        + str(path)
+                        + "；禁止改用 colorkey/chromakey/Screen/blend 降级。"
+                    )
+                if bool(item.get("include_audio", False)) and not source_media.get("audio_codec"):
+                    visual_errors.append(
+                        f"素材声明 include_audio=true 但没有可用音轨：{path}"
+                    )
         if motion_effects:
             required = motion_effects.get("mode") == "required"
             check(
@@ -827,11 +904,13 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
         "timeline_json": str(timeline_path),
         "renderer": str(renderer),
         "binaries": binaries,
+        "runtime_evidence": runtime_evidence(),
         "checks": checks,
         "missing": missing,
         "missing_binaries": missing_binaries,
         "visual_policy": visual_policy,
         "visual_checks": visual_checks,
+        "alpha_checks": alpha_checks,
         "visual_errors": visual_errors,
         "visual_warnings": visual_warnings,
         "motion_effects": motion_effects,
@@ -844,6 +923,7 @@ def preflight_report(args: argparse.Namespace) -> dict[str, Any]:
             "Material size is preserved by default; the renderer repositions first and, only when required, scales to the largest size that fits outside the logo and warning protection regions without a fixed scale threshold.",
             "Rendering is blocked until every image/video in the synced Manifest has a model-written description and source-pixel effective_region, and all timeline visual assets are tracked by that Manifest.",
             "Every supplemental material must be tied to explicit benefit-point narration through semantic_role=benefit_point and matched_benefit_text.",
+            "Video materials require explicit transparency_mode; embedded_alpha is accepted only after three real decoded-frame alpha samples pass, and chroma-key/screen/blend fallbacks are forbidden.",
             "Materials use half-open [start,end) intervals. Inside one sequence_id, every end must exactly equal the next start, and every handoff must equal a caption start; use a different sequence_id only for an intentional digital-human gap.",
         ],
     }
@@ -875,6 +955,68 @@ def cmd_sync_assets(args: argparse.Namespace) -> int:
         command.append("--force")
     result = run_command(command, capture=False, check=False)
     return result.returncode
+
+
+def cmd_alpha_audit(args: argparse.Namespace) -> int:
+    """Audit every video under an asset root using the actual Windows decoder."""
+
+    asset_root = args.asset_root.expanduser().resolve()
+    if not asset_root.is_dir():
+        raise PipelineError(f"Asset root not found: {asset_root}")
+    qa_root = args.qa_dir.expanduser().resolve() if args.qa_dir else None
+    paths = sorted(
+        (
+            path
+            for path in asset_root.rglob("*")
+            if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS
+        ),
+        key=lambda path: path.as_posix().casefold(),
+    )
+    items: list[dict[str, Any]] = []
+    for index, path in enumerate(paths, start=1):
+        relative = path.relative_to(asset_root).as_posix()
+        alpha = inspect_embedded_alpha(path)
+        media = media_summary(path)
+        item: dict[str, Any] = {
+            "index": index,
+            "relative_path": relative,
+            "media": media,
+            "alpha": alpha,
+        }
+        if qa_root and alpha["ok"]:
+            safe_name = re.sub(r"[^0-9A-Za-z._-]+", "_", relative).strip("_")
+            item["qa"] = render_alpha_qa_frames(
+                path,
+                qa_root / f"{index:03d}_{safe_name}",
+            )
+        items.append(item)
+    failed = [item["relative_path"] for item in items if not item["alpha"]["ok"]]
+    qa_failed = [
+        item["relative_path"]
+        for item in items
+        if isinstance(item.get("qa"), dict) and not item["qa"].get("ok")
+    ]
+    report = {
+        "ok": bool(paths) and not failed and not qa_failed,
+        "asset_root": str(asset_root),
+        "runtime_evidence": runtime_evidence(),
+        "policy": {
+            "sample_points": [0.1, 0.5, 0.9],
+            "require_non_constant_alpha": True,
+            "forbidden_fallbacks": ["colorkey", "chromakey", "screen", "blend"],
+        },
+        "summary": {
+            "total": len(items),
+            "passed": len(items) - len(failed),
+            "failed": len(failed),
+            "qa_failed": len(qa_failed),
+        },
+        "failed": failed,
+        "qa_failed": qa_failed,
+        "items": items,
+    }
+    write_json(report, args.output_json)
+    return 0 if report["ok"] else 2
 
 
 def parse_noise_levels(raw: str) -> list[str]:
@@ -2186,6 +2328,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync_assets.add_argument("--checksum", action="store_true")
     sync_assets.add_argument("--force", action="store_true")
     sync_assets.set_defaults(func=cmd_sync_assets)
+
+    alpha_audit = sub.add_parser(
+        "alpha-audit",
+        help="Decode-sample every video Alpha plane and optionally render checker/light/dark QA frames",
+    )
+    alpha_audit.add_argument("--asset-root", type=Path, required=True)
+    alpha_audit.add_argument("--qa-dir", type=Path)
+    alpha_audit.add_argument("--output-json", type=Path)
+    alpha_audit.set_defaults(func=cmd_alpha_audit)
 
     caption_budget = sub.add_parser(
         "caption-budget",

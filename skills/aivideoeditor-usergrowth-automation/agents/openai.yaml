@@ -1,4 +1,4 @@
 interface:
   display_name: "AIVideoEditor UserGrowth Automation"
-  short_description: "Guide desktop UserGrowth upload automation"
-  default_prompt: "Use $aivideoeditor-usergrowth-automation to dry-run selected videos for UserGrowth upload."
+  short_description: "Run UserGrowth uploads, Feishu sync, and tagging"
+  default_prompt: "Use $aivideoeditor-usergrowth-automation to plan or run UserGrowth uploads and Feishu-backed Tomato Music CID/BID tagging."

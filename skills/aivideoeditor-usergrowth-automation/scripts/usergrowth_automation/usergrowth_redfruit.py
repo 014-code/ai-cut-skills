@@ -378,7 +378,7 @@ def redfruit_drama_type(file_name: str) -> str:
 
 
 def redfruit_drama_title(file_name: str) -> str:
-    parts = _split_name_parts(file_name)
+    parts = _split_name_parts_preserving_punctuation(file_name)
     if len(parts) >= 3 and _looks_like_redfruit_type(parts[1]):
         return parts[2].strip()
     for index, part in enumerate(parts):
@@ -595,6 +595,13 @@ def redfruit_editor_tags(file_name: str) -> list[str]:
 def _split_name_parts(file_name: str) -> list[str]:
     stem = Path(str(file_name or "")).stem
     stem = unicodedata.normalize("NFKC", stem)
+    stem = stem.replace("—", "-").replace("–", "-").replace("－", "-")
+    return [part.strip() for part in re.split(r"\s*-\s*", stem) if part.strip()]
+
+
+def _split_name_parts_preserving_punctuation(file_name: str) -> list[str]:
+    """拆分红果文件名时保留剧名原始标点，避免中文逗号被 NFKC 改成英文逗号。"""
+    stem = Path(str(file_name or "")).stem
     stem = stem.replace("—", "-").replace("–", "-").replace("－", "-")
     return [part.strip() for part in re.split(r"\s*-\s*", stem) if part.strip()]
 

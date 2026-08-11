@@ -245,8 +245,9 @@ class SkillConsistencyTests(unittest.TestCase):
         readme = readme_path.read_text(encoding="utf-8")
 
         self.assertIn(".workbuddy", readme)
-        self.assertIn("rsync", readme)
-        self.assertIn("同一份仓库内容", readme)
+        self.assertIn("sync_skills.py", readme)
+        self.assertIn("--no-delete", readme)
+        self.assertIn("仓库中的 `skills/` 是唯一可信源", readme)
 
 
 if __name__ == "__main__":

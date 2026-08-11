@@ -8,6 +8,7 @@
 - 本地 `whisper` CLI 和内置或已缓存的 `tiny` 模型：无调用方台词时不可用可退化为多阈值音量检测；提供台词时必须可用并输出 `--word_timestamps True` 的词级 JSON，否则渲染失败；
 - `setup-video-editing-environment` 内置官方 `tiny.pt`，汽水脚本会优先把其目录传给 Whisper CLI；它只替代权重下载，不替代 `openai-whisper` 包和 CLI；
 - 输入视频、BGM、素材目录和时间轴 JSON。
+- Windows 透明视频要求当前 FFmpeg 实际把 HEVC Alpha 辅助层解码为带 Alpha 的帧；版本号、编码名和 `ffprobe` 颜色层 `pix_fmt` 不能代替抽样门禁。
 - 必需安装 `manage-visual-asset-library`；它负责生成和校验工作区 `visual_assets_manifest.json`。汽水 `preflight`/`render` 只消费 Manifest 并执行最低契约门禁。
 - 可选 `${CODEX_HOME:-$HOME/.codex}/skills/video-motion-effects`；启用时额外需要 Node.js、Chrome/Chromium 及该 Skill 已安装的 Remotion 依赖。
 
@@ -34,6 +35,8 @@ python3 scripts/soda_pipeline.py preflight \
 ```
 
 时间轴 JSON 中的素材路径默认相对 `--asset-root`；也可以使用绝对路径。
+
+每个视频素材必须显式提供 `transparency_mode=opaque|embedded_alpha`。`embedded_alpha` 在 10%、50%、90% 抽样点检查真实 Alpha min/max，失败即停止且禁止黑色抠像、Screen、`colorkey`、`chromakey`、blend 降级。`playback_mode=once|once_hold_last|loop` 默认 `once_hold_last`；渲染器重置素材 PTS 后加 `mapped_start`。`include_audio=true` 时要求真实音轨并按 `audio_gain_db` 混音，默认 `-3 dB`。
 
 `render` 和 `validate-rules` 的 `--channel` 同样保持必填，用于让合规报告记录已经确定的正式渠道。用户未指定时由执行模型根据口播、金额、金币/提现、歌单和素材线索从 `old-down`、`new-high-mid`、`free-listen`、`coin-non-down` 中自主选择；正式交付不使用 `general`。CLI 仍显式传入模型选定的 `--channel` 和 `--bgm`，这里的必填含义是“执行前必须得到确定值”，不是“必须询问用户”。
 
