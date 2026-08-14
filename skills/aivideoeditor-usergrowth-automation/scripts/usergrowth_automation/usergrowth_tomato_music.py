@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Awaitable, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from openpyxl import load_workbook
 
 from .usergrowth_browser import HOME_URL, UserGrowthBrowserClient
+from .usergrowth_models import UserGrowthCancelled
 
 
 ProgressCallback = Callable[[str], None]
 CheckpointCallback = Callable[[dict], None]
+ChunkSuccessCallback = Callable[
+    ["TomatoMusicTagBatch", "TomatoMusicChunkResult"],
+    Awaitable[int | None] | int | None,
+]
 CID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
 MAX_SEARCH_CHUNK_SIZE = 50
 
@@ -25,6 +31,7 @@ class TomatoMusicTagBatch:
     tag: str
     cids: list[str]
     song_names: list[str] = field(default_factory=list)
+    tracks: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -40,6 +47,9 @@ class TomatoMusicChunkResult:
     failed: int = 0
     status: str = "pending"
     message: str = ""
+    status_updated: bool = False
+    status_updated_rows: int = 0
+    status_update_message: str = ""
 
 
 def normalise_bid(value: object) -> str:
@@ -95,12 +105,18 @@ def _load_json_batches(path: Path) -> list[TomatoMusicTagBatch]:
             for item in (row.get("songNames") or row.get("song_names") or [])
             if str(item).strip()
         ]
+        tracks = [
+            {"song": str(item.get("song") or "").strip(), "artist": str(item.get("artist") or "").strip()}
+            for item in (row.get("tracks") or [])
+            if isinstance(item, dict) and str(item.get("song") or "").strip() and str(item.get("artist") or "").strip()
+        ]
         batches.append(
             TomatoMusicTagBatch(
                 bid=bid,
                 tag=str(row.get("tag") or tag_for_bid(bid)).strip(),
                 cids=cids,
                 song_names=song_names,
+                tracks=tracks,
             )
         )
     if not batches:
@@ -123,6 +139,7 @@ def _load_excel_batches(path: Path) -> list[TomatoMusicTagBatch]:
     bid_headers = {"bid", "bookid", "书籍id", "小说id"}
     cid_headers = {"cid", "素材cid", "creativeid", "素材id"}
     song_headers = {"歌名", "歌曲名", "songname", "song"}
+    status_headers = {"打标状态", "标签状态", "tagstatus", "status"}
     try:
         for sheet in workbook.worksheets:
             header_row = None
@@ -140,6 +157,9 @@ def _load_excel_batches(path: Path) -> list[TomatoMusicTagBatch]:
                 song_index = next((i for i, value in enumerate(compacted) if value in song_headers), None)
                 if song_index is not None:
                     header_map["song"] = song_index
+                status_index = next((i for i, value in enumerate(compacted) if value in status_headers), None)
+                if status_index is not None:
+                    header_map["status"] = status_index
                 break
             if header_row is None:
                 continue
@@ -153,6 +173,17 @@ def _load_excel_batches(path: Path) -> list[TomatoMusicTagBatch]:
                 if not bid or not cids:
                     continue
                 last_bid = bid
+                status_index = header_map.get("status")
+                if status_index is None:
+                    inferred_index = header_map["cid"] + 1
+                    inferred_status = str(row[inferred_index] or "").strip() if inferred_index < len(row) else ""
+                    if inferred_status in {"已打标", "未打标"}:
+                        status_index = inferred_index
+                status = str(row[status_index] or "").strip() if status_index is not None and status_index < len(row) else ""
+                if status == "已打标":
+                    continue
+                if status not in {"", "未打标"}:
+                    continue
                 item = grouped.setdefault(bid, {"cids": [], "songs": []})
                 for cid in cids:
                     if cid not in item["cids"]:
@@ -171,6 +202,7 @@ def _load_excel_batches(path: Path) -> list[TomatoMusicTagBatch]:
             tag=tag_for_bid(bid),
             cids=list(values["cids"]),
             song_names=list(values["songs"]),
+            tracks=[],
         )
         for bid, values in grouped.items()
         if values["cids"]
@@ -201,6 +233,8 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
             chunk_size: int = MAX_SEARCH_CHUNK_SIZE,
             progress: ProgressCallback | None = None,
             checkpoint: CheckpointCallback | None = None,
+            on_chunk_success: ChunkSuccessCallback | None = None,
+            playwright_instance=None,
     ) -> list[TomatoMusicChunkResult]:
         try:
             from playwright.async_api import async_playwright
@@ -208,24 +242,47 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
             raise RuntimeError("需要先安装 playwright，并执行 playwright install chromium") from exc
 
         results: list[TomatoMusicChunkResult] = []
-        async with async_playwright() as playwright:
+        async with AsyncExitStack() as playwright_stack:
+            playwright = playwright_instance
+            if playwright is None:
+                playwright = await playwright_stack.enter_async_context(async_playwright())
             browser = await self._launch_browser(playwright)
+            session = {"browser": browser}
             context = await browser.new_context(viewport={"width": 1440, "height": 1000})
             page = await context.new_page()
             self._wrap_page_speed(page)
             page.set_default_timeout(self.timeout_ms)
             page.set_default_navigation_timeout(self.timeout_ms)
             try:
-                await self._login(page, progress)
-                await self._enable_post_login_resource_blocking(context, progress)
-                page = await self._open_tomato_material_page(
-                    page,
-                    customer_id=customer_id,
-                    material_url=material_url,
-                    progress=progress,
-                )
+                while True:
+                    try:
+                        await self._login(page, progress)
+                        await self._enable_post_login_resource_blocking(context, progress)
+                        page = await self._open_tomato_material_page(
+                            page,
+                            customer_id=customer_id,
+                            material_url=material_url,
+                            progress=progress,
+                        )
+                        break
+                    except UserGrowthCancelled:
+                        raise
+                    except Exception as exc:
+                        loading_stalled = await self._page_is_blank_or_loading(page)
+                        if not self._is_recoverable_session_exception(exc) and not loading_stalled:
+                            raise
+                        page = await self._wait_for_network_recovery(
+                            page,
+                            context,
+                            progress,
+                            "番茄音乐登录和素材页准备",
+                            playwright=playwright,
+                            session=session,
+                        )
+                        context = page.context
                 base_url = self._material_search_base_url(page.url)
                 for batch_index, batch in enumerate(batches, start=1):
+                    batch_result_start = len(results)
                     chunks = split_cids(batch.cids, chunk_size)
                     self._emit(
                         progress,
@@ -240,28 +297,96 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
                             requested_cids=list(cids),
                         )
                         results.append(result)
-                        try:
-                            page = await self._tag_one_cid_chunk(
-                                page,
-                                base_url=base_url,
-                                cids=cids,
-                                tag=result.tag,
-                                progress=progress,
-                                result=result,
-                            )
-                        except Exception as exc:
-                            result.status = "failed"
-                            result.message = str(exc)
-                            if checkpoint:
-                                checkpoint({"results": serialise_results(results)})
-                            raise
+                        while True:
+                            self._raise_if_cancelled()
+                            try:
+                                page = await self._tag_one_cid_chunk(
+                                    page,
+                                    base_url=base_url,
+                                    cids=cids,
+                                    tag=result.tag,
+                                    progress=progress,
+                                    result=result,
+                                    require_exact_match=bool(on_chunk_success),
+                                )
+                                break
+                            except UserGrowthCancelled:
+                                raise
+                            except Exception as exc:
+                                # Network/page failures are session failures, not
+                                # a completed chunk. Recover the browser and retry
+                                # this same chunk without consuming its business
+                                # retry budget; a user close still raises above.
+                                loading_stalled = await self._page_is_blank_or_loading(page)
+                                if self._is_recoverable_session_exception(exc) or loading_stalled:
+                                    page = await self._wait_for_network_recovery(
+                                        page,
+                                        context,
+                                        progress,
+                                        f"番茄音乐 BID {batch.bid} 第 {chunk_index} 组",
+                                        playwright=playwright,
+                                        session=session,
+                                    )
+                                    context = page.context
+                                    page = await self._open_tomato_material_page(
+                                        page,
+                                        customer_id=customer_id,
+                                        material_url=material_url,
+                                        progress=progress,
+                                    )
+                                    base_url = self._material_search_base_url(page.url)
+                                    self._emit(
+                                        progress,
+                                        f"番茄音乐 BID {batch.bid} 第 {chunk_index} 组网络恢复，"
+                                        "继续当前分组",
+                                    )
+                                    continue
+                                result.status = "failed"
+                                result.message = str(exc) or "本组打标失败"
+                                self._emit(
+                                    progress,
+                                    f"番茄音乐 BID {batch.bid} 第 {chunk_index} 组失败："
+                                    f"{result.message}；已记录失败，继续后续分组",
+                                )
+                                if checkpoint:
+                                    checkpoint({"results": serialise_results(results)})
+                                break
+                        if on_chunk_success and result.status == "success":
+                            try:
+                                callback_result = on_chunk_success(batch, result)
+                                if asyncio.iscoroutine(callback_result):
+                                    callback_result = await callback_result
+                                result.status_updated = True
+                                result.status_updated_rows = int(callback_result or 0)
+                            except Exception as exc:
+                                result.status = "failed"
+                                result.status_update_message = str(exc)
+                                result.message = f"墨攻标签任务已成功，但打标状态回写失败：{exc}"
+                                if checkpoint:
+                                    checkpoint({"results": serialise_results(results)})
+                                self._emit(
+                                    progress,
+                                    f"番茄音乐 BID {batch.bid} 第 {chunk_index} 组状态回写失败："
+                                    f"{result.message}；已记录失败，继续后续分组",
+                                )
                         if checkpoint:
                             checkpoint({"results": serialise_results(results)})
-                    self._emit(progress, f"番茄音乐 BID {batch.bid} 已完成全部可检索素材打标")
+                    batch_results = results[batch_result_start:]
+                    failed_count = sum(1 for item in batch_results if item.status == "failed")
+                    if failed_count:
+                        self._emit(
+                            progress,
+                            f"番茄音乐 BID {batch.bid} 已遍历全部分组，"
+                            f"成功 {len(batch_results) - failed_count} 组，失败 {failed_count} 组；"
+                            "继续后续 BID 批次",
+                        )
+                    else:
+                        self._emit(progress, f"番茄音乐 BID {batch.bid} 已完成全部可检索素材打标")
                 return results
             finally:
                 try:
-                    await browser.close()
+                    # 标记为流程主动收尾，避免异常退出被误记为用户关闭页面。
+                    await self._close_browser_intentionally(session.get("browser", browser))
                 except Exception:
                     pass
 
@@ -282,82 +407,40 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
         await self._safe_goto(page, HOME_URL)
         await page.wait_for_timeout(2500)
         if customer_id:
-            await self._select_customer(page, customer_id, progress)
+            page = await self._select_customer(page, customer_id, progress)
 
-        await self._wait_for_page_text(page, ("墨攻AI",), timeout_ms=None, raise_on_timeout=True)
-        await self._click_text(page, "墨攻AI")
-        await self._wait_for_page_text(
-            page,
-            ("工单管理", "素材管理"),
-            timeout_ms=None,
-            raise_on_timeout=True,
-        )
-        await self._click_text(page, "素材管理")
-        await page.wait_for_timeout(2500)
+        # 客户入口会保留上次所在的墨攻页面。若已经落在带 selectorId 的
+        # 素材管理页，直接复用当前页，避免再点工单管理造成错误的导航失败。
+        if await self._is_tomato_material_page_ready(page):
+            self._emit(progress, "客户进入后已在素材管理，直接复用当前页面")
+            return page
+
+        # 复用汽水/红果已验证的墨攻菜单导航；客户进入后必须保留当前页面，
+        # 不能重新访问无 selectorId 的首页，否则会丢失客户 3681575 上下文。
+        try:
+            await self._open_work_order_management(page, progress, navigate_home=False)
+        except RuntimeError:
+            # 工单菜单的点击可能未切页，但客户入口已异步跳到素材管理。
+            # 这是番茄流程的目标页，不应触发全流程清理并关闭浏览器。
+            if await self._is_tomato_material_page_ready(page):
+                self._emit(progress, "工单导航未切页，但当前已是素材管理，继续当前页面")
+                return page
+            raise
+
+        if await self._is_tomato_material_page_ready(page):
+            self._emit(progress, "已在素材管理，跳过重复菜单点击")
+            return page
+        page = await self._open_material_management_page(page, progress)
         await self._wait_tomato_material_page_ready(page)
         return page
 
-    async def _select_customer(
-            self,
-            page,
-            customer_id: str,
-            progress: ProgressCallback | None,
-    ) -> None:
-        customer_id = str(customer_id or "").strip()
-        if not customer_id:
-            return
-        body = await self._body_text(page, timeout_ms=3000)
-        if customer_id not in body:
-            await self._click_if_present(page, "客户列表")
-            search = await self._first_existing(
-                page,
-                (
-                    "input[placeholder*='客户']",
-                    "input[placeholder*='ID']",
-                    "input[placeholder*='搜索']",
-                ),
-            )
-            if search:
-                await search.fill(customer_id)
-                await search.press("Enter")
-                await page.wait_for_timeout(2000)
-
-        customer = page.get_by_text(customer_id, exact=True).first
-        try:
-            if not await customer.count() or not await customer.is_visible():
-                self._emit(progress, f"客户 {customer_id} 未显示在列表中，沿用当前客户上下文")
-                return
-        except Exception:
-            return
-
-        for xpath in (
-            "xpath=ancestor::tr[1]",
-            "xpath=ancestor::*[contains(@class,'card')][1]",
-            "xpath=ancestor::*[contains(@class,'item')][1]",
-            "xpath=ancestor::*[contains(@class,'row')][1]",
-        ):
-            container = customer.locator(xpath)
-            try:
-                if not await container.count() or not await container.is_visible():
-                    continue
-                for text in ("进入", "选择", "切换", "确认"):
-                    button = container.get_by_text(text, exact=True).first
-                    if await button.count() and await button.is_visible():
-                        await button.click()
-                        await page.wait_for_timeout(1800)
-                        self._emit(progress, f"已选择客户 {customer_id}")
-                        return
-            except Exception:
-                continue
-        await customer.click()
-        await page.wait_for_timeout(1800)
-        await self._click_if_present(page, "确定")
-        self._emit(progress, f"已选择客户 {customer_id}")
+    async def _is_tomato_material_page_ready(self, page) -> bool:
+        body = await self._body_text(page, timeout_ms=2500)
+        return "素材管理" in body and "全部素材" in body and "全局搜索" in body
 
     async def _wait_tomato_material_page_ready(self, page) -> None:
         async def ready() -> bool:
-            body = await self._body_text(page, timeout_ms=2500)
-            return "素材管理" in body and "全部素材" in body and "全局搜索" in body
+            return await self._is_tomato_material_page_ready(page)
 
         if not await self._wait_for_result(ready, timeout_ms=60000, interval_ms=800):
             await self._snapshot_error(page, "tomato_music_material_page_not_ready")
@@ -374,7 +457,7 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
     def _material_search_url(base_url: str, cids: list[str]) -> str:
         parts = urlsplit(base_url)
         params = parse_qsl(parts.query, keep_blank_values=True)
-        params.append(("q", "\n".join(cids)))
+        params.append(("q", " ".join(cids)))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
 
     async def _tag_one_cid_chunk(
@@ -386,19 +469,24 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
             tag: str,
             progress: ProgressCallback | None,
             result: TomatoMusicChunkResult,
+        require_exact_match: bool = False,
     ):
-        search_url = self._material_search_url(base_url, cids)
-        await self._safe_goto(page, search_url)
-        matched_count = await self._wait_material_search_result(page, cids)
+        matched_count = await self._search_redfruit_materials_by_cids(
+            page,
+            cids,
+            progress,
+            wait_on_empty=True,
+            clear_query_scope=True,
+        )
         result.matched_count = matched_count
-        if matched_count <= 0:
-            result.status = "skipped"
-            result.message = "当前客户素材库未检索到这些 CID"
-            self._emit(progress, f"番茄音乐 {result.bid} 第 {result.chunk_index} 组：未检索到素材，跳过")
-            return page
         if matched_count > len(cids):
             raise RuntimeError(
                 f"搜索结果 {matched_count} 条超过本组 CID 数 {len(cids)}，为避免误选已停止"
+            )
+        if require_exact_match and matched_count != len(cids):
+            raise RuntimeError(
+                f"搜索结果 {matched_count} 条少于本组 CID 数 {len(cids)}，"
+                "无法安全回写逐行打标状态，已停止提交"
             )
 
         if await self._selected_count(page) > 0:
@@ -436,30 +524,15 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
             f"番茄音乐 {result.bid} 第 {result.chunk_index} 组：任务 {task_id}，"
             f"成功 {result.success}/{result.total}，失败 {result.failed}",
         )
+        await self._snapshot(
+            task_page,
+            f"tomato_music_tag_success_{result.bid}_{result.chunk_index}",
+            screenshot=True,
+        )
         await self._close_redfruit_result_dialog(page)
         if page.is_closed():
             page = task_page
         return page
-
-    async def _wait_material_search_result(self, page, cids: list[str]) -> int:
-        minimum_wait_seconds = 4.0
-        started = asyncio.get_running_loop().time()
-        while True:
-            self._raise_if_cancelled()
-            body = await self._body_text(page, timeout_ms=3000)
-            matches = re.findall(r"共\s*(\d+)\s*条", body)
-            if matches:
-                return int(matches[-1])
-            if "暂无数据" in body and asyncio.get_running_loop().time() - started >= minimum_wait_seconds:
-                return 0
-            if asyncio.get_running_loop().time() - started >= 60:
-                await self._snapshot_error(
-                    page,
-                    "tomato_music_search_timeout",
-                    extra=f"cids={','.join(cids)}",
-                )
-                raise RuntimeError("等待番茄音乐 CID 搜索结果超时")
-            await page.wait_for_timeout(800)
 
     async def _fill_tomato_custom_tag_dialog(self, page, tag: str) -> None:
         dialog = await self._wait_tomato_custom_tag_dialog(page)

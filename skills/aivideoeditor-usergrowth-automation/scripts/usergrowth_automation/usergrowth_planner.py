@@ -384,6 +384,14 @@ def _redfruit_metadata_for_config(config: UserGrowthRunConfig, path: Path) -> di
         metadata["arlp_platforms"] = list(config.arlp_platforms)
     if config.arlp_platform_all is not None:
         metadata["arlp_platform_all"] = bool(config.arlp_platform_all)
+    if config.arlp_products or config.arlp_platforms:
+        stages = [dict(stage) for stage in metadata.get("arlp_stages", []) if isinstance(stage, dict)]
+        if stages:
+            if config.arlp_products:
+                stages[0]["products"] = list(config.arlp_products)
+            if config.arlp_platforms:
+                stages[0]["platforms"] = list(config.arlp_platforms)
+            metadata["arlp_stages"] = stages
     return metadata
 
 

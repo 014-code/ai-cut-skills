@@ -679,11 +679,15 @@
         "Excel",
         "歌曲库",
         "标签",
-        "回填"
+        "回填",
+        "飞书",
+        "user_access_token",
+        "OAuth"
       ],
       "when_to_use": [
         "需要将视频上传到 UserGrowth 并送审",
-        "需要匹配歌曲库 回填 Excel CID 或处理素材标签"
+        "需要匹配歌曲库 回填 Excel CID 或处理素材标签",
+        "需要通过飞书 user_access_token 读取或回填番茄音乐 BID"
       ],
       "when_not_use": [
         "需要生成视频",
@@ -694,11 +698,13 @@
         "video_files",
         "upload_manifest",
         "song_library",
+        "feishu_spreadsheet_urls",
         "usergrowth_credentials"
       ],
       "outputs": [
         "upload_results",
         "cid_backfill",
+        "feishu_bid_plan",
         "task_logs"
       ],
       "requires": [],

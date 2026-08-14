@@ -112,8 +112,8 @@ def run_usergrowth_batches(
             if result.status == "failed" and index < len(configs) - 1:
                 _emit(
                     progress,
-                    f"[{_batch_label(index, config)}] 已达到本批重试上限，"
-                    f"串行模式跳过当前批，继续第 {index + 2} 批",
+                    f"[{_batch_label(index, config)}] 本批失败已记录，"
+                    f"串行模式继续第 {index + 2} 批；不得让失败批次阻断后续队列",
                 )
             if result.status == "cancelled":
                 for remaining_index in range(index + 1, len(configs)):
@@ -191,6 +191,8 @@ def run_usergrowth_task(
             config.account,
             config.password,
             headless=config.headless,
+            storage_state_path=config.storage_state_path,
+            storage_state_output_path=config.storage_state_output_path,
             debug_dir=debug_dir,
             refresh_interval_seconds=config.refresh_interval_seconds,
             max_status_retries=config.max_status_retries,

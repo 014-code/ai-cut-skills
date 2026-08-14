@@ -98,7 +98,11 @@ class UserGrowthOrderPlan:
     upload_task_id: str = ""
     review_task_id: str = ""
     arlp_task_id: str = ""
+    arlp_stage_index: int = 0
+    arlp_stage_task_ids: list[str] = field(default_factory=list)
+    arlp_stage_progress: list[dict[str, Any]] = field(default_factory=list)
     classification_task_id: str = ""
+    classification_progress: dict[str, Any] = field(default_factory=dict)
     operation_retry_counts: dict[str, int] = field(default_factory=dict)
     stage: str = "pending"
     checkpoint_message: str = ""
@@ -114,7 +118,11 @@ class UserGrowthOrderPlan:
             "upload_task_id": self.upload_task_id,
             "review_task_id": self.review_task_id,
             "arlp_task_id": self.arlp_task_id,
+            "arlp_stage_index": self.arlp_stage_index,
+            "arlp_stage_task_ids": self.arlp_stage_task_ids,
+            "arlp_stage_progress": self.arlp_stage_progress,
             "classification_task_id": self.classification_task_id,
+            "classification_progress": self.classification_progress,
             "operation_retry_counts": self.operation_retry_counts,
             "stage": self.stage,
             "checkpoint_message": self.checkpoint_message,
@@ -161,6 +169,11 @@ class UserGrowthRunConfig:
     recursive: bool = True
     dry_run: bool = True
     headless: bool = False
+    # Platform integrations may bridge an encrypted saved browser session via
+    # temporary files. These paths are runtime-only and are intentionally
+    # excluded from task payloads/logs.
+    storage_state_path: Path | None = None
+    storage_state_output_path: Path | None = None
     max_status_retries: int = 3
     refresh_interval_seconds: float = 12.0
     browser_slow_mo_ms: int = 600

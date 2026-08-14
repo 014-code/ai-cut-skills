@@ -180,7 +180,7 @@ $env:FEISHU_APP_SECRET = "..."
 python C:\Users\Donson\.codex\skills\aivideoeditor-visual-moderation\scripts\sync_feishu_keyword_policy_oauth.py
 ```
 
-The script opens the official Feishu authorization page with user scopes `wiki:wiki:readonly docx:document:readonly`, validates `state`, exchanges the one-time code at `authen/v2/oauth/token`, and passes the user access token directly to the same Wiki/Docx reader. It does not persist the access token or refresh token. Configure these user-identity permissions in the developer console; application-identity permissions alone do not make them valid OAuth scopes. The redirect URL must exactly match the one configured in the app.
+The script opens the domestic Feishu authorization page with user scopes `wiki:node:read docx:document:readonly`, generates a PKCE `code_verifier` and S256 `code_challenge`, validates `state`, exchanges the one-time code at `authen/v2/oauth/token` with the verifier, and passes the resulting `user_access_token` directly to the same Wiki/Docx reader. It does not persist the access token or refresh token. Configure these user-identity permissions in the developer console; application-identity permissions alone do not make them valid OAuth scopes. The redirect URL must exactly match the one configured in the app.
 
 The actual source-video workflow writes:
 
