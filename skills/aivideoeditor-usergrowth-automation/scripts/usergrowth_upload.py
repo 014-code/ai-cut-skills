@@ -19,6 +19,7 @@ from usergrowth_automation.usergrowth_browser import UserGrowthBrowserClient
 from usergrowth_automation.usergrowth_excel import load_song_records, write_back_results
 from usergrowth_automation.usergrowth_models import (
     VIDEO_SUFFIXES,
+    UserGrowthCancelled,
     UserGrowthOrderPlan,
     UserGrowthRunConfig,
     UserGrowthVideoItem,
@@ -41,6 +42,7 @@ from usergrowth_automation.usergrowth_redfruit import (
     build_redfruit_metadata,
     is_redfruit_workflow,
     normalise_workflow,
+    require_redfruit_content_kind,
 )
 from usergrowth_automation.usergrowth_tag_templates import (
     DEFAULT_CUSTOM_TAG_TEMPLATE_NAME,
@@ -190,7 +192,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="只补录已有创意单元，不重新上传文件；可重复传入。",
     )
     parser.add_argument("--existing-creative-unit-title", help="补录批次的剧名，仅用于红果分类/日志。")
-    parser.add_argument("--existing-creative-unit-drama-type", help="补录批次剧目类型：动态漫或仿真人。")
+    parser.add_argument(
+        "--existing-creative-unit-drama-type",
+        help="补录批次剧目类型：动态漫、仿真人或纯短剧（真人剧/真人实拍短剧）。",
+    )
     parser.add_argument("--existing-creative-unit-bid", help="补录批次的 bid_剧目ID。")
     parser.add_argument("--backfill-excel", help="Backfill Excel path.")
     parser.add_argument("--song-excel", help="Song library Excel path.")
@@ -205,6 +210,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--live", action="store_true", help="Run real browser upload. Omit for dry-run.")
     parser.add_argument("--confirm-live", action="store_true", help="Required with --live to allow real upload/review/backfill.")
     parser.add_argument("--headless", action="store_true", help="Run browser headless in live mode.")
+    parser.add_argument(
+        "--storage-state",
+        help="Playwright storage state JSON used to reuse a saved UserGrowth browser session.",
+    )
+    parser.add_argument(
+        "--storage-state-output",
+        help="Write the validated Playwright storage state to this runtime-only JSON path.",
+    )
     parser.add_argument("--workflow", help="Workflow name such as soda_music or redfruit_short_drama.")
     parser.add_argument("--redfruit-default-genre", help="Default redfruit genre used when file names do not specify one.")
     parser.add_argument("--redfruit-bid-map", help="JSON string mapping drama titles to bid_... values.")
@@ -327,7 +340,13 @@ def run_batch_specs_task(
         payload["auto_split_by_song"] = True
     (batch_root / "batch_summary.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _write_batch_log(batch_root, payload)
-    _emit(progress, f"{source_text}执行完成：成功 {payload['summary']['success']} 批，失败 {payload['summary']['failed']} 批")
+    _emit(
+        progress,
+        f"{source_text}执行结束：已尝试 {payload['summary']['attempted_batches']}/"
+        f"{payload['summary']['total_batches']} 批，成功 {payload['summary']['success']} 批，"
+        f"失败 {payload['summary']['failed']} 批，取消 {payload['summary']['cancelled']} 批；"
+        f"整体状态={payload['summary']['overall_status']}",
+    )
     return payload
 
 
@@ -467,6 +486,12 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
     )
     dry_run = not bool(args.live or manifest.get("live") or manifest.get("dry_run") is False)
     recursive = args.recursive if args.recursive is not None else bool(manifest.get("recursive", True))
+    storage_state_value = _pick(getattr(args, "storage_state", None), manifest, "storage_state")
+    storage_state_output_value = _pick(
+        getattr(args, "storage_state_output", None),
+        manifest,
+        "storage_state_output",
+    )
     return UserGrowthRunConfig(
         video_folder=video_folder,
         order_excel=backfill_excel,
@@ -516,6 +541,16 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
         recursive=recursive,
         dry_run=dry_run,
         headless=bool(args.headless or manifest.get("headless", False)),
+        storage_state_path=(
+            _resolve_manifest_path(storage_state_value, base_dir)
+            if storage_state_value not in (None, "")
+            else None
+        ),
+        storage_state_output_path=(
+            _resolve_manifest_path(storage_state_output_value, base_dir)
+            if storage_state_output_value not in (None, "")
+            else None
+        ),
         max_status_retries=int(_pick(args.max_status_retries, manifest, "max_status_retries") or 3),
         refresh_interval_seconds=float(_pick(args.refresh_interval_seconds, manifest, "refresh_interval_seconds") or 12.0),
         browser_slow_mo_ms=int(_pick(args.browser_slow_mo_ms, manifest, "browser_slow_mo_ms") or 600),
@@ -815,6 +850,12 @@ def run_resumed_usergrowth_task(
         recursive=bool(saved_config.get("recursive", True)),
         dry_run=False,
         headless=bool(args.headless or saved_config.get("headless", False)),
+        storage_state_path=(Path(str(args.storage_state)).resolve() if getattr(args, "storage_state", None) else None),
+        storage_state_output_path=(
+            Path(str(args.storage_state_output)).resolve()
+            if getattr(args, "storage_state_output", None)
+            else None
+        ),
         max_status_retries=int(_pick(args.max_status_retries, saved_config, "max_status_retries") or 3),
         refresh_interval_seconds=float(_pick(args.refresh_interval_seconds, saved_config, "refresh_interval_seconds") or 12.0),
         browser_slow_mo_ms=int(_pick(args.browser_slow_mo_ms, saved_config, "browser_slow_mo_ms") or 600),
@@ -829,7 +870,22 @@ def run_resumed_usergrowth_task(
         plan.upload_task_id = str(saved_plan.get("upload_task_id") or plan.task_id)
         plan.review_task_id = str(saved_plan.get("review_task_id") or "")
         plan.arlp_task_id = str(saved_plan.get("arlp_task_id") or "")
+        plan.arlp_stage_index = int(saved_plan.get("arlp_stage_index") or 0)
+        plan.arlp_stage_task_ids = [
+            str(value) for value in (saved_plan.get("arlp_stage_task_ids") or []) if str(value).strip()
+        ]
+        plan.arlp_stage_progress = [
+            dict(value)
+            for value in (saved_plan.get("arlp_stage_progress") or [])
+            if isinstance(value, dict)
+        ]
         plan.classification_task_id = str(saved_plan.get("classification_task_id") or "")
+        saved_classification_progress = saved_plan.get("classification_progress")
+        plan.classification_progress = (
+            dict(saved_classification_progress)
+            if isinstance(saved_classification_progress, dict)
+            else {}
+        )
         plan.operation_retry_counts = {
             str(key): int(value)
             for key, value in dict(saved_plan.get("operation_retry_counts") or {}).items()
@@ -897,7 +953,11 @@ def run_resumed_usergrowth_task(
                     "upload_task_id": plan.upload_task_id or plan.task_id,
                     "review_task_id": plan.review_task_id,
                     "arlp_task_id": plan.arlp_task_id,
+                    "arlp_stage_index": plan.arlp_stage_index,
+                    "arlp_stage_task_ids": list(plan.arlp_stage_task_ids),
+                    "arlp_stage_progress": [dict(value) for value in plan.arlp_stage_progress],
                     "classification_task_id": plan.classification_task_id,
+                    "classification_progress": dict(plan.classification_progress),
                     "operation_retry_counts": dict(plan.operation_retry_counts),
                     "items": {
                         item.file_name: {
@@ -930,6 +990,8 @@ def run_resumed_usergrowth_task(
                 config.account,
                 config.password,
                 headless=config.headless,
+                storage_state_path=config.storage_state_path,
+                storage_state_output_path=config.storage_state_output_path,
                 debug_dir=debug_dir,
                 refresh_interval_seconds=config.refresh_interval_seconds,
                 max_status_retries=config.max_status_retries,
@@ -1022,7 +1084,11 @@ def run_selected_usergrowth_task(
                     "upload_task_id": plan.upload_task_id or plan.task_id,
                     "review_task_id": plan.review_task_id,
                     "arlp_task_id": plan.arlp_task_id,
+                    "arlp_stage_index": plan.arlp_stage_index,
+                    "arlp_stage_task_ids": list(plan.arlp_stage_task_ids),
+                    "arlp_stage_progress": [dict(value) for value in plan.arlp_stage_progress],
                     "classification_task_id": plan.classification_task_id,
+                    "classification_progress": dict(plan.classification_progress),
                     "operation_retry_counts": dict(plan.operation_retry_counts),
                     "items": {
                         item.file_name: {
@@ -1086,6 +1152,8 @@ def run_selected_usergrowth_task(
                     config.account,
                     config.password,
                     headless=config.headless,
+                    storage_state_path=config.storage_state_path,
+                    storage_state_output_path=config.storage_state_output_path,
                     debug_dir=debug_dir,
                     refresh_interval_seconds=config.refresh_interval_seconds,
                     max_status_retries=config.max_status_retries,
@@ -1159,7 +1227,15 @@ def run_existing_creative_units_task(
         raise RuntimeError("补录已有创意单元需要订单 ID。")
 
     drama_title = config.existing_creative_unit_title or "补录批次"
-    drama_type = config.existing_creative_unit_drama_type or "动态漫"
+    if not config.existing_creative_unit_drama_type.strip():
+        raise RuntimeError("补录已有创意单元必须明确指定剧目类型：动态漫、仿真人或纯短剧。")
+    try:
+        drama_type = require_redfruit_content_kind(
+            config.existing_creative_unit_drama_type,
+            source="补录批次剧目类型",
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     bid = config.existing_creative_unit_bid or ""
     synthetic_name = (
         f"dxzc-{drama_type}-{drama_title}-0806-无剧名-六部-补录-原创AI前贴-{bid}.mp4"
@@ -1202,6 +1278,8 @@ def run_existing_creative_units_task(
             config.account,
             config.password,
             headless=config.headless,
+            storage_state_path=config.storage_state_path,
+            storage_state_output_path=config.storage_state_output_path,
             debug_dir=debug_dir,
             refresh_interval_seconds=config.refresh_interval_seconds,
             max_status_retries=config.max_status_retries,
@@ -1245,19 +1323,34 @@ def run_selected_usergrowth_batches(
             payload = run_selected_usergrowth_task(spec.config, spec.video_paths, batch_progress)
             batch_progress("执行完成")
             return _batch_success_result(spec, payload)
+        except UserGrowthCancelled as exc:
+            # 用户取消或手动关闭有头浏览器是唯一允许终止队列的情况；
+            # 把当前批次保留下来，便于批次汇总明确显示停止原因。
+            batch_progress(f"执行已取消：{exc}")
+            return _batch_cancelled_result(spec, exc)
         except Exception as exc:  # noqa: BLE001
             batch_progress(f"执行失败：{exc}")
             return _batch_failed_result(spec, exc)
 
     if worker_count == 1:
-        for spec in specs:
+        for spec in sorted(specs, key=lambda value: value.index):
             result = run_one(spec)
             results[spec.index] = result
+            if result.get("status") == "cancelled":
+                for remaining_spec in sorted(specs, key=lambda value: value.index):
+                    if remaining_spec.index <= spec.index:
+                        continue
+                    results[remaining_spec.index] = _batch_cancelled_result(
+                        remaining_spec,
+                        UserGrowthCancelled("前一批已取消，串行队列停止"),
+                        attempted=False,
+                    )
+                break
             if result.get("status") == "failed" and spec.index < len(specs) - 1:
                 _emit(
                     progress,
-                    f"[{spec.label}] 已达到本批重试上限，串行模式跳过当前批，"
-                    f"继续第 {spec.index + 2} 批",
+                    f"[{spec.label}] 本批失败已记录，继续第 {spec.index + 2} 批；"
+                    "后续用户指定批次仍必须执行",
                 )
         return [result for result in results if result is not None]
 
@@ -1279,6 +1372,7 @@ def _batch_success_result(spec: SelectedBatchSpec, payload: dict[str, Any]) -> d
         "index": spec.index,
         "label": spec.label,
         "status": "success",
+        "attempted": True,
         "message": "完成",
         "order_id": spec.config.order_id,
         "video_folder": str(spec.config.video_folder),
@@ -1300,6 +1394,7 @@ def _batch_failed_result(spec: SelectedBatchSpec, exc: Exception) -> dict[str, A
         "index": spec.index,
         "label": spec.label,
         "status": "failed",
+        "attempted": True,
         "message": str(exc),
         "error_type": type(exc).__name__,
         "order_id": spec.config.order_id,
@@ -1310,6 +1405,31 @@ def _batch_failed_result(spec: SelectedBatchSpec, exc: Exception) -> dict[str, A
         "error_json": str(Path(task_root) / "error.json") if task_root else "",
         "error_log": str(Path(task_root) / "error.log") if task_root else "",
         "diagnostic_summary": str(Path(task_root) / "diagnostic_summary.json") if task_root else "",
+        "config": _safe_config_dict(spec.config),
+    }
+
+
+def _batch_cancelled_result(
+    spec: SelectedBatchSpec,
+    exc: BaseException,
+    *,
+    attempted: bool = True,
+) -> dict[str, Any]:
+    return {
+        "index": spec.index,
+        "label": spec.label,
+        "status": "cancelled",
+        "attempted": attempted,
+        "message": str(exc) or "已取消",
+        "error_type": type(exc).__name__,
+        "order_id": spec.config.order_id,
+        "video_folder": str(spec.config.video_folder),
+        "selected_count": len(spec.video_paths),
+        "selected_videos": [str(path) for path in spec.video_paths],
+        "task_root": "",
+        "error_json": "",
+        "error_log": "",
+        "diagnostic_summary": "",
         "config": _safe_config_dict(spec.config),
     }
 
@@ -1332,16 +1452,35 @@ def _build_batch_payload(
         success_items += int(summary.get("success") or 0)
         skipped_items += int(summary.get("skipped") or 0)
         failed_items += int(summary.get("failed") or 0)
+    total_batches = len(specs)
+    attempted_batches = sum(1 for result in results if result.get("attempted", True))
+    unattempted_batches = max(total_batches - attempted_batches, 0)
+    success_batches = sum(1 for result in results if result.get("status") == "success")
+    failed_batches = sum(1 for result in results if result.get("status") == "failed")
+    cancelled_batches = sum(1 for result in results if result.get("status") == "cancelled")
+    if cancelled_batches:
+        overall_status = "cancelled"
+    elif unattempted_batches:
+        overall_status = "failed"
+    elif failed_batches and success_batches:
+        overall_status = "partial_success"
+    elif failed_batches:
+        overall_status = "failed"
+    else:
+        overall_status = "success"
     return {
         "batch_id": batch_root.name,
         "batch_root": str(batch_root),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "concurrency": concurrency,
         "summary": {
-            "total_batches": len(specs),
-            "success": sum(1 for result in results if result.get("status") == "success"),
-            "failed": sum(1 for result in results if result.get("status") == "failed"),
-            "cancelled": sum(1 for result in results if result.get("status") == "cancelled"),
+            "total_batches": total_batches,
+            "attempted_batches": attempted_batches,
+            "unattempted_batches": unattempted_batches,
+            "overall_status": overall_status,
+            "success": success_batches,
+            "failed": failed_batches,
+            "cancelled": cancelled_batches,
             "total_items": total_items,
             "ready_items": ready_items,
             "success_items": success_items,
@@ -1490,6 +1629,8 @@ def _write_diagnostic_summary(
                         "upload_task_id": str(order.get("upload_task_id") or ""),
                         "review_task_id": str(order.get("review_task_id") or ""),
                         "arlp_task_id": str(order.get("arlp_task_id") or ""),
+                        "arlp_stage_index": int(order.get("arlp_stage_index") or 0),
+                        "arlp_stage_task_ids": list(order.get("arlp_stage_task_ids") or []),
                         "classification_task_id": str(order.get("classification_task_id") or ""),
                         "operation_retry_counts": dict(order.get("operation_retry_counts") or {}),
                     }
@@ -1507,6 +1648,8 @@ def _write_diagnostic_summary(
                         "upload_task_id": str(order.get("upload_task_id") or order.get("task_id") or ""),
                         "review_task_id": str(order.get("review_task_id") or ""),
                         "arlp_task_id": str(order.get("arlp_task_id") or ""),
+                        "arlp_stage_index": int(order.get("arlp_stage_index") or 0),
+                        "arlp_stage_task_ids": list(order.get("arlp_stage_task_ids") or []),
                         "classification_task_id": str(order.get("classification_task_id") or ""),
                         "operation_retry_counts": dict(order.get("operation_retry_counts") or {}),
                     }
@@ -1589,6 +1732,8 @@ def _is_browser_restartable_failure(exc: BaseException) -> bool:
 
 def _is_auto_resume_retryable_failure(exc: BaseException) -> bool:
     """允许页面操作失败做有限次断点续跑，但前置校验和输入错误必须直接停下。"""
+    if isinstance(exc, UserGrowthCancelled):
+        return False
     message = str(exc or "").lower()
     non_retryable_markers = (
         "前置校验失败",

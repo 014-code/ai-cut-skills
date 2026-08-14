@@ -6,7 +6,22 @@ Use `scripts/usergrowth_upload.py` when the user wants the skill itself to perfo
 
 Use `scripts/tomato_music_tagging.py` after the Tomato Music upload/CID collection flow when each BID batch must be applied as a custom tag in 墨攻AI素材管理. Prefer online Feishu input through the official Wiki + Sheets OpenAPI; see `references/feishu-sheets-api.md`. Do not use browser simulation for Feishu table reads or writes.
 
-The compatible local input path accepts dry-run JSON (`batches[].bid` + `batches[].cids`) or an `.xlsx/.xlsm` containing `bid`/`bookid` and `cid` columns across multiple sheets. Excel rows with invalid/non-hex-32 CID values are ignored; duplicate CIDs within a BID are de-duplicated.
+The source is passed with `--feishu-source-url`. Pass one `--feishu-library-url` for each审核人员单曲查询表; the two library tables are merged before strict song-name-and-artist matching. Both fields must match after normalization; a missing artist or song-name-only match is excluded. A single `--feishu-library-url` remains supported for older runs.
+
+For online Feishu access without tenant data-scope configuration, add `--feishu-user-oauth` and provide `FEISHU_APP_ID`/`FEISHU_APP_SECRET` through the environment. The command opens the domestic Feishu OAuth page and waits for `http://127.0.0.1:8765/callback`; register that URL in the app's security settings first. By default the returned user token is memory-only. Add `--feishu-oauth-persist` to request `offline_access`, save access/refresh tokens in a Windows CurrentUser DPAPI-encrypted cache, and reuse or refresh them in later processes without opening the consent page. For a business-user one-time setup, use `--feishu-oauth-bootstrap` instead: set `FEISHU_BOOTSTRAP_ACCOUNT` and `FEISHU_BOOTSTRAP_PASSWORD` only for that first process (or answer the secure prompts), and the command will complete the visible domestic Feishu login/consent and imply persistent caching. Later runs with the same Windows user profile need neither the Feishu account/password nor a browser. The default cache is under the current user's `LOCALAPPDATA`; override it with `--feishu-oauth-cache`. Use `--feishu-oauth-reauthorize` only when a fresh consent grant is required. The App Secret is never written to the cache. Do not use `--feishu-user-oauth`/`--feishu-oauth-bootstrap` together with `FEISHU_ACCESS_TOKEN`.
+
+```powershell
+python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\tomato_music_tagging.py `
+  --feishu-source-url 'https://donsontech.feishu.cn/wiki/W5jwwHoxei11cjkWzxZciWJWnCh' `
+  --feishu-library-url 'https://donsontech.feishu.cn/wiki/GuUUwCVeoiJLS8k2kTxcBS9Cngh?from=from_copylink' `
+  --feishu-library-url 'https://donsontech.feishu.cn/wiki/PSSYwIoBHi7JY5kB6jGcLpWundb?from=from_copylink&sheet=qTG951' `
+  --feishu-user-oauth `
+  --feishu-oauth-persist `
+  --customer-id 3681575 `
+  --output-root 'D:\Users\Donson\Downloads\番茄音乐飞书预检输出'
+```
+
+The compatible local input path accepts dry-run JSON (`batches[].bid` + `batches[].cids`) or an `.xlsx/.xlsm` containing `bid`/`bookid` and `cid` columns across multiple sheets. Excel rows with invalid/non-hex-32 CID values are ignored; duplicate CIDs within a BID are de-duplicated. If an Excel row's `打标状态`/`标签状态` is `已打标`, exclude it before BID grouping and browser launch; only blank or `未打标` rows are eligible.
 
 First create and inspect a dry-run plan:
 
@@ -31,7 +46,9 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts
   --output-root 'D:\Users\Donson\Downloads\番茄音乐打标输出'
 ```
 
-The platform accepts newline-separated CID search values. The runner encodes the newline search in the URL and caps each search chunk at 50 CIDs, because comma-separated values and larger chunks are not reliable on the current 素材管理 page. It verifies the visible result count before `全选所有`, writes `bid_<BID>`, opens the resulting operation task, and requires `总任务数 == 批次实际命中数`, `执行成功数量 == 总任务数`, and `执行失败数量 == 0` before marking that chunk complete. Each chunk is checkpointed in `tomato_music_tagging_checkpoint.json`.
+Use `--concurrency 3` to keep at most three independent BID browser sessions active. The command performs Feishu OAuth and source preflight once, then schedules one BID per browser; when a browser finishes, the next pending BID takes that slot. Results remain in source order, debug artifacts use separate `debug/<index>_bid_<BID>/` folders, and an ordinary batch failure is recorded without discarding later batches. Manual browser closure cancels the shared queue.
+
+The platform accepts space-separated CID search values. The runner encodes the space-separated search in the URL and caps each search chunk at 50 CIDs, because comma-separated values and larger chunks are not reliable on the current 素材管理 page. It verifies the visible result count before `全选所有`, writes `bid_<BID>`, opens the resulting operation task, and requires `总任务数 == 批次实际命中数`, `执行成功数量 == 总任务数`, and `执行失败数量 == 0` before marking that chunk complete. Each chunk is checkpointed in `tomato_music_tagging_checkpoint.json`.
 
 ## Install Runtime Dependencies
 
@@ -83,7 +100,9 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts
 
 Resume supports `soda_music` and `redfruit_short_drama`. Credentials are read again from CLI arguments or environment variables and are never stored in the checkpoint. A `completed` or `cid_backfilled_unreviewed` checkpoint returns the saved result without opening a browser; earlier stages are resumed from their saved task IDs and item metadata.
 
-For Redfruit, when the checkpoint already contains a unique CID for every active material and the stage is `review_submitted`, `arlp_submitting`, `arlp_success`, or `classification_submitting`, resume skips the historical upload/review task and goes directly to `墨攻AI -> 素材管理`. It searches the batch CIDs (newline-separated), verifies that the result count covers the batch, then continues `增加 ARLP` and `修改分类标签`. It must not wait for an old upload task in this case.
+For Redfruit, when the checkpoint already contains a unique CID for every active material and the stage is `review_submitted`, `arlp_submitting`, `arlp_success`, or `classification_submitting`, resume skips the historical upload/review task and goes directly to `墨攻AI -> 素材管理`. It searches the batch CIDs (space-separated), verifies that the result count covers the batch, then continues from `arlp_stage_index` through the remaining three-stage ARLP configurations and `修改分类标签`. `arlp_stage_progress` is authoritative for the current configuration: a saved task ID in `task_created`, `waiting_result`, or `partial_failure` is reopened and polled instead of creating another ARLP task; a `selection_started`, `modal_open`, or `submitting` checkpoint safely replays only the current ARLP configuration. Completed stage task IDs are retained in `arlp_stage_task_ids` and cannot advance the index twice. It must not wait for an old upload task in this case.
+
+For checkpoints created before the three-stage ARLP upgrade, `stage=arlp_success` or `classification_submitting` with no stage index is migrated as historical stage 1 complete (`arlp_stage_index=1`). Resume starts at `短剧端原生IAA`, then runs `番茄畅听`, instead of repeating stage 1 or skipping the two new stages. Checkpoints without `arlp_stage_progress` or `classification_progress` remain valid and use empty defaults.
 
 For Redfruit `upload_processing` checkpoints without a task ID, resume never falls back to file upload. It only uses saved original creative-unit IDs to enter `工单管理 -> 创意单元 -> 录入素材`; if those IDs are missing, it stops with a checkpoint error instead of risking a duplicate upload.
 
@@ -219,7 +238,7 @@ Run it:
 
 Batch mode writes a total summary to `<output-root>/batch_runs/<timestamp>_<task-name>/batch_summary.json` and `run.log`. Each child batch still writes its own `<output-root>/<timestamp>_<batch-task-name>/task.json`, `run.log`, `result.xlsx` in dry-run mode, and `debug/` in live mode.
 
-Multi-batch execution remains parallel by default. If `concurrency` is omitted, it defaults to the number of batches, capped at 10. Explicit `concurrency=1` or `--concurrency 1` selects ordered serial execution. In serial mode, a batch that exhausts its retries is written as failed and skipped, then the next batch starts; a user cancellation/manual browser close stops the queue instead of opening the next batch.
+Multi-batch execution remains parallel by default. If `concurrency` is omitted, it defaults to the number of batches, capped at 10. When the user specifies an order or asks for sequential execution, use `concurrency=1` or `--concurrency 1`; the manifest order is then preserved. A normal business failure, exhausted batch retry, or recoverable page issue is recorded for that batch and cannot stop later batches. The aggregate records `total_batches`, `attempted_batches`, `unattempted_batches`, and `overall_status`. A user cancellation/manual browser close stops the queue instead of opening the next batch.
 
 In the desktop app, the automatic song splitter produces the same shape conceptually: one batch per recognized song, with explicit selected video paths for that song. The browser layer still fills the first chameleon card and uses `一键复用`, so different songs should be split before live upload.
 
@@ -239,6 +258,13 @@ $env:USERGROWTH_PASSWORD = '<password>'
 For batch live upload, keep `confirm_live` at the top level or pass `--confirm-live`. Top-level `live=true` makes batches live unless a batch explicitly sets `dry_run=true`; command-line `--live` is a global override and makes every batch live.
 
 Use `--headless` only after visible browser mode has been validated.
+
+Platform integrations can bridge a saved Playwright session without placing
+cookies in task manifests or logs. Pass `--storage-state <input.json>` to
+reuse a state file and `--storage-state-output <output.json>` to export the
+latest authenticated state; callers should treat both files as short-lived
+secrets and remove them after the process exits. The platform upload workflow
+uses these options only when its “复用已保存会话” switch is enabled.
 
 ## Redfruit Manual Overrides
 
@@ -264,7 +290,7 @@ Manifest equivalents are `redfruit_layout_override`, `redfruit_material_mode_ove
 
 When the platform reports that a file was uploaded before and provides the original creative-unit IDs, run direct recovery with repeated `--existing-creative-unit-id`. This path searches the order's creative-unit list, selects the IDs across pages, and continues through 录入素材, review, ARLP, and redfruit post-review classification. It does not upload source files or create new creative units.
 
-This mode is redfruit-only and requires `--live --confirm-live`. Pass the batch metadata explicitly:
+This mode is redfruit-only and requires `--live --confirm-live`. Pass the batch metadata explicitly. `--existing-creative-unit-drama-type` is mandatory and must be `动态漫`, `仿真人`, or `纯短剧`; `真人剧` and `真人实拍短剧` normalize to `纯短剧`:
 
 ```powershell
 & python 'C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts\usergrowth_upload.py' `
