@@ -11,7 +11,7 @@ import traceback
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .usergrowth_captcha import UserGrowthCaptchaSolver
@@ -4274,6 +4274,11 @@ class UserGrowthBrowserClient:
             lambda: self._open_label_selector(page),
             required_fields=[str(path[0]) for path in paths],
             context_label="红果短剧录入分类标签",
+            refresh_before_reopen=True,
+            on_page_refreshed=lambda: self._restore_redfruit_entry_card_after_classification_reload(
+                page,
+                item,
+            ),
         )
 
         for path in paths:
@@ -4300,6 +4305,18 @@ class UserGrowthBrowserClient:
         await self._click_radio_near_text(page, "未成年人内容", "已授权")
         await self._click_radio_near_text(page, "影视内容", "已授权")
         return await self._reuse_all_submit_and_open_task_detail(page, item)
+
+    async def _restore_redfruit_entry_card_after_classification_reload(
+            self,
+            page,
+            item: UserGrowthVideoItem,
+    ) -> None:
+        """刷新红果录入页后，恢复分类弹窗前必须已就绪的首卡状态。"""
+        await self._wait_chameleon_card_forms_ready(page, [item])
+        if not await self._ensure_dropdown_value(page, "UGC内容", "不包含"):
+            raise RuntimeError("刷新后红果短剧 UGC 内容选择失败")
+        if not await self._ensure_dropdown_value(page, "创意源", "原创"):
+            raise RuntimeError("刷新后红果短剧创意源选择失败")
 
     async def _ensure_dropdown_value(self, page, field_text: str, value_text: str) -> bool:
         """普通下拉字段已是目标值时跳过，否则选择目标值。"""
@@ -4942,8 +4959,10 @@ class UserGrowthBrowserClient:
             required_fields: Iterable[str] = (),
             progress: ProgressCallback | None = None,
             context_label: str = "分类标签",
+            refresh_before_reopen: bool = False,
+            on_page_refreshed: Callable[[], Awaitable[None]] | None = None,
     ):
-        """打开分类标签弹窗并持续等待目标字段；空态或缺字段时取消重开。"""
+        """打开分类标签弹窗并持续等待目标字段；可按工作流要求刷新后重开。"""
         required = [str(field).strip() for field in required_fields if str(field).strip()]
         reopen_attempt = 0
         backoff_seconds = 2.0
@@ -4966,18 +4985,24 @@ class UserGrowthBrowserClient:
                 field_count = len(field_names)
                 if root is not None and empty_message:
                     reason = empty_message
+                    recovery_action = "取消后刷新页面再打开" if refresh_before_reopen else "取消后再打开"
                     self._emit(
                         progress,
-                        f"{context_label}未完整加载：{reason}，取消后 {backoff_seconds:.1f}s 再打开",
+                        f"{context_label}未完整加载：{reason}，{recovery_action}"
+                        f"（{backoff_seconds:.1f}s 后重试）",
                     )
                     self._write_run_log(
                         f"[{datetime.now().isoformat(timespec='seconds')}] classification modal reopen: "
                         f"context={context_label}, reopen_attempt={reopen_attempt}, reason={reason}, "
                         f"field_count={field_count}, required={required}, "
-                        f"backoff={backoff_seconds:.1f}s"
+                        f"refresh_before_reopen={refresh_before_reopen}, backoff={backoff_seconds:.1f}s"
                     )
                     await self._cancel_classification_modal(page, root)
                     await self._sleep(backoff_seconds)
+                    if refresh_before_reopen:
+                        await self._reload_classification_modal_host(page, context_label)
+                        if on_page_refreshed is not None:
+                            await on_page_refreshed()
                     backoff_seconds = min(backoff_seconds * 2, 30.0)
                     break
 
@@ -4997,6 +5022,20 @@ class UserGrowthBrowserClient:
                         f"field_count={field_count}, missing={missing}"
                     )
                 await self._sleep(1.0)
+
+    async def _reload_classification_modal_host(self, page, context_label: str) -> None:
+        """红果弹窗空态时刷新宿主页，避免在同一份空表单上反复打开。"""
+        self._write_run_log(
+            f"[{datetime.now().isoformat(timespec='seconds')}] classification modal host reload: "
+            f"context={context_label}, url={page.url}"
+        )
+        try:
+            await page.reload(wait_until="domcontentloaded")
+        except Exception as exc:  # noqa: BLE001
+            if self._is_session_closed_exception(exc) or self._is_recoverable_session_exception(exc):
+                raise
+            raise RuntimeError(f"{context_label}刷新页面失败：{exc}") from exc
+        await self._sleep(2.0)
 
     async def _classification_modal_probe(
             self,
@@ -6754,6 +6793,7 @@ class UserGrowthBrowserClient:
                 material_page,
                 progress,
                 required_fields=[str(path[0]) for path in paths if path],
+                items=items,
             )
             await self._fill_redfruit_post_review_classifications(
                 material_page,
@@ -6853,6 +6893,7 @@ class UserGrowthBrowserClient:
                     await self._open_redfruit_post_review_classification_modal(
                         page,
                         progress,
+                        items=items,
                     )
                     pending_refresh_delay = 0.0
 
@@ -8960,14 +9001,23 @@ class UserGrowthBrowserClient:
             page,
             progress: ProgressCallback | None,
             required_fields: Iterable[str] = (),
+            items: list[UserGrowthVideoItem] | None = None,
     ):
         """打开红果后审分类弹窗，并等待目标后审字段全部出现。"""
+        async def restore_selection() -> None:
+            if not items:
+                return
+            await self._wait_material_items_ready(page, items)
+            await self._select_all_materials(page, items)
+
         return await self._open_classification_modal_ready(
             page,
             lambda: self._run_material_edit_action(page, "修改分类标签"),
             required_fields=required_fields,
             progress=progress,
             context_label="红果短剧后审修改分类标签",
+            refresh_before_reopen=True,
+            on_page_refreshed=restore_selection,
         )
 
     async def _click_redfruit_modal_action(self, page, texts: tuple[str, ...]) -> None:

@@ -55,7 +55,7 @@ When a Soda Music or Redfruit multi-batch run is explicitly serial (`--concurren
 - Feishu writeback verification fails: stop and inspect the exact range from `task.json.feishu.planned_writes`. Do not proceed to assume the source sheet contains the planned BID values.
 
 - Tomato Music batch search shows `暂无数据`: confirm the customer context, preserve the material page `selectorId`, use space-separated CID values, and reduce the search to at most 50 CIDs. Do not switch to comma-separated input or click `全选所有` on a no-result page.
-- Soda/Redfruit classification modal shows `暂无...` or a required field has not rendered: cancel only the current classification modal, wait with exponential backoff, and reopen it. Redfruit post-review `修改分类标签` uses the same required-field rule; do not gate on a fixed total field count.
+- A Soda/Redfruit classification modal shows `暂无...`: Soda cancels only the current modal, waits with exponential backoff, and reopens it. Redfruit cancels the modal, refreshes the host page, waits for material controls again, then reopens it; Redfruit post-review also repeats `点第一张素材 -> 全选所有` after that refresh. When a required field is still rendering but the modal has no `暂无...` empty state, keep waiting for it. Do not gate on a fixed total field count.
 - Tomato Music tag task count mismatch: inspect `tomato_music_tagging_checkpoint.json` and the chunk's visible `共 N 条` count. The current chunk must remain `failed` unless the operation task reports total N, success N, and failure 0; that failure is recorded, then later CID chunks and BID batches are still attempted. Network/page failures recover the current chunk instead of closing the whole run.
 
 - `需要先安装 playwright，并执行 playwright install chromium`
