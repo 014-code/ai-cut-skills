@@ -27,6 +27,12 @@ from .usergrowth_redfruit import (
     is_redfruit_workflow,
 )
 from .usergrowth_rules import display_material_from_label, classification_path_for_material
+from .usergrowth_session_cache import (
+    clear_session_cache,
+    default_session_cache_path,
+    load_session_cache,
+    save_session_cache,
+)
 
 ProgressCallback = Callable[[str], None]
 OrderCompleteCallback = Callable[[UserGrowthOrderPlan], None]
@@ -75,7 +81,6 @@ WORK_ORDER_URL = "https://usergrowth.com.cn/aigc/manage/order"
 USERGROWTH_OPERATION_SPEED_FACTOR = 1.0
 OPERATION_TASK_RETRY_LIMIT = 3
 UPLOAD_ROW_RETRY_LIMIT = 3
-REDFRUIT_POST_REVIEW_CLASSIFICATION_FIELD_COUNT = 54
 
 # 投放信息弹窗选择器：定位 Arco Modal / Dialog / Drawer 等弹窗容器
 DELIVERY_MODAL_SELECTOR = ".arco-modal, .arco-modal-content, [role='dialog'], .arco-drawer"
@@ -120,6 +125,8 @@ class UserGrowthBrowserClient:
             storage_state: dict[str, Any] | None = None,
             storage_state_path: str | Path | None = None,
             storage_state_output_path: str | Path | None = None,
+            reuse_saved_session: bool = True,
+            session_cache_path: str | Path | None = None,
             debug_dir: Path | None = None,
             timeout_ms: int = 180000,
             refresh_interval_seconds: float = 12.0,
@@ -136,6 +143,21 @@ class UserGrowthBrowserClient:
         self.storage_state = dict(storage_state) if isinstance(storage_state, dict) else None
         self.storage_state_path = Path(storage_state_path) if storage_state_path else None
         self.storage_state_output_path = Path(storage_state_output_path) if storage_state_output_path else None
+        has_explicit_session_bridge = bool(
+            self.storage_state is not None
+            or self.storage_state_path
+            or self.storage_state_output_path
+        )
+        if reuse_saved_session and not has_explicit_session_bridge:
+            self.session_cache_path = (
+                Path(session_cache_path)
+                if session_cache_path
+                else default_session_cache_path(account)
+            )
+        else:
+            self.session_cache_path = None
+        self._storage_state_source = "provided" if self.storage_state is not None else ""
+        self._session_cache_saved = False
         self.session_authenticated = False
         self.login_performed = False
         self.debug_dir = debug_dir
@@ -157,6 +179,26 @@ class UserGrowthBrowserClient:
         self._user_closed_headed_page_at = 0.0
         self._crashed_page_ids: set[int] = set()
         self._intentional_page_close_ids: set[int] = set()
+        # 红果后置阶段只能在本次正式 run() 正在处理的计划中执行，避免临时
+        # 脚本绕过上传/送审/ARLP 检查点直接调用内部方法修改素材。
+        self._active_redfruit_state_machine_plan_ids: set[int] = set()
+
+    def _bind_redfruit_state_machine(self, plan: UserGrowthOrderPlan) -> None:
+        """把当前正式 runner 正在处理的红果计划绑定到状态机。"""
+        self._active_redfruit_state_machine_plan_ids.add(id(plan))
+
+    def _release_redfruit_state_machine(self, plan: UserGrowthOrderPlan) -> None:
+        """订单处理结束后撤销红果状态机的临时执行授权。"""
+        self._active_redfruit_state_machine_plan_ids.discard(id(plan))
+
+    def _assert_redfruit_state_machine(self, plan: UserGrowthOrderPlan) -> None:
+        """拒绝脱离正式 runner 的红果 ARLP、分类和断点恢复调用。"""
+        if id(plan) in self._active_redfruit_state_machine_plan_ids:
+            return
+        raise RuntimeError(
+            "红果短剧状态机不可绕过：请仅通过 scripts/usergrowth_upload.py 的正式上传"
+            "或 --resume-task 继续原任务；禁止直接调用红果 ARLP、分类标签或断点恢复内部方法。"
+        )
 
     async def run(self, plans: list[UserGrowthOrderPlan], progress: ProgressCallback | None = None) -> None:
         """启动浏览器并按订单计划逐单处理上传流程。"""
@@ -183,8 +225,7 @@ class UserGrowthBrowserClient:
             # 可能重建 browser/context；取消监听必须跟随新的 browser。
             session = {"browser": browser}
             cancel_task = asyncio.create_task(self._watch_cancel(session, progress))
-            if self.storage_state is None and self.storage_state_path:
-                self.storage_state = self._load_storage_state(self.storage_state_path)
+            self._prepare_storage_state()
             context = await browser.new_context(**self._context_options())
             page = await context.new_page()
             self._wrap_page_speed(page)
@@ -210,13 +251,16 @@ class UserGrowthBrowserClient:
                             session=session,
                         )
                         context = page.context
-                await self._capture_storage_state(context)
+                await self._persist_session_state(context, progress)
                 await self._enable_post_login_resource_blocking(context, progress)
                 await self._snapshot(page, "02_after_login")
                 for plan in plans:
                     self._raise_if_cancelled()
                     if plan.status == "skipped":
                         continue
+                    redfruit_state_machine_bound = self._is_redfruit_items(plan.items)
+                    if redfruit_state_machine_bound:
+                        self._bind_redfruit_state_machine(plan)
                     try:
                         while True:
                             try:
@@ -292,6 +336,9 @@ class UserGrowthBrowserClient:
                             "本批已记录失败，继续后续用户指定批次",
                         )
                         continue
+                    finally:
+                        if redfruit_state_machine_bound:
+                            self._release_redfruit_state_machine(plan)
                     if plan.status == "failed":
                         self._emit(
                             progress,
@@ -327,7 +374,7 @@ class UserGrowthBrowserClient:
                     ],
                 )
                 try:
-                    await self._write_storage_state(context)
+                    await self._persist_session_state(context)
                 except Exception as exc:
                     self._write_run_log(
                         f"[{datetime.now().isoformat(timespec='seconds')}] "
@@ -550,6 +597,24 @@ class UserGrowthBrowserClient:
             options["storage_state"] = self.storage_state
         return options
 
+    def _prepare_storage_state(self) -> None:
+        """Load an explicit bridge state or the account-scoped encrypted cache."""
+        if self.storage_state is not None:
+            return
+        if self.storage_state_path:
+            self.storage_state = self._load_storage_state(self.storage_state_path)
+            if self.storage_state is not None:
+                self._storage_state_source = "explicit_file"
+            return
+        if not self.session_cache_path:
+            return
+        self.storage_state = load_session_cache(self.session_cache_path, self.account)
+        if self.storage_state is not None:
+            self._storage_state_source = "encrypted_cache"
+            self._write_run_log(
+                f"[{datetime.now().isoformat(timespec='seconds')}] encrypted login session loaded"
+            )
+
     @staticmethod
     def _load_storage_state(path: Path) -> dict[str, Any] | None:
         try:
@@ -582,6 +647,26 @@ class UserGrowthBrowserClient:
         temporary = output.with_name(f"{output.name}.tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(temporary, output)
+
+    async def _persist_session_state(
+            self,
+            context: Any,
+            progress: ProgressCallback | None = None,
+    ) -> None:
+        """Persist a validated session before later navigation can fail."""
+        await self._capture_storage_state(context)
+        if self.session_authenticated and self.session_cache_path and isinstance(self.storage_state, dict):
+            try:
+                save_session_cache(self.session_cache_path, self.account, self.storage_state)
+                if self.login_performed and not self._session_cache_saved:
+                    self._emit(progress, "已加密保存 UserGrowth 登录会话，后续任务将自动复用")
+                self._session_cache_saved = True
+            except Exception as exc:
+                self._write_run_log(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] encrypted session cache save failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        await self._write_storage_state(context)
 
     async def _track_browser_process(self, browser) -> None:
         """记录 Chromium 主进程，区分用户正常关闭与浏览器异常退出。"""
@@ -772,7 +857,6 @@ class UserGrowthBrowserClient:
 
     async def _login(self, page, progress: ProgressCallback | None) -> None:
         """打开登录页，填写账号密码并自动识别图片验证码。"""
-        self._emit(progress, "打开 UserGrowth 登录页")
         if self.storage_state:
             self._emit(progress, "验证已保存的 UserGrowth 登录会话")
             await self._safe_goto(page, HOME_URL)
@@ -782,6 +866,10 @@ class UserGrowthBrowserClient:
                 self._emit(progress, "复用已保存的 UserGrowth 登录会话")
                 return
             self._emit(progress, "已保存的 UserGrowth 登录会话失效，重新登录")
+            self.storage_state = None
+            self._storage_state_source = ""
+            clear_session_cache(self.session_cache_path)
+        self._emit(progress, "打开 UserGrowth 登录页")
         await self._safe_goto(page, LOGIN_URL)
         await self._snapshot(page, "01_open_login")
         if await self._looks_logged_in(page):
@@ -1133,6 +1221,7 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
     ) -> None:
         """按订单 checkpoint 恢复红果流程，不重新创建已完成的业务步骤。"""
+        self._assert_redfruit_state_machine(plan)
         stage = str(plan.stage or "pending")
         if stage == "completed":
             plan.status = "success"
@@ -4851,11 +4940,10 @@ class UserGrowthBrowserClient:
             opener,
             *,
             required_fields: Iterable[str] = (),
-            expected_field_count: int | None = None,
             progress: ProgressCallback | None = None,
             context_label: str = "分类标签",
     ):
-        """打开分类标签弹窗并持续等待完整表单；空态或数量不完整时取消重开。"""
+        """打开分类标签弹窗并持续等待目标字段；空态或缺字段时取消重开。"""
         required = [str(field).strip() for field in required_fields if str(field).strip()]
         reopen_attempt = 0
         backoff_seconds = 2.0
@@ -4864,40 +4952,20 @@ class UserGrowthBrowserClient:
             reopen_attempt += 1
             await opener()
             wait_attempt = 0
-            last_incomplete_count: int | None = None
-            stable_incomplete_rounds = 0
             while True:
                 self._raise_if_cancelled()
                 wait_attempt += 1
                 probe = await self._classification_modal_probe(
                     page,
                     required,
-                    scan_all=bool(required) or expected_field_count is not None,
+                    scan_all=bool(required),
                 )
                 root = probe.get("root")
                 empty_message = str(probe.get("empty_message") or "")
                 field_names = list(probe.get("field_names") or [])
                 field_count = len(field_names)
-
-                incomplete_count = (
-                    expected_field_count is not None
-                    and root is not None
-                    and not empty_message
-                    and field_count != expected_field_count
-                )
-                if incomplete_count:
-                    if field_count == last_incomplete_count:
-                        stable_incomplete_rounds += 1
-                    else:
-                        last_incomplete_count = field_count
-                        stable_incomplete_rounds = 1
-                else:
-                    last_incomplete_count = None
-                    stable_incomplete_rounds = 0
-
-                count_confirmed_incomplete = incomplete_count and stable_incomplete_rounds >= 3
-                if root is not None and (empty_message or count_confirmed_incomplete):
-                    reason = empty_message or f"分类选项仅加载 {field_count}/{expected_field_count} 条"
+                if root is not None and empty_message:
+                    reason = empty_message
                     self._emit(
                         progress,
                         f"{context_label}未完整加载：{reason}，取消后 {backoff_seconds:.1f}s 再打开",
@@ -4905,7 +4973,7 @@ class UserGrowthBrowserClient:
                     self._write_run_log(
                         f"[{datetime.now().isoformat(timespec='seconds')}] classification modal reopen: "
                         f"context={context_label}, reopen_attempt={reopen_attempt}, reason={reason}, "
-                        f"field_count={field_count}, expected={expected_field_count}, "
+                        f"field_count={field_count}, required={required}, "
                         f"backoff={backoff_seconds:.1f}s"
                     )
                     await self._cancel_classification_modal(page, root)
@@ -4915,8 +4983,7 @@ class UserGrowthBrowserClient:
 
                 normalized_names = {_compact_text(name) for name in field_names}
                 missing = [field for field in required if _compact_text(field) not in normalized_names]
-                count_ready = expected_field_count is None or field_count == expected_field_count
-                if root is not None and count_ready and not missing:
+                if root is not None and not missing:
                     self._write_run_log(
                         f"[{datetime.now().isoformat(timespec='seconds')}] classification modal ready: "
                         f"context={context_label}, field_count={field_count}, required={required}"
@@ -5696,6 +5763,7 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
     ) -> None:
         """红果短剧送审后追加 ARLP，并修改素材分类标签。"""
+        self._assert_redfruit_state_machine(plan)
         self._emit(progress, f"红果短剧任务 {task_id}：进入素材/文案列表处理 ARLP")
         detail_page = await self._open_task_detail_for_task_id(
             page,
@@ -5736,6 +5804,7 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
     ) -> None:
         """在已定位到本批素材的素材管理页继续 ARLP 和后审分类标签。"""
+        self._assert_redfruit_state_machine(plan)
         arlp_stages = self._redfruit_arlp_stages(items[0]) if items else []
         if self._upgrade_legacy_redfruit_arlp_checkpoint(plan, arlp_stages):
             self._checkpoint(
@@ -5918,6 +5987,7 @@ class UserGrowthBrowserClient:
             stage_total: int,
     ) -> None:
         """反复增加一个 ARLP 配置阶段，直到对应任务报告全部素材成功。"""
+        self._assert_redfruit_state_machine(plan)
         if not items:
             return
 
@@ -6649,6 +6719,7 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None,
     ) -> None:
         """修改红果后审分类标签，并持续补改直到每条素材都成功。"""
+        self._assert_redfruit_state_machine(plan)
         if not items:
             return
 
@@ -6736,6 +6807,7 @@ class UserGrowthBrowserClient:
             progress: ProgressCallback | None = None,
     ) -> None:
         """填写红果 ARLP 后需要补充的素材分类标签，失败时刷新并指数退避重试。"""
+        self._assert_redfruit_state_machine(plan)
         if not items:
             return
 

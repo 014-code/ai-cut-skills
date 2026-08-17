@@ -1,47 +1,57 @@
 # UserGrowth Code Map
 
-The standalone runnable copy lives in this skill:
+The standalone implementation in this skill is authoritative. Edit the files below, then sync the skill runtime; do not modify a guessed desktop mirror.
 
-- `scripts/usergrowth_upload.py`: CLI entry for dry-run, selected videos, single-run manifests, multi-batch manifests/concurrency, and live upload.
-- `scripts/usergrowth_automation/`: vendored Python package copied from the desktop UserGrowth implementation.
-- `scripts/requirements.txt`: runtime dependencies for the standalone tool.
+## Entrypoints
 
-The original source paths below are useful when comparing or syncing back to the AIVideoEditor backend repo.
+- `scripts/usergrowth_upload.py`
+  Soda Music and Redfruit upload CLI: selected files, manifests, automatic song splitting, batch concurrency, checkpoints, and `--resume-task`. It accepts only `soda_music` and `redfruit_short_drama`; Tomato Music is deliberately rejected here.
 
-Resolve original source paths from the AIVideoEditor backend repo root.
+- `scripts/tomato_music_tagging.py`
+  Tomato Music CID-to-`bid_<BID>` tagging CLI, including Feishu lookup/writeback and independent Tomato checkpoints. It does not upload videos or run Redfruit stages.
 
-## Desktop Source
+- `scripts/requirements.txt`
+  Runtime dependencies for the standalone tool.
 
-- `material_remix_desktop_source/app/tk_ui.py`
-  Tk desktop entry. The `UserGrowth 自动上传` tab collects video folder, backfill Excel, song Excel, output dir, order ID, month tag, account/password, task name, concurrency, and dry-run/headless/recursive toggles. It previews via `build_usergrowth_plan`, runs one task via `run_usergrowth_task`, and runs queued batches via `run_usergrowth_batches`.
+## Core Package
 
-- `material_remix_desktop_source/app/usergrowth_models.py`
-  Dataclasses and status carriers: `UserGrowthRunConfig`, `UserGrowthVideoItem`, `UserGrowthOrderPlan`, `UserGrowthBatchResult`, `UserGrowthCancelled`. Video suffixes: `.mp4`, `.mov`, `.mkv`, `.avi`.
+- `scripts/usergrowth_automation/usergrowth_models.py`
+  Shared dataclasses, status carriers, and supported video suffixes.
 
-- `material_remix_desktop_source/app/usergrowth_rules.py`
-  Filename parsing and tag/classification rules. Material keywords include `金币音乐新high`, `金币音乐新mid`, `金币音乐新`, `金币音乐旧`, `金币下沉`, `金币VIP`, `金币SVIP`. Optional filename tags include `算法选歌`, `音综`, `衍生`, `量产`, `钩子`, `抖舞`. Classification paths currently use `LUNA_` prefixes.
+- `scripts/usergrowth_automation/usergrowth_planner.py`
+  Soda song-batch planning and Redfruit file-to-metadata planning.
 
-- `material_remix_desktop_source/app/usergrowth_excel.py`
-  Excel reader/writer. Loads song records from flexible headers, resolves song IDs from links, removes duplicate song names, writes duplicate songs to a separate workbook, and writes CID/material/song/tag results back to the backfill workbook. It ensures `歌曲名称` exists immediately after `CID` when no song-name column exists.
+- `scripts/usergrowth_automation/usergrowth_rules.py`
+  Soda material detection, song-name extraction, classification paths, and template-related tag rules.
 
-- `material_remix_desktop_source/app/usergrowth_planner.py`
-  Builds upload plans from video files, song records, and the configured order ID. It attaches song ID/custom tags, skips blocked songs, skips files whose material type cannot be detected, and groups active items into `UserGrowthOrderPlan`.
+- `scripts/usergrowth_automation/usergrowth_redfruit.py`
+  Redfruit filename metadata, drama type, preflight normalization, three ARLP stages, and post-review classification paths.
 
-- `material_remix_desktop_source/app/usergrowth_runner.py`
-  Orchestrates one run or multiple batches. It creates the output task folder, writes `task.json`/`run.log`, separates dry-run from live browser upload, and serializes writes to the same backfill Excel path with an in-process lock.
+- `scripts/usergrowth_automation/usergrowth_browser.py`
+  Shared Playwright login, upload, Chameleon, review, CID, Redfruit state machine, ARLP, classification, retries, diagnostics, and session recovery.
 
-- `material_remix_desktop_source/app/usergrowth_browser.py`
-  Playwright client for UserGrowth. Handles login with OCR captcha, order search, creative-unit creation, upload, 录入变色龙, review submission, task polling, CID/material-type reading, error screenshots/text snapshots, and cancellation.
+- `scripts/usergrowth_automation/usergrowth_tomato_music.py`
+  Tomato material management, CID search/chunking, and strict `bid_<BID>` custom-tag application.
 
-- `material_remix_desktop_source/app/usergrowth_captcha.py`
-  Thin `ddddocr` wrapper. Raises `需要先安装 ddddocr 才能自动识别登录验证码` if the dependency is missing.
+- `scripts/usergrowth_automation/usergrowth_excel.py`
+  Soda song/backfill workbook loading and writeback, including the `CID`-adjacent `歌曲名称` column.
 
-- `material_remix_desktop_source/requirements.txt`
-  Desktop dependencies include `openpyxl`, `ddddocr`, `onnxruntime`, and `playwright`.
+- `scripts/usergrowth_automation/usergrowth_feishu_sheets.py` and `feishu_oauth.py`
+  Official Feishu Wiki/Sheets API, PKCE/bootstrap authorization, and optional writeback.
+
+- `scripts/usergrowth_automation/usergrowth_session_cache.py`
+  Account-scoped Windows DPAPI UserGrowth login cache shared by all three workflows.
+
+- `scripts/usergrowth_automation/usergrowth_runner.py`, `usergrowth_captcha.py`, and `usergrowth_tag_templates.py`
+  Desktop-compatible batch runner, captcha OCR wrapper, and Soda custom-tag template handling.
+
+## Legacy UI Reference
+
+`D:\linan\pro\aivideoeditor-backend\material_remix_desktop_source\app\tk_ui.py` remains only as a legacy desktop UI reference. Its former sibling `app/usergrowth_*.py` modules are no longer present there; do not treat those paths as editable or sync targets.
 
 ## Usual Edit Points
 
-- Add or change filename/material/tag rules in `usergrowth_rules.py`; then verify planner and browser tag fill both use the intended month/tag behavior.
-- Change song matching, CID backfill, or inserted Excel columns in `usergrowth_excel.py`; test with temporary workbooks.
-- Change UI inputs or batch behavior in `tk_ui.py`, `usergrowth_models.py`, and `usergrowth_runner.py` together.
+- Change Soda filename/material/tag rules in `usergrowth_rules.py`; verify planner and browser tag fill together.
+- Change Redfruit preflight, ARLP, or classifications in `usergrowth_redfruit.py` and `usergrowth_browser.py`; preserve the state machine and checkpoints.
+- Change song matching or Excel backfill in `usergrowth_excel.py`; test temporary workbooks.
 - Change browser selectors or live platform behavior in `usergrowth_browser.py`; use debug snapshots and avoid live upload unless explicitly authorized.

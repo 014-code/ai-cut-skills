@@ -64,6 +64,32 @@ def tag_for_bid(value: object) -> str:
     return f"bid_{bid}" if bid else ""
 
 
+def validate_tomato_music_tag_batches(
+        batches: Iterable[TomatoMusicTagBatch],
+) -> list[TomatoMusicTagBatch]:
+    """限制番茄音乐工具只能为每个 BID 追加对应的 bid_<BID> 标签。"""
+    validated: list[TomatoMusicTagBatch] = []
+    for index, batch in enumerate(batches, start=1):
+        bid = normalise_bid(batch.bid)
+        expected_tag = tag_for_bid(bid)
+        supplied_tag = str(batch.tag or "").strip()
+        if not bid:
+            raise RuntimeError(f"番茄音乐打标第 {index} 批缺少 BID，无法生成 bid_<BID> 标签")
+        if supplied_tag and supplied_tag != expected_tag:
+            raise RuntimeError(
+                f"番茄音乐打标第 {index} 批标签不合法：BID {bid} 只能追加 {expected_tag}，"
+                "红果短剧自定义标签必须通过正式上传状态机处理。"
+            )
+        validated.append(TomatoMusicTagBatch(
+            bid=bid,
+            tag=expected_tag,
+            cids=list(batch.cids),
+            song_names=list(batch.song_names),
+            tracks=list(batch.tracks),
+        ))
+    return validated
+
+
 def normalise_cids(values: Iterable[object]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -236,6 +262,7 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
             on_chunk_success: ChunkSuccessCallback | None = None,
             playwright_instance=None,
     ) -> list[TomatoMusicChunkResult]:
+        batches = validate_tomato_music_tag_batches(batches)
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
@@ -248,7 +275,8 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
                 playwright = await playwright_stack.enter_async_context(async_playwright())
             browser = await self._launch_browser(playwright)
             session = {"browser": browser}
-            context = await browser.new_context(viewport={"width": 1440, "height": 1000})
+            self._prepare_storage_state()
+            context = await browser.new_context(**self._context_options())
             page = await context.new_page()
             self._wrap_page_speed(page)
             page.set_default_timeout(self.timeout_ms)
@@ -257,6 +285,7 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
                 while True:
                     try:
                         await self._login(page, progress)
+                        await self._persist_session_state(context, progress)
                         await self._enable_post_login_resource_blocking(context, progress)
                         page = await self._open_tomato_material_page(
                             page,
@@ -384,6 +413,10 @@ class TomatoMusicTaggingClient(UserGrowthBrowserClient):
                         self._emit(progress, f"番茄音乐 BID {batch.bid} 已完成全部可检索素材打标")
                 return results
             finally:
+                try:
+                    await self._persist_session_state(context)
+                except Exception:
+                    pass
                 try:
                     # 标记为流程主动收尾，避免异常退出被误记为用户关闭页面。
                     await self._close_browser_intentionally(session.get("browser", browser))

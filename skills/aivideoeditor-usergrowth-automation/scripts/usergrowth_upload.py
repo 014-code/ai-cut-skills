@@ -41,7 +41,7 @@ from usergrowth_automation.usergrowth_rules import (
 from usergrowth_automation.usergrowth_redfruit import (
     build_redfruit_metadata,
     is_redfruit_workflow,
-    normalise_workflow,
+    require_upload_workflow,
     require_redfruit_content_kind,
 )
 from usergrowth_automation.usergrowth_tag_templates import (
@@ -471,7 +471,7 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
     if video_value in (None, "") and _existing_creative_unit_ids_from_args(args, manifest):
         video_value = str(output_root)
     video_folder = _required_path(video_value, base_dir, "video_folder")
-    workflow = normalise_workflow(_pick(args.workflow, manifest, "workflow") or "soda_music")
+    workflow = require_upload_workflow(_pick(args.workflow, manifest, "workflow"))
     backfill_value = _pick(args.backfill_excel, manifest, "backfill_excel", "order_excel")
     song_value = _pick(args.song_excel, manifest, "song_excel")
     backfill_excel = None if is_redfruit_workflow(workflow) and backfill_value in (None, "") else _required_path(
@@ -773,7 +773,7 @@ def run_resumed_usergrowth_task(
     if not isinstance(saved_payload, dict):
         raise RuntimeError("断点 task.json 不是 JSON object。")
     saved_config = saved_payload.get("config") or {}
-    workflow = normalise_workflow(saved_config.get("workflow") or "soda_music")
+    workflow = require_upload_workflow(saved_config.get("workflow"))
     if workflow not in {"soda_music", "redfruit_short_drama"}:
         raise RuntimeError(f"--resume-task 不支持 workflow={workflow}。")
     redfruit_workflow = is_redfruit_workflow(workflow)

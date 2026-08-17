@@ -259,10 +259,17 @@ For batch live upload, keep `confirm_live` at the top level or pass `--confirm-l
 
 Use `--headless` only after visible browser mode has been validated.
 
-Platform integrations can bridge a saved Playwright session without placing
-cookies in task manifests or logs. Pass `--storage-state <input.json>` to
-reuse a state file and `--storage-state-output <output.json>` to export the
-latest authenticated state; callers should treat both files as short-lived
+Standalone Soda Music, Redfruit short-drama, and Tomato Music runs reuse one
+account-scoped UserGrowth session automatically. The local cache is encrypted
+with Windows CurrentUser DPAPI and stored under `LOCALAPPDATA`; a valid cache
+skips account/password/captcha entry, while an invalid cache falls back to the
+normal login and is replaced after authentication.
+
+Platform integrations can still bridge a saved Playwright session without
+placing cookies in task manifests or logs. Pass `--storage-state <input.json>`
+to reuse a state file and `--storage-state-output <output.json>` to export the
+latest authenticated state; explicit bridge paths take precedence over the
+automatic local cache. Callers should treat both bridge files as short-lived
 secrets and remove them after the process exits. The platform upload workflow
 uses these options only when its “复用已保存会话” switch is enabled.
 

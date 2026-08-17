@@ -55,7 +55,7 @@ When a Soda Music or Redfruit multi-batch run is explicitly serial (`--concurren
 - Feishu writeback verification fails: stop and inspect the exact range from `task.json.feishu.planned_writes`. Do not proceed to assume the source sheet contains the planned BID values.
 
 - Tomato Music batch search shows `暂无数据`: confirm the customer context, preserve the material page `selectorId`, use space-separated CID values, and reduce the search to at most 50 CIDs. Do not switch to comma-separated input or click `全选所有` on a no-result page.
-- Soda/Redfruit classification modal shows `暂无...` or required fields have not rendered: cancel only the current classification modal, wait with exponential backoff, and reopen it. Redfruit post-review `修改分类标签` additionally requires an exact full-modal count of 54 selectable fields before any value is changed.
+- Soda/Redfruit classification modal shows `暂无...` or a required field has not rendered: cancel only the current classification modal, wait with exponential backoff, and reopen it. Redfruit post-review `修改分类标签` uses the same required-field rule; do not gate on a fixed total field count.
 - Tomato Music tag task count mismatch: inspect `tomato_music_tagging_checkpoint.json` and the chunk's visible `共 N 条` count. The current chunk must remain `failed` unless the operation task reports total N, success N, and failure 0; that failure is recorded, then later CID chunks and BID batches are still attempted. Network/page failures recover the current chunk instead of closing the whole run.
 
 - `需要先安装 playwright，并执行 playwright install chromium`
@@ -66,6 +66,9 @@ When a Soda Music or Redfruit multi-batch run is explicitly serial (`--concurren
 
 - Login fails after 5 attempts
   Inspect `login_failed_*` snapshots. Check account/password, captcha image detection, whether the login page changed, and whether `/home` still shows `墨攻AI` or `采购中心`.
+
+- Saved UserGrowth session is rejected
+  The three automation workflows validate the encrypted account-scoped cache against `/home`. An invalid cache is removed and the same browser continues through account/password/captcha login; this is recoverable and must not stop the requested batch queue. The cache contains encrypted cookies and is readable only by the same Windows user.
 
 - Login reports `图片验证码由4位字符组成`, `请填写正确的图片验证码`, or an equivalent captcha-validation message
   Treat it as a captcha business failure, not a slow page. Reload the login page, wait for the form and a fresh captcha, then retry. This shared login behavior applies to Soda Music, Redfruit short-drama, and Tomato Music tagging.
