@@ -13,6 +13,24 @@ WORKFLOW_REDFRUIT_SHORT_DRAMA = "redfruit_short_drama"
 REDFRUIT_DEFAULT_GENRE = ""
 REDFRUIT_GENRE_ROOT = "番茄/红果短剧素材题材"
 REDFRUIT_GENRE_OTHER = "短剧-其他"
+_SODA_WORKFLOW_ALIASES = {
+    "soda",
+    "sodamusic",
+    "qishui",
+    "qishuiyinyue",
+    "汽水",
+    "汽水音乐",
+}
+_REDFRUIT_WORKFLOW_ALIASES = {
+    "redfruit",
+    "hongguo",
+    "hongguoduanju",
+    "redfruitshortdrama",
+    "hongguoshortdrama",
+    "shortdrama",
+    "红果短剧",
+    "红果免费短剧",
+}
 
 
 def _normalise_key(value: object) -> str:
@@ -287,9 +305,22 @@ def _playlet_title_label_from_line(label_line: str) -> str:
 
 def normalise_workflow(value: object) -> str:
     text = _normalise_token(value)
-    if text in {"redfruit", "hongguo", "hongguoduanju", "redfruitshortdrama", "hongguoshortdrama", "shortdrama", "红果短剧", "红果免费短剧"}:
+    if text in _REDFRUIT_WORKFLOW_ALIASES:
         return WORKFLOW_REDFRUIT_SHORT_DRAMA
     return WORKFLOW_SODA_MUSIC
+
+
+def require_upload_workflow(value: object) -> str:
+    """解析上传 CLI 的明确工作流，拒绝未知值而不是静默回退到汽水。"""
+    text = _normalise_token(value)
+    if not text or text in _SODA_WORKFLOW_ALIASES:
+        return WORKFLOW_SODA_MUSIC
+    if text in _REDFRUIT_WORKFLOW_ALIASES:
+        return WORKFLOW_REDFRUIT_SHORT_DRAMA
+    raise ValueError(
+        f"不支持的上传 workflow={value!r}。usergrowth_upload.py 仅支持 soda_music 或 "
+        "redfruit_short_drama；番茄音乐 CID/BID 打标请使用 tomato_music_tagging.py。"
+    )
 
 
 def is_redfruit_workflow(value: object) -> bool:

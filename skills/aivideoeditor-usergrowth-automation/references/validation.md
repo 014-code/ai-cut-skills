@@ -82,6 +82,7 @@ If desktop tests exist in the checkout, prefer targeted runs such as `tests\desk
 
 - Browser changes
   Use `headless=False` for diagnosis, collect `debug/` artifacts, and test against a safe order before production. Check login, work-order search, create creative unit, upload input, chameleon modal, cascaders, chameleon tag strategy (`reuse_all`, common-tags-plus-per-card-song-id, and per-card full fill), review, task polling, CID extraction, and Excel write callback. For existing creative units, cover the `已录入为素材` dialog with multiple `创意id/cid` pairs and verify the branch exits immediately with CIDs mapped by `existing_material_id`.
+  For login-session changes, verify DPAPI round-trip/account isolation, invalid-cache fallback, atomic concurrent writes, shared cache resolution for Soda/Redfruit/Tomato, and a Tomato context receiving the saved `storage_state`.
 
 - Standalone CLI changes
   Run `--help`, `py_compile`, and a dry-run using temporary `.mp4` placeholders plus temporary song/backfill workbooks. Confirm only selected videos appear in `task.json` and `result.xlsx`.

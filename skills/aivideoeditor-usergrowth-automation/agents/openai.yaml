@@ -1,4 +1,4 @@
 interface:
   display_name: "AIVideoEditor UserGrowth Automation"
-  short_description: "Run UserGrowth uploads, Feishu sync, and tagging"
-  default_prompt: "Use $aivideoeditor-usergrowth-automation to plan or run UserGrowth uploads and Feishu-backed Tomato Music CID/BID tagging."
+  short_description: "Run Soda/Redfruit uploads or Tomato CID/BID tagging"
+  default_prompt: "Use $aivideoeditor-usergrowth-automation. First identify the explicit workflow: Soda Music upload, Redfruit short-drama upload, or Tomato Music CID-to-BID tagging; keep their stages and artifacts separate."

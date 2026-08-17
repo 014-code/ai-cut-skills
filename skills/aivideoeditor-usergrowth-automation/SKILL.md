@@ -20,6 +20,8 @@ This skill intentionally excludes PyInstaller/exe packaging and release tasks un
 3. Do not store or echo credentials. Prefer `USERGROWTH_ACCOUNT` and `USERGROWTH_PASSWORD`.
 4. If modifying the standalone implementation, edit files under `scripts/usergrowth_automation/` and then run the validation guidance.
 
+Soda Music upload, Redfruit short-drama upload, and Tomato Music CID/BID tagging automatically share one account-scoped UserGrowth login session. The standalone cache is encrypted with Windows CurrentUser DPAPI, validated against the authenticated home route before use, replaced after a fresh captcha login, and never written to task manifests or logs. Explicit `--storage-state`/`--storage-state-output` bridge files remain available to platform integrations and take precedence over the automatic cache.
+
 For the post-upload Tomato Music workflow (按 CID 批量给素材追加 `bid_<BID>` 自定义标签), use `scripts/tomato_music_tagging.py`. Prefer the official Feishu Wiki + Sheets OpenAPI for online song/BID lookup and BID writeback; repeat `--feishu-library-url` for every审核人员单曲查询表. Do not automate Feishu grid reads or edits through browser clicks. Keep Playwright only for the UserGrowth/墨攻 material-management steps. When tenant data scope is not configured, use `--feishu-user-oauth` to obtain a domestic Feishu `user_access_token` with PKCE; it inherits the authorizing user's document permissions. Add `--feishu-oauth-persist` for long-lived authorization: the access/refresh tokens are stored only in a Windows CurrentUser DPAPI-encrypted cache and refreshed automatically, while the App Secret stays environment-only. For a business user's one-time setup, use `--feishu-oauth-bootstrap`: on a cache miss it reads `FEISHU_BOOTSTRAP_ACCOUNT` and `FEISHU_BOOTSTRAP_PASSWORD` (or prompts securely), completes the visible domestic Feishu login/consent, and implies persistent caching; on later runs it skips both credentials and the browser. Use `--feishu-oauth-reauthorize` only to replace an expired/revoked cache through a fresh consent flow. Require `--feishu-writeback --confirm-feishu-writeback` for online sheet changes and `--live --confirm-live` for UserGrowth tag changes.
 
 For multiple Tomato Music BID batches, use `--concurrency N` to run at most `N` independent browser sessions inside the same process and OAuth token. Each browser handles one BID at a time; completed slots pull the next BID. Keep per-BID debug folders, preserve input-order result collection, and let one ordinary batch failure continue the remaining queue.
@@ -49,6 +51,18 @@ This boundary applies to both Soda Music and Redfruit short-drama automation.
 - Errors, flaky selectors, missing dependencies, locked Excel, debug screenshots/logs: read `references/failure-playbook.md`.
 - Test selection and verification expectations: read `references/validation.md`.
 
+## Workflow Isolation
+
+The three UserGrowth workflows are separate contracts. Route only from the user's explicit business target; never infer or switch a workflow from an order ID, customer ID, file-name fragment, tag, or a previous task folder. If the target is not explicit, stop and ask which workflow is required. `usergrowth_upload.py` defaults only an omitted workflow to Soda Music; every explicitly supplied unknown workflow, including `tomato_music`, is rejected instead of falling back to Soda.
+
+| User target | Workflow and entry | Must not be mixed in |
+| --- | --- | --- |
+| 汽水音乐 upload | `workflow=soda_music` through `scripts/usergrowth_upload.py` | Song-library matching, song batching, template tags, CID Excel/song-name backfill, upload -> Chameleon -> review -> CID. Do not run Redfruit preflight, ARLP, or post-review classifications. |
+| 红果短剧 upload | `workflow=redfruit_short_drama` through `scripts/usergrowth_upload.py` | Filename/order/Mogong/BID preflight, Redfruit tags, upload -> review -> three ordered ARLP stages -> post-review classifications. Do not use Soda song splitting, song templates, song-library matching, or Excel backfill. |
+| 番茄音乐 CID/BID tagging | `scripts/tomato_music_tagging.py` only | Existing material CIDs -> exact `bid_<BID>` tags and optional Feishu lookup/writeback. It is not a video-upload, review, CID-collection, Redfruit ARLP, or generic custom-tag flow. |
+
+Do not carry a checkpoint between workflows. Soda resumes only `soda_music_checkpoint.json`; Redfruit resumes only `redfruit_checkpoint.json`; Tomato resumes only `tomato_music_tagging_checkpoint.json`. A checkpoint, CID list, tag template, or task folder from one workflow is invalid input to either of the other two.
+
 ## Script Entry
 
 Primary CLI:
@@ -60,6 +74,8 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts
 The CLI supports `--video`, `--video-glob`, `--video-list`, `--all-videos`, `--split-by-song`, direct existing-creative-unit recovery with repeated `--existing-creative-unit-id`, Soda/Redfruit `--resume-task`, single-run JSON manifests, and multi-batch manifests with top-level `batches` plus `--concurrency`. When the user gives an explicit batch order or asks to run batches one by one, set `--concurrency 1`; the queue preserves manifest order. A normal batch/business failure is written as `failed` and the next user-requested batch is still started. Network/page recovery remains inside the current batch. Only user cancellation or manual closure of the headed browser stops the remaining queue. It fails when a requested selector does not match any video.
 
 For Redfruit, require every file name to identify exactly one supported drama type: `动态漫`, `仿真人`, or `纯短剧` (`真人剧` and `真人实拍短剧` are aliases). Run the blocking order/Mogong/BID preflight before upload. Never guess an unknown type. After review, finish all three ARLP product/platform stages in order, checkpoint each stage, then apply the drama-type-specific post-review classifications. Read the exact products, platforms, tags, and classification paths from `references/browser-flow.md`.
+
+Redfruit's original state machine is mandatory. For a new task, use `usergrowth_upload.py`; once a task folder/checkpoint exists, recover it only with `usergrowth_upload.py --resume-task <task-folder>`. Do not use inline Python, manually constructed `UserGrowthOrderPlan` objects, `TomatoMusicTaggingClient`, or private browser-client methods to jump to upload recovery, ARLP, or classification. The runtime rejects those Redfruit internal calls outside the active formal runner. `tomato_music_tagging.py` is limited to appending the exact `bid_<BID>` tag for its supplied BID; it is not a generic custom-tag writer.
 
 ## Safety Rules
 
