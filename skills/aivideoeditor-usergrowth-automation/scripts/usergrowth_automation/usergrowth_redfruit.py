@@ -572,7 +572,7 @@ def redfruit_post_review_classification_paths(drama_type: str) -> list[list[str]
 def redfruit_material_type_path(material_mode: str) -> list[str]:
     if material_mode in {"AI前贴", "AI后贴"}:
         return ["番茄/红果小说素材类型", "信息流素材类型", "AI素材", "AI前贴/后贴"]
-    return ["番茄/红果小说素材类型", "剪辑制作", "常规剪辑"]
+    return ["番茄/红果小说素材类型", "信息流素材类型", "纯原片剪辑"]
 
 
 def redfruit_genre(file_name: str, *, default_genre: str = REDFRUIT_DEFAULT_GENRE) -> str:
