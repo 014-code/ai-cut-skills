@@ -52,6 +52,21 @@ EXCLUDED_NAMES = {
     "node_modules",
 }
 EXCLUDED_SUFFIXES = (".pyc", ".pyo")
+REQUIRED_GATE_WORKFLOWS = {
+    ".github/workflows/pr-checks.yml": (
+        "on:",
+        "pull_request:",
+        "python scripts/ci_lint.py",
+        "python scripts/ci_security_scan.py",
+        "python -X utf8 -m unittest discover",
+    ),
+    ".github/workflows/ai-review-merge.yml": (
+        "on:",
+        "workflow_run:",
+        'workflows: ["PR Checks"]',
+        "python scripts/run_ai_review_gate.py",
+    ),
+}
 
 
 class ReleaseError(RuntimeError):
@@ -273,6 +288,19 @@ def discover_test_roots(repo_root: Path, skills: tuple[str, ...]) -> list[tuple[
     return roots
 
 
+def validate_gate_workflows(repo_root: Path) -> None:
+    """Require the repository's remote, protected validation gate to exist."""
+    for relative, required_markers in REQUIRED_GATE_WORKFLOWS.items():
+        workflow = repo_root / relative
+        try:
+            content = workflow.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ReleaseError(f"缺少强制 GitHub 门禁工作流：{relative}") from exc
+        missing = [marker for marker in required_markers if marker not in content]
+        if missing:
+            raise ReleaseError(f"GitHub 门禁工作流 {relative} 缺少必要校验：{', '.join(missing)}")
+
+
 def run_checks(
     repo_root: Path,
     config: ReleaseConfig,
@@ -281,6 +309,12 @@ def run_checks(
     read_only: bool = False,
 ) -> dict[str, object]:
     checks: list[dict[str, object]] = []
+
+    try:
+        validate_gate_workflows(repo_root)
+        checks.append({"name": "github_gate_workflows", "ok": True, "output": "required PR gates present"})
+    except ReleaseError as exc:
+        checks.append({"name": "github_gate_workflows", "ok": False, "output": str(exc)[-2000:]})
 
     with isolated_validation_environment() as validation_env:
 

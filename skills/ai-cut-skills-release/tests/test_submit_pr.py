@@ -53,6 +53,22 @@ class SubmitPrHelpersTests(unittest.TestCase):
 
         self.assertEqual(roots, [("skill_tests:demo", skill_tests)])
 
+    def test_requires_remote_gate_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(MODULE.ReleaseError, "缺少强制 GitHub 门禁"):
+                MODULE.validate_gate_workflows(root)
+
+    def test_accepts_complete_remote_gate_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            for relative, markers in MODULE.REQUIRED_GATE_WORKFLOWS.items():
+                path = root / relative
+                path.write_text("\n".join(markers), encoding="utf-8")
+            MODULE.validate_gate_workflows(root)
+
     def test_normalizes_relative_paths(self) -> None:
         self.assertEqual(MODULE.normalize_relative_path("tests\\test_demo.py"), "tests/test_demo.py")
         with self.assertRaises(MODULE.ReleaseError):
