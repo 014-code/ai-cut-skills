@@ -93,6 +93,21 @@ class SubmitPrHelpersTests(unittest.TestCase):
             ["git", "-c", "core.hooksPath=C:/empty-hooks", "commit", "-m", "release"],
         )
 
+    def test_applies_staged_and_unstaged_deltas_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            with patch.object(MODULE, "run_bytes", return_value=b"") as run_bytes:
+                MODULE.apply_source_changes(root, worktree, "HEAD", ["skills/demo"], [])
+
+        self.assertEqual(run_bytes.call_count, 2)
+        self.assertEqual(run_bytes.call_args_list[0].args[0], ["git", "diff", "--binary", "--", "skills/demo"])
+        self.assertEqual(
+            run_bytes.call_args_list[1].args[0],
+            ["git", "diff", "--binary", "--cached", "--", "skills/demo"],
+        )
+
     def test_refreshes_base_with_explicit_refspec(self) -> None:
         with patch.object(MODULE, "run_command", side_effect=["", "upstream/main"]) as run:
             result = MODULE.refresh_base_ref(Path("."), "upstream", "main")

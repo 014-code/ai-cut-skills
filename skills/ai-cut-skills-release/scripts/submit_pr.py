@@ -950,8 +950,14 @@ def apply_source_changes(
                 repo_root,
             )
         )
-    # Always apply the current staged/unstaged working-tree delta separately.
-    patches.append(run_bytes(["git", "diff", "--binary", base_ref, "--", *pathspecs], repo_root))
+    # Apply staged and unstaged deltas explicitly. A staged-only change must
+    # not depend on Git's implicit HEAD comparison semantics.
+    unstaged_args = ["git", "diff", "--binary"]
+    if base_ref != "HEAD":
+        unstaged_args.append(base_ref)
+    unstaged_args.extend(["--", *pathspecs])
+    patches.append(run_bytes(unstaged_args, repo_root))
+    patches.append(run_bytes(["git", "diff", "--binary", "--cached", "--", *pathspecs], repo_root))
     for index, patch in enumerate(patches):
         if not patch:
             continue
