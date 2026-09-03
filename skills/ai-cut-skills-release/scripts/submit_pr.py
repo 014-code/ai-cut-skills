@@ -1041,7 +1041,6 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             preflight_worktree,
             config,
             changed_paths=changed,
-            read_only=True,
         )
         validate_preflight_result(
             changed,
