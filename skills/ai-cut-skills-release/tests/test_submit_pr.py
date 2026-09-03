@@ -159,6 +159,16 @@ class SubmitPrHelpersTests(unittest.TestCase):
         ):
             self.assertIsNone(MODULE.select_source_commit_base(Path("."), "origin/demo"))
 
+    def test_local_source_base_uses_merge_base_when_upstream_moved_ahead(self) -> None:
+        with patch.object(
+            MODULE,
+            "run_command_result",
+            side_effect=[(1, "", "base is not ancestor"), (1, "", "head is not ancestor"), (0, "merge-base", "")],
+        ) as run:
+            self.assertEqual(MODULE.select_local_commit_base(Path("."), "upstream/main"), "merge-base")
+
+        self.assertEqual(run.call_args_list[-1].args[0], ["git", "merge-base", "upstream/main", "HEAD"])
+
     def test_rejects_diverged_local_and_existing_pr_branches(self) -> None:
         with patch.object(
             MODULE,

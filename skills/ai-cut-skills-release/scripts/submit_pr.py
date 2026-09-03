@@ -730,13 +730,46 @@ def select_source_commit_base(repo_root: Path, remote_branch_ref: str) -> str | 
     raise ReleaseError(f"本地分支与已有 PR 分支已分叉，无法安全计算增量：{detail[-1000:]}")
 
 
+def select_local_commit_base(repo_root: Path, base_ref: str) -> str | None:
+    """Choose the local patch base when a trusted upstream moved ahead.
+
+    A topic branch commonly diverges from a refreshed upstream tracking ref
+    only because it was created from an older upstream commit. Its merge-base
+    contains exactly the topic delta and is safe to use for scoped release
+    collection. Existing PR branches continue to use the stricter
+    ``select_source_commit_base`` path above.
+    """
+    base_is_ancestor, _, base_error = run_command_result(
+        ["git", "merge-base", "--is-ancestor", base_ref, "HEAD"],
+        repo_root,
+    )
+    if base_is_ancestor == 0:
+        return base_ref
+
+    head_is_ancestor, _, head_error = run_command_result(
+        ["git", "merge-base", "--is-ancestor", "HEAD", base_ref],
+        repo_root,
+    )
+    if head_is_ancestor == 0:
+        return None
+
+    merge_status, merge_output, merge_error = run_command_result(
+        ["git", "merge-base", base_ref, "HEAD"],
+        repo_root,
+    )
+    if merge_status == 0 and merge_output:
+        return merge_output
+    detail = merge_error or head_error or base_error or "无法找到本地分支与可信基线的共同祖先"
+    raise ReleaseError(f"本地分支与可信基线没有可安全复用的共同祖先：{detail[-1000:]}")
+
+
 def list_release_changed_paths(
     repo_root: Path,
     base_ref: str,
     pathspecs: list[str],
 ) -> tuple[list[str], list[str], str | None]:
     """Collect only local changes without treating an ahead remote as deletions."""
-    commit_base_ref = select_source_commit_base(repo_root, base_ref)
+    commit_base_ref = select_local_commit_base(repo_root, base_ref)
     tracked: list[str] = []
     if commit_base_ref:
         tracked.extend(
