@@ -22,7 +22,7 @@ commit/PR 摘要必须是单行且不能匹配凭据键值对或常见 Token 前
 
 执行提交前依次执行：
 
-- `quick_validate.py` 校验每个目标 Skill 的 frontmatter、目录和占位内容；
+- 发布脚本内置静态检查校验每个目标 Skill 的 frontmatter、目录和占位内容；
 - GitHub PR Checks 中的 `scripts/sync_skills.py --check` 校验仓库 catalog；
 - Python 文件语法检查；
 - `git diff --check`；

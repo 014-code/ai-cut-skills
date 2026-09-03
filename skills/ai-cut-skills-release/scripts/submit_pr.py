@@ -268,10 +268,26 @@ def list_changed_paths(repo_root: Path, base_ref: str | None, pathspecs: list[st
     return list(dict.fromkeys(tracked)), list(dict.fromkeys(untracked))
 
 
-def quick_validator_path() -> Path | None:
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    candidate = codex_home / "skills" / ".system" / "skill-creator" / "scripts" / "quick_validate.py"
-    return candidate if candidate.is_file() else None
+def validate_skill_structure(repo_root: Path, skill: str) -> None:
+    """Perform trusted, non-executing checks for a Skill entrypoint."""
+    skill_root = repo_root / "skills" / skill
+    entrypoint = skill_root / "SKILL.md"
+    try:
+        content = entrypoint.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReleaseError(f"无法读取 Skill 入口：{entrypoint}") from exc
+    if not re.match(r"^---\r?\n", content):
+        raise ReleaseError(f"Skill {skill} 缺少 YAML frontmatter")
+    parts = re.split(r"\r?\n---\r?\n", content, maxsplit=1)
+    if len(parts) != 2:
+        raise ReleaseError(f"Skill {skill} 的 YAML frontmatter 未正确闭合")
+    frontmatter = parts[0]
+    if not re.search(r"(?m)^name:\s*[^\s#]+", frontmatter):
+        raise ReleaseError(f"Skill {skill} frontmatter 缺少 name")
+    if not re.search(r"(?m)^description:\s*\S+", frontmatter):
+        raise ReleaseError(f"Skill {skill} frontmatter 缺少 description")
+    if re.search(r"(?i)(?:TODO|FIXME|replace this|your description)", content):
+        raise ReleaseError(f"Skill {skill} 包含未完成的占位内容")
 
 
 def discover_test_roots(repo_root: Path, skills: tuple[str, ...]) -> list[tuple[str, Path]]:
@@ -325,15 +341,12 @@ def run_checks(
             except ReleaseError as exc:
                 checks.append({"name": name, "ok": False, "output": str(exc)[-2000:]})
 
-        validator = quick_validator_path()
         for skill in config.skills:
-            if validator:
-                check(
-                    f"quick_validate:{skill}",
-                    [sys.executable, "-I", "-X", "utf8", str(validator), str(repo_root / "skills" / skill)],
-                )
-            else:
-                checks.append({"name": f"quick_validate:{skill}", "ok": False, "output": "找不到 quick_validate.py"})
+            try:
+                validate_skill_structure(repo_root, skill)
+                checks.append({"name": f"skill_structure:{skill}", "ok": True, "output": "static structure valid"})
+            except ReleaseError as exc:
+                checks.append({"name": f"skill_structure:{skill}", "ok": False, "output": str(exc)[-2000:]})
 
         # Repository scripts are untrusted input. Catalog and repository
         # tests run in the GitHub PR workflow, which is the actual boundary;

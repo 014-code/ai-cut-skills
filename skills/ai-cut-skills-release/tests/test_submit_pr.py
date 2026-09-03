@@ -485,9 +485,8 @@ class SubmitPrHelpersTests(unittest.TestCase):
                 keep_worktree=False,
                 auto_fork=True,
             )
-            with patch.object(MODULE, "quick_validator_path", return_value=None):
-                with patch.object(MODULE, "run_command", return_value=""):
-                    checks = MODULE.run_checks(root, config, changed_paths=[])
+            with patch.object(MODULE, "run_command", return_value=""):
+                checks = MODULE.run_checks(root, config, changed_paths=[])
 
             syntax = next(row for row in checks["checks"] if row["name"] == "python_syntax")
             self.assertTrue(syntax["ok"])
@@ -520,9 +519,8 @@ class SubmitPrHelpersTests(unittest.TestCase):
                 keep_worktree=False,
                 auto_fork=True,
             )
-            with patch.object(MODULE, "quick_validator_path", return_value=None):
-                with patch.object(MODULE, "run_command", return_value="") as run:
-                    checks = MODULE.run_checks(root, config, changed_paths=["skills/demo/main.py"], read_only=True)
+            with patch.object(MODULE, "run_command", return_value="") as run:
+                checks = MODULE.run_checks(root, config, changed_paths=["skills/demo/main.py"], read_only=True)
 
             names = {row["name"] for row in checks["checks"]}
             self.assertIn("catalog", names)
