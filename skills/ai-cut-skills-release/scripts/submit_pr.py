@@ -1004,17 +1004,30 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     base_ref = f"{config.base_remote}/{config.base_branch}"
 
     if not config.execute:
-        tracked, untracked = list_changed_paths(repo_root, None, pathspecs)
-        validate_no_symlink_paths(repo_root, tracked + untracked)
-        check_parent, check_worktree = create_check_worktree(repo_root, "HEAD", pathspecs, untracked)
+        base_ref = refresh_base_ref(repo_root, config.base_remote, config.base_branch)
+        tracked, untracked, local_commit_base_ref = list_release_changed_paths(
+            repo_root,
+            base_ref,
+            pathspecs,
+        )
+        changed = tracked + untracked
+        validate_no_symlink_paths(repo_root, changed)
+        check_parent, check_worktree = create_check_worktree(
+            repo_root,
+            base_ref,
+            pathspecs,
+            untracked,
+            source_base_ref="HEAD",
+            source_commit_base_ref=local_commit_base_ref,
+        )
         try:
             checks = run_checks(
                 check_worktree,
                 config,
-                changed_paths=tracked + untracked,
+                changed_paths=changed,
                 read_only=True,
             )
-            validate_preflight_result(tracked + untracked, checks)
+            validate_preflight_result(changed, checks)
         finally:
             remove_worktree(repo_root, check_worktree, check_parent)
         return {
@@ -1022,7 +1035,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             "branch": branch,
             "base": base_ref,
             "pathspecs": pathspecs,
-            "changed_paths": tracked + untracked,
+            "changed_paths": changed,
             "checks": checks,
             "execute_command": "加 --execute 执行提交、推送和创建 PR",
         }
