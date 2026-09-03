@@ -756,6 +756,27 @@ def validate_branch_reconcile(repo_root: Path, base_ref: str, branch_ref: str) -
         raise ReleaseError(f"已有 PR 分支与最新基线存在冲突或无法判断：{detail[-1000:]}")
 
 
+def prepare_existing_remote_branch(
+    repo_root: Path,
+    push_remote: str,
+    branch: str,
+    base_ref: str,
+    pathspecs: list[str],
+) -> tuple[str | None, bool]:
+    """Refresh and validate an existing branch, identifying ownership first."""
+    existing_remote_sha = remote_branch_sha(repo_root, push_remote, branch)
+    if not existing_remote_sha:
+        return None, False
+
+    existing_remote_sha = refresh_remote_branch_ref(repo_root, push_remote, branch)
+    # Classify ownership before shape/reconciliation checks so an interrupted
+    # PR creation can be retried using its explicit release marker.
+    managed_remote_branch = remote_branch_is_managed(repo_root, push_remote, branch)
+    validate_branch_scope(repo_root, base_ref, f"{push_remote}/{branch}", pathspecs)
+    validate_branch_reconcile(repo_root, base_ref, f"{push_remote}/{branch}")
+    return existing_remote_sha, managed_remote_branch
+
+
 def committed_paths(worktree: Path) -> list[str]:
     output = run_command(
         ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD"],
@@ -1158,18 +1179,13 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     else:
         ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
 
-    existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
-    managed_remote_branch = False
-    if existing_remote_sha:
-        existing_remote_sha = refresh_remote_branch_ref(repo_root, config.push_remote, branch)
-        validate_branch_scope(
-            repo_root,
-            base_ref,
-            f"{config.push_remote}/{branch}",
-            pathspecs,
-        )
-        managed_remote_branch = remote_branch_is_managed(repo_root, config.push_remote, branch)
-        validate_branch_reconcile(repo_root, base_ref, f"{config.push_remote}/{branch}")
+    existing_remote_sha, managed_remote_branch = prepare_existing_remote_branch(
+        repo_root,
+        config.push_remote,
+        branch,
+        base_ref,
+        pathspecs,
+    )
     validate_remote_branch_reuse(
         branch,
         existing_remote_sha,

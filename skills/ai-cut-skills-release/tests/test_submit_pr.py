@@ -185,6 +185,25 @@ class SubmitPrHelpersTests(unittest.TestCase):
         with patch.object(MODULE, "run_command_result", return_value=(0, "tree", "")):
             MODULE.validate_branch_reconcile(Path("."), "upstream/main", "origin/demo")
 
+    def test_classifies_managed_branch_before_shape_validation(self) -> None:
+        events: list[str] = []
+
+        with patch.object(MODULE, "remote_branch_sha", side_effect=lambda *args: events.append("sha") or "a" * 40), \
+            patch.object(MODULE, "refresh_remote_branch_ref", side_effect=lambda *args: events.append("refresh") or "b" * 40), \
+            patch.object(MODULE, "remote_branch_is_managed", side_effect=lambda *args: events.append("managed") or True), \
+            patch.object(MODULE, "validate_branch_scope", side_effect=lambda *args: events.append("scope") or []), \
+            patch.object(MODULE, "validate_branch_reconcile", side_effect=lambda *args: events.append("reconcile")):
+            result = MODULE.prepare_existing_remote_branch(
+                Path("."),
+                "origin",
+                "demo",
+                "upstream/main",
+                ["skills/demo"],
+            )
+
+        self.assertEqual(result, ("b" * 40, True))
+        self.assertEqual(events, ["sha", "refresh", "managed", "scope", "reconcile"])
+
     def test_rejects_out_of_scope_files_in_final_commit(self) -> None:
         with patch.object(MODULE, "run_command", return_value="skills/demo/SKILL.md\nREADME.md"):
             with self.assertRaisesRegex(MODULE.ReleaseError, "允许范围外文件"):
