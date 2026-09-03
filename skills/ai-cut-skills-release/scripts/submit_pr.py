@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +23,15 @@ from urllib.parse import urlparse
 SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RELEASE_MARKER_PREFIX = "AI-Cut-Skills-Release:"
 CHANGE_TYPES = {"feat", "fix", "docs", "refactor", "test", "chore"}
+SENSITIVE_ENV_MARKERS = (
+    "TOKEN",
+    "PASSWORD",
+    "SECRET",
+    "CREDENTIAL",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "AUTH",
+)
 EXCLUDED_NAMES = {
     ".DS_Store",
     ".idea",
@@ -67,6 +78,7 @@ def run_command(
     *,
     check: bool = True,
     input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> str:
     completed = subprocess.run(
         args,
@@ -76,11 +88,49 @@ def run_command(
         capture_output=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
     if check and completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise ReleaseError(f"命令失败：{' '.join(args)}\n{detail[-2000:]}")
     return completed.stdout.strip()
+
+
+@contextmanager
+def isolated_validation_environment() -> Iterator[dict[str, str]]:
+    """Run repository-controlled checks without local credentials or config."""
+    with tempfile.TemporaryDirectory(prefix="ai-cut-skills-validation-") as temporary:
+        temporary_root = Path(temporary)
+        env: dict[str, str] = {}
+        for key, value in os.environ.items():
+            normalized = key.upper()
+            if any(marker in normalized for marker in SENSITIVE_ENV_MARKERS):
+                continue
+            if normalized in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "GIT_ASKPASS", "SSH_AUTH_SOCK"}:
+                continue
+            if normalized in {"PYTHONPATH", "PYTHONHOME", "NODE_PATH"}:
+                continue
+            env[key] = value
+        env.update(
+            {
+                "HOME": str(temporary_root),
+                "USERPROFILE": str(temporary_root),
+                "APPDATA": str(temporary_root / "AppData"),
+                "LOCALAPPDATA": str(temporary_root / "LocalAppData"),
+                "TEMP": str(temporary_root / "Temp"),
+                "TMP": str(temporary_root / "Temp"),
+                "TMPDIR": str(temporary_root / "Temp"),
+                "GH_CONFIG_DIR": str(temporary_root / "gh"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(temporary_root / "gitconfig"),
+                "GIT_TERMINAL_PROMPT": "0",
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONSAFEPATH": "1",
+                "CI": "1",
+            }
+        )
+        (temporary_root / "Temp").mkdir(parents=True, exist_ok=True)
+        yield env
 
 
 def run_bytes(args: list[str], cwd: Path) -> bytes:
@@ -197,33 +247,34 @@ def run_checks(
 ) -> dict[str, object]:
     checks: list[dict[str, object]] = []
 
-    def check(name: str, args: list[str]) -> None:
-        try:
-            output = run_command(args, repo_root)
-            checks.append({"name": name, "ok": True, "output": output[-2000:]})
-        except ReleaseError as exc:
-            checks.append({"name": name, "ok": False, "output": str(exc)[-2000:]})
+    with isolated_validation_environment() as validation_env:
 
-    validator = quick_validator_path()
-    for skill in config.skills:
-        if validator:
-            check(
-                f"quick_validate:{skill}",
-                [sys.executable, "-X", "utf8", str(validator), str(repo_root / "skills" / skill)],
-            )
-        else:
-            checks.append({"name": f"quick_validate:{skill}", "ok": False, "output": "找不到 quick_validate.py"})
+        def check(name: str, args: list[str]) -> None:
+            try:
+                output = run_command(args, repo_root, env=validation_env)
+                checks.append({"name": name, "ok": True, "output": output[-2000:]})
+            except ReleaseError as exc:
+                checks.append({"name": name, "ok": False, "output": str(exc)[-2000:]})
 
-    sync_script = repo_root / "scripts" / "sync_skills.py"
-    if read_only:
-        checks.append({"name": "catalog", "ok": True, "output": "skipped in read-only plan mode"})
-    elif sync_script.is_file():
-        check("catalog", [sys.executable, "-X", "utf8", str(sync_script), "--check"])
+        validator = quick_validator_path()
+        for skill in config.skills:
+            if validator:
+                check(
+                    f"quick_validate:{skill}",
+                    [sys.executable, "-I", "-X", "utf8", str(validator), str(repo_root / "skills" / skill)],
+                )
+            else:
+                checks.append({"name": f"quick_validate:{skill}", "ok": False, "output": "找不到 quick_validate.py"})
 
-    python_files = []
-    for skill in config.skills:
-        python_files.extend((repo_root / "skills" / skill).rglob("*.py"))
-    if python_files:
+        sync_script = repo_root / "scripts" / "sync_skills.py"
+        if read_only:
+            checks.append({"name": "catalog", "ok": True, "output": "skipped in read-only plan mode"})
+        elif sync_script.is_file():
+            check("catalog", [sys.executable, "-I", "-X", "utf8", str(sync_script), "--check"])
+
+        python_files = []
+        for skill in config.skills:
+            python_files.extend((repo_root / "skills" / skill).rglob("*.py"))
         try:
             for path in python_files:
                 source = path.read_text(encoding="utf-8")
@@ -232,36 +283,42 @@ def run_checks(
         except (OSError, SyntaxError, UnicodeError) as exc:
             checks.append({"name": "python_syntax", "ok": False, "output": str(exc)[-2000:]})
 
-    check("diff_check", ["git", "diff", "--check"])
-    check("cached_diff_check", ["git", "diff", "--cached", "--check"])
+        # Treat CRLF line endings as end-of-line characters so Windows
+        # worktrees do not report every changed line as trailing whitespace.
+        check("diff_check", ["git", "-c", "core.whitespace=cr-at-eol", "diff", "--check"])
+        check(
+            "cached_diff_check",
+            ["git", "-c", "core.whitespace=cr-at-eol", "diff", "--cached", "--check"],
+        )
 
-    if read_only:
-        checks.append({"name": "tests", "ok": True, "output": "skipped in read-only plan mode"})
-    elif config.skip_tests:
-        checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
-    else:
-        test_roots = discover_test_roots(repo_root, config.skills)
-        if not test_roots:
-            checks.append({"name": "tests", "ok": True, "output": "no repository or Skill unittest files"})
+        if read_only:
+            checks.append({"name": "tests", "ok": True, "output": "skipped in read-only plan mode"})
+        elif config.skip_tests:
+            checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
         else:
-            for name, test_root in test_roots:
-                relative_root = test_root.relative_to(repo_root).as_posix()
-                check(
-                    name,
-                    [
-                        sys.executable,
-                        "-X",
-                        "utf8",
-                        "-m",
-                        "unittest",
-                        "discover",
-                        "-s",
-                        relative_root,
-                        "-p",
-                        "test_*.py",
-                        "-v",
-                    ],
-                )
+            test_roots = discover_test_roots(repo_root, config.skills)
+            if not test_roots:
+                checks.append({"name": "tests", "ok": True, "output": "no repository or Skill unittest files"})
+            else:
+                for name, test_root in test_roots:
+                    relative_root = test_root.relative_to(repo_root).as_posix()
+                    check(
+                        name,
+                        [
+                            sys.executable,
+                            "-I",
+                            "-X",
+                            "utf8",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            relative_root,
+                            "-p",
+                            "test_*.py",
+                            "-v",
+                        ],
+                    )
 
     checks.append({"name": "changed_paths", "ok": True, "output": "\n".join(changed_paths)})
     return {"ok": all(bool(item.get("ok")) for item in checks), "checks": checks}
