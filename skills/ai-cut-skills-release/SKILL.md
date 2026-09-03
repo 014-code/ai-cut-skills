@@ -15,7 +15,7 @@ description: "提交 AI Cut Skills 仓库改动并创建或更新 GitHub PR；�
 4. 只带入目标 Skill 及显式指定的附加文件，不把其他工作区改动混入提交；符号链接路径会被拒绝，避免把仓库外文件复制进提交。
 5. 执行 Skill 结构校验、仓库清单校验、语法检查、仓库根目录测试和目标 Skill 自带测试。
 6. 生成规范 commit，推送到当前账户 fork，创建或更新对应 GitHub PR。
-7. 重复执行同一组别/作用域/日期时，只允许在检测到当前账户、当前 base 分支下的打开 PR 后安全更新远端分支；陌生的同名远端分支会直接停止。
+7. 重复执行同一组别/作用域/日期时，只允许在检测到当前账户、当前 base 分支下的打开 PR 后安全更新远端分支；PR 创建 API 返回不确定时保留带有受管提交标记的远端分支，后续可安全重试，陌生的同名远端分支会直接停止。
 
 ## 认证
 
@@ -51,6 +51,6 @@ python skills/ai-cut-skills-release/scripts/submit_pr.py `
 
 如需跳过 GitHub fork 的创建和 parent 校验，可显式增加 `--no-auto-fork`。该选项仍会严格校验推送远端的 fetch URL 和所有有效 push URL 必须指向当前账户 fork，不会放宽提交范围、分支和 PR 安全校验。
 
-执行模式保持可审计：默认只读预检；`--execute` 才创建临时 worktree、提交和推送。已有受管 PR 的分支更新使用 `git push --force-with-lease`，不会无条件强制覆盖远端分支。这个 Skill 只创建或更新 PR，不自动审批或合并。
+执行模式保持可审计：默认只读预检；`--execute` 才创建临时 worktree、提交和推送。已有受管 PR 的分支更新使用 `git push --force-with-lease`，提交后会再次核验实际 commit 的变更范围；与最新基线无法安全合并时停止。这个 Skill 只创建或更新 PR，不自动审批或合并。
 
 详细的分支、提交范围和 PR 规则见 [references/release-policy.md](references/release-policy.md)。

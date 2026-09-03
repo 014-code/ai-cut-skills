@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 
 SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+RELEASE_MARKER_PREFIX = "AI-Cut-Skills-Release:"
 CHANGE_TYPES = {"feat", "fix", "docs", "refactor", "test", "chore"}
 EXCLUDED_NAMES = {
     ".DS_Store",
@@ -269,6 +270,10 @@ def validate_preflight_result(changed_paths: list[str], checks: dict[str, object
     ]
     detail = "、".join(failed) if failed else "未知校验"
     raise ReleaseError(f"提交前校验失败：{detail}")
+
+
+def release_commit_marker(branch: str) -> str:
+    return f"{RELEASE_MARKER_PREFIX} {branch}"
 
 
 def remote_repository(repo_root: Path, remote: str) -> str:
@@ -557,13 +562,28 @@ def refresh_remote_branch_ref(repo_root: Path, remote: str, branch: str) -> str:
     return run_command(["git", "rev-parse", "--verify", tracking_ref], repo_root)
 
 
+def remote_branch_is_managed(repo_root: Path, remote: str, branch: str) -> bool:
+    """Recognize a branch left by this Skill after a PR creation failure."""
+    message = run_command(
+        ["git", "show", "-s", "--format=%B", f"{remote}/{branch}"],
+        repo_root,
+    )
+    return release_commit_marker(branch) in message.splitlines()
+
+
 def select_worktree_ref(base_ref: str, push_remote: str, branch: str, existing_remote_sha: str | None) -> str:
     """Use the managed remote branch as the update base when it already exists."""
     return f"{push_remote}/{branch}" if existing_remote_sha else base_ref
 
 
-def validate_remote_branch_reuse(branch: str, remote_sha: str | None, existing_pr: dict[str, object] | None) -> None:
-    if remote_sha and not existing_pr:
+def validate_remote_branch_reuse(
+    branch: str,
+    remote_sha: str | None,
+    existing_pr: dict[str, object] | None,
+    *,
+    managed: bool = False,
+) -> None:
+    if remote_sha and not existing_pr and not managed:
         raise ReleaseError(
             f"远端分支 {branch} 已存在，但没有找到当前账户在目标 base 分支下的打开 PR；"
             "为避免覆盖未知改动，已停止。请更换作用域/日期，或先人工处理该分支。"
@@ -584,15 +604,37 @@ def build_push_args(remote: str, branch: str, remote_sha: str | None) -> list[st
     ]
 
 
-def build_delete_args(remote: str, branch: str, expected_sha: str) -> list[str]:
-    """Delete only a branch that is still at the SHA we just pushed."""
-    return [
-        "git",
-        "push",
-        f"--force-with-lease=refs/heads/{branch}:{expected_sha}",
-        remote,
-        f":refs/heads/{branch}",
-    ]
+def validate_branch_reconcile(repo_root: Path, base_ref: str, branch_ref: str) -> None:
+    """Fail closed when the managed branch cannot be merged with the fresh base."""
+    status, output, error = run_command_result(
+        ["git", "merge-tree", "--write-tree", base_ref, branch_ref],
+        repo_root,
+    )
+    if status != 0:
+        detail = error or output or "无法判断分支是否可合并"
+        raise ReleaseError(f"已有 PR 分支与最新基线存在冲突或无法判断：{detail[-1000:]}")
+
+
+def committed_paths(worktree: Path) -> list[str]:
+    output = run_command(
+        ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD"],
+        worktree,
+    )
+    return [line for line in output.splitlines() if line]
+
+
+def changed_paths_between(worktree: Path, base_ref: str, pathspecs: list[str]) -> list[str]:
+    output = run_command(["git", "diff", "--name-only", base_ref, "--", *pathspecs], worktree)
+    return [line for line in output.splitlines() if line]
+
+
+def validate_committed_scope(worktree: Path, pathspecs: list[str]) -> list[str]:
+    """Validate the commit that will be pushed, after tests and hooks ran."""
+    changed = committed_paths(worktree)
+    outside = [path for path in changed if not path_is_allowed(path, pathspecs)]
+    if outside:
+        raise ReleaseError(f"提交后的 commit 出现允许范围外文件：{', '.join(outside)}")
+    return changed
 
 
 def create_temporary_body_file(body: str) -> Path:
@@ -685,41 +727,6 @@ def remove_worktree(repo_root: Path, worktree: Path, parent: Path, branch: str |
     if branch:
         run_command(["git", "branch", "-D", branch], repo_root, check=False)
     shutil.rmtree(parent, ignore_errors=True)
-
-
-def cleanup_unclaimed_remote_branch(
-    repo_root: Path,
-    remote: str,
-    branch: str,
-    expected_sha: str,
-    repository: str,
-    head_owner: str,
-    base_branch: str,
-) -> None:
-    """Remove a branch left by a failed new PR creation only when ownership is proven."""
-    try:
-        if find_open_pr(repo_root, repository, branch, head_owner, base_branch):
-            return
-    except ReleaseError as exc:
-        print(f"WARNING: 无法确认 PR 是否已创建，保留远端分支：{exc}", file=sys.stderr)
-        return
-
-    try:
-        current_sha = remote_branch_sha(repo_root, remote, branch)
-    except ReleaseError as exc:
-        print(f"WARNING: 无法确认远端分支状态，保留远端分支：{exc}", file=sys.stderr)
-        return
-    if current_sha != expected_sha:
-        print(
-            f"WARNING: 远端分支 {branch} 已发生变化，保留该分支，不执行清理。",
-            file=sys.stderr,
-        )
-        return
-
-    status, output, error = run_command_result(build_delete_args(remote, branch, expected_sha), repo_root)
-    if status != 0:
-        detail = error or output or "未知 Git 错误"
-        print(f"WARNING: 清理未关联 PR 的远端分支失败：{detail[-1000:]}", file=sys.stderr)
 
 
 def ensure_staged_scope(worktree: Path, pathspecs: list[str]) -> list[str]:
@@ -880,8 +887,6 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     base_ref = refresh_base_ref(repo_root, config.base_remote, config.base_branch)
     tracked, untracked = list_changed_paths(repo_root, base_ref, pathspecs)
     changed = tracked + untracked
-    if not changed:
-        raise ReleaseError("目标 Skill 相对最新基线没有可提交变更")
     validate_no_symlink_paths(repo_root, changed)
 
     repository = resolve_target_repository(repo_root, config.base_remote, config.target_repository)
@@ -899,9 +904,21 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
-    validate_remote_branch_reuse(branch, existing_remote_sha, existing_pr)
+    managed_remote_branch = False
     if existing_remote_sha:
         existing_remote_sha = refresh_remote_branch_ref(repo_root, config.push_remote, branch)
+        managed_remote_branch = remote_branch_is_managed(repo_root, config.push_remote, branch)
+        validate_branch_reconcile(repo_root, base_ref, f"{config.push_remote}/{branch}")
+    validate_remote_branch_reuse(
+        branch,
+        existing_remote_sha,
+        existing_pr,
+        managed=managed_remote_branch,
+    )
+    if not changed and not (existing_remote_sha and managed_remote_branch):
+        raise ReleaseError("目标 Skill 相对最新基线没有可提交的变更")
+    # The remote branch was fetched above; use it as the worktree base so
+    # previous PR commits are retained during an update or retry.
     worktree_ref = select_worktree_ref(base_ref, config.push_remote, branch, existing_remote_sha)
     source_base_ref = worktree_ref if existing_remote_sha else base_ref
     parent, worktree = create_worktree(
@@ -913,28 +930,31 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         source_base_ref=source_base_ref,
     )
     try:
-        staged = ensure_staged_scope(worktree, pathspecs)
+        commit_needed = True
+        try:
+            staged = ensure_staged_scope(worktree, pathspecs)
+        except ReleaseError as exc:
+            if not (existing_remote_sha and managed_remote_branch and "没有可提交的变更" in str(exc)):
+                raise
+            staged = changed_paths_between(worktree, base_ref, pathspecs)
+            if not staged:
+                raise ReleaseError("受管远端分支没有可创建 PR 的目标 Skill 变更") from exc
+            validate_no_symlink_paths(worktree, staged)
+            commit_needed = False
         checks = run_checks(worktree, config, changed_paths=staged)
-        if not checks.get("ok"):
-            raise ReleaseError("提交前校验失败，请先处理 PR 检查结果")
+        validate_preflight_result(staged, checks)
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
-        run_command(["git", "commit", "-m", title], worktree)
-        pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
-        run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
+        if commit_needed:
+            run_command(["git", "commit", "-m", title, "-m", release_commit_marker(branch)], worktree)
+            pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
+            validate_committed_scope(worktree, pathspecs)
+            run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
         try:
             pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
         except ReleaseError:
-            if existing_remote_sha is None:
-                cleanup_unclaimed_remote_branch(
-                    repo_root,
-                    config.push_remote,
-                    branch,
-                    pushed_sha,
-                    repository,
-                    head_owner,
-                    config.base_branch,
-                )
+            # Keep a successfully pushed branch on ambiguous PR API failures.
+            # Its commit marker makes a later retry safe to recognize.
             raise
         result = {
             "status": "submitted",

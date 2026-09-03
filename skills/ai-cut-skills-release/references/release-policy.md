@@ -27,7 +27,7 @@
 - `git diff --check`；
 - 仓库 `tests/` 和本次目标 Skill `skills/<skill>/tests/` 下的 unittest（可用 `--skip-tests` 明确跳过）。
 
-任何失败都会阻止 commit 和 push。校验结果会写入 PR 描述，不写入凭据。
+任何失败都会阻止 commit 和 push。提交和本地钩子完成后，脚本还会检查最终 commit 的变更路径；越界时不会 push。校验结果会写入 PR 描述，不写入凭据。
 
 ## GitHub Fork 与 PR
 
@@ -42,14 +42,16 @@
 
 计划模式是只读的，不会创建或修改 fork；会在临时 detached worktree 中运行可能产生文件的检查，结束后清理。需要跳过 GitHub fork 创建和 parent 校验时可使用 `--no-auto-fork`，但仍必须确认 fetch URL 以及所有有效 push URL 都指向当前账户 fork，并遵守远端分支和 PR 的安全校验。
 
-同一 head 分支已有打开的 PR 时更新标题和正文，不重复创建。只有在 PR 编号、URL、head 分支、head owner 和 base 分支字段全部存在且精确匹配时才允许复用；字段缺失时按不可复用处理。执行前会先检查远端是否已有同名分支；临时 worktree 结束后会清理脚本创建的本地分支引用：
+同一 head 分支已有打开的 PR 时更新标题和正文，不重复创建。只有在 PR 编号、URL、head 分支、head owner 和 base 分支字段全部存在且精确匹配时才允许复用；字段缺失时按不可复用处理。已有远端分支会先刷新并用 `git merge-tree --write-tree` 检查与最新基线的可合并性，再以该远端分支为更新基线，保留已有提交。执行前会先检查远端是否已有同名分支；临时 worktree 结束后会清理脚本创建的本地分支引用：
 
 - 没有远端分支：使用普通 `git push`；
 - 有远端分支且存在当前账户指向目标 base 的打开 PR：只用 `--force-with-lease=<expected-sha>` 更新；
-- 有远端分支但没有可复用的打开 PR：停止，避免覆盖未知改动。
+- 有远端分支但没有可复用的打开 PR：仅当顶部提交包含本 Skill 写入的受管提交标记时允许安全重试，否则停止，避免覆盖未知改动。
 
 推送前会分别读取 remote 的 fetch URL 和 `remote.<name>.pushurl` 展开的所有有效 push URL。任何 URL 不是当前账户 fork 都会停止；不能只依赖 fetch URL 判断推送目标。
 
 PR 创建和更新都要求 GitHub CLI 已登录并具备目标仓库权限。PR 的 head owner、head branch 和 base branch 必须与本次执行一致。
+
+如果分支已成功推送但 PR API 返回不确定错误，脚本不会自动删除远端分支；提交中的受管标记用于后续重试，避免把可能已经创建成功的 PR 置于无效状态。
 
 合并不属于本 Skill 的自动动作；提交 Skill 只负责生成可审查的 PR。
