@@ -351,6 +351,76 @@ class SubmitPrHelpersTests(unittest.TestCase):
             self.assertTrue(syntax["ok"])
             self.assertFalse(any(path.name == "__pycache__" for path in root.rglob("__pycache__")))
 
+    def test_failed_preflight_does_not_create_fork_or_change_push_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "skills" / "demo").mkdir(parents=True)
+            (root / "skills" / "demo" / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+            config = MODULE.ReleaseConfig(
+                repo_root=root,
+                skills=("demo",),
+                includes=(),
+                group="014-code",
+                change_type="fix",
+                summary="test",
+                scope="demo",
+                date="20260903",
+                base_remote="upstream",
+                base_branch="main",
+                push_remote="origin",
+                github_account=None,
+                target_repository=None,
+                execute=True,
+                skip_tests=True,
+                keep_worktree=False,
+                auto_fork=True,
+            )
+            failed_checks = {"ok": False, "checks": [{"name": "tests", "ok": False}]}
+            with patch.object(MODULE, "run_command", return_value=str(root)):
+                with patch.object(MODULE, "refresh_base_ref", return_value="upstream/main"):
+                    with patch.object(MODULE, "list_changed_paths", return_value=(["skills/demo/SKILL.md"], [])):
+                        with patch.object(MODULE, "validate_no_symlink_paths"):
+                            with patch.object(
+                                MODULE,
+                                "resolve_target_repository",
+                                return_value="liudu2326526/ai-cut-skills",
+                            ):
+                                with patch.object(MODULE, "github_login", return_value="014-code"):
+                                    with patch.object(MODULE, "find_open_pr", return_value=None):
+                                        with patch.object(MODULE, "remote_branch_sha", return_value=None):
+                                            with patch.object(
+                                                MODULE,
+                                                "create_worktree",
+                                                return_value=(root, root),
+                                            ):
+                                                with patch.object(
+                                                    MODULE,
+                                                    "ensure_staged_scope",
+                                                    return_value=["skills/demo/SKILL.md"],
+                                                ):
+                                                    with patch.object(
+                                                        MODULE,
+                                                        "run_checks",
+                                                        return_value=failed_checks,
+                                                    ):
+                                                        with patch.object(MODULE, "remove_worktree"):
+                                                            with patch.object(
+                                                                MODULE,
+                                                                "ensure_fork_repository",
+                                                            ) as ensure_fork:
+                                                                with patch.object(
+                                                                    MODULE,
+                                                                    "ensure_release_push_remote",
+                                                                ) as ensure_remote:
+                                                                    with self.assertRaisesRegex(
+                                                                        MODULE.ReleaseError,
+                                                                        "提交前校验失败",
+                                                                    ):
+                                                                        MODULE.run_release(config)
+
+            ensure_fork.assert_not_called()
+            ensure_remote.assert_not_called()
+
     def test_creates_fork_after_404_and_waits_until_available(self) -> None:
         api_responses = [
             (1, "", "HTTP 404: Not Found"),

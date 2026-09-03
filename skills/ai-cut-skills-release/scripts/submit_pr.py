@@ -891,17 +891,6 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
 
     repository = resolve_target_repository(repo_root, config.base_remote, config.target_repository)
     head_owner = github_login(repo_root, config.github_account)
-    if config.auto_fork:
-        _, upstream_repo = split_repository(repository)
-        ensure_fork_repository(
-            repo_root,
-            repository,
-            head_owner,
-            upstream_repo,
-            config.push_remote,
-        )
-    else:
-        ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
     managed_remote_branch = False
@@ -945,6 +934,21 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         validate_preflight_result(staged, checks)
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
+
+        # Do not create a fork or change local remote configuration until the
+        # scoped worktree has passed every local validation. A failed or empty
+        # preflight must remain completely free of GitHub-side mutations.
+        if config.auto_fork:
+            _, upstream_repo = split_repository(repository)
+            ensure_fork_repository(
+                repo_root,
+                repository,
+                head_owner,
+                upstream_repo,
+                config.push_remote,
+            )
+        else:
+            ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
         if commit_needed:
             run_command(["git", "commit", "-m", title, "-m", release_commit_marker(branch)], worktree)
             pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
