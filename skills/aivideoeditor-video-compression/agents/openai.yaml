@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video Compression"
+  short_description: "Quality-first standalone video compression with validation"
+  default_prompt: "Use $aivideoeditor-video-compression to compress this video and compare the input and output."

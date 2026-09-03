@@ -25,7 +25,7 @@ The standalone implementation in this skill is authoritative. Edit the files bel
   Soda material detection, song-name extraction, classification paths, and template-related tag rules.
 
 - `scripts/usergrowth_automation/usergrowth_redfruit.py`
-  Redfruit filename metadata, drama type, preflight normalization, three ARLP stages, and post-review classification paths.
+  Redfruit filename metadata, drama type, preflight normalization, combined entry-time classification paths, and three ARLP stages.
 
 - `scripts/usergrowth_automation/usergrowth_browser.py`
   Shared Playwright login, upload, Chameleon, review, CID, Redfruit state machine, ARLP, classification, retries, diagnostics, and session recovery.

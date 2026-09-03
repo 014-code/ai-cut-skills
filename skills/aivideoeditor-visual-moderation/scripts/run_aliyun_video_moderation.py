@@ -8,6 +8,7 @@ variables and never writes them to disk.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 
 POLICY_VERSION = "visual-moderation-baseline-2026-07-29"
@@ -805,8 +807,141 @@ class AliyunGreenVideoClient:
         return model_to_dict(response.body)
 
 
+class AliyunGreenVirtualKeyClient:
+    """Call the platform proxy without exposing the upstream AK/SK to the Skill."""
+
+    RUNTIME_PATH_MARKER = "/api-key-distribution/runtime/aliyun-green"
+
+    def __init__(self, virtual_key: str, runtime_base_url: str, timeout_seconds: float) -> None:
+        self.virtual_key = str(virtual_key or "").strip()
+        self.runtime_base_url = str(runtime_base_url or "").strip().rstrip("/")
+        self.timeout_seconds = max(float(timeout_seconds), 1.0)
+        parsed_url = urlsplit(self.runtime_base_url)
+        if not self.virtual_key:
+            raise RuntimeError("Aliyun Green virtual Key is required.")
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise RuntimeError("--aliyun-virtual-runtime-base-url must be an absolute HTTP(S) URL.")
+        if self.RUNTIME_PATH_MARKER not in parsed_url.path.rstrip("/"):
+            raise RuntimeError(
+                "--aliyun-virtual-runtime-base-url must end in "
+                "/api-key-distribution/runtime/aliyun-green."
+            )
+        if parsed_url.username or parsed_url.password:
+            raise RuntimeError("--aliyun-virtual-runtime-base-url must not contain credentials.")
+        self._parsed_url = parsed_url
+
+    def submit_url(self, url: str, service: str) -> Dict[str, Any]:
+        return self._request_json(
+            "video-moderation",
+            method="POST",
+            payload={"url": url, "service": service},
+        )
+
+    def submit_local(self, file_path: str, service: str) -> Dict[str, Any]:
+        path = Path(file_path)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError("Local video file does not exist or is empty.")
+        return self._request_file(
+            "video-moderation/local",
+            file_path=path,
+            query={"service": service, "fileName": path.name},
+        )
+
+    def query(self, task_id: str, service: str) -> Dict[str, Any]:
+        body = self._request_json(
+            "video-moderation/result",
+            method="GET",
+            query={"taskId": task_id, "service": service},
+        )
+        result = body.get("result")
+        return result if isinstance(result, dict) else body
+
+    def _request_json(
+        self,
+        route: str,
+        *,
+        method: str,
+        payload: Optional[Dict[str, Any]] = None,
+        query: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        return self._request(route, method=method, body=body, query=query, headers=headers)
+
+    def _request_file(self, route: str, *, file_path: Path, query: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request(
+            route,
+            method="POST",
+            file_path=file_path,
+            query=query,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    def _request(
+        self,
+        route: str,
+        *,
+        method: str,
+        body: Optional[bytes] = None,
+        file_path: Optional[Path] = None,
+        query: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        target = self._build_target(route, query)
+        connection_type = http.client.HTTPSConnection if self._parsed_url.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(
+            self._parsed_url.hostname,
+            self._parsed_url.port,
+            timeout=self.timeout_seconds,
+        )
+        content_length = file_path.stat().st_size if file_path else len(body or b"")
+        try:
+            connection.putrequest(method.upper(), target)
+            connection.putheader("Authorization", f"Bearer {self.virtual_key}")
+            connection.putheader("Content-Length", str(content_length))
+            for header_name, header_value in (headers or {}).items():
+                connection.putheader(header_name, header_value)
+            connection.endheaders()
+            if file_path:
+                with file_path.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        connection.send(chunk)
+            elif body:
+                connection.send(body)
+
+            response = connection.getresponse()
+            response_body = response.read()
+        except OSError as exc:
+            raise RuntimeError(f"Aliyun Green virtual Key proxy request failed: {exc.__class__.__name__}") from exc
+        finally:
+            connection.close()
+
+        try:
+            parsed_body = json.loads(response_body.decode("utf-8")) if response_body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Aliyun Green virtual Key proxy returned invalid JSON (HTTP {response.status}).") from exc
+        if response.status < 200 or response.status >= 300:
+            detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
+            raise RuntimeError(f"Aliyun Green virtual Key proxy failed (HTTP {response.status}): {detail or 'request rejected'}")
+        if not isinstance(parsed_body, dict):
+            raise RuntimeError("Aliyun Green virtual Key proxy returned an invalid response.")
+        return parsed_body
+
+    def _build_target(self, route: str, query: Optional[Dict[str, Any]]) -> str:
+        base_query = parse_qsl(self._parsed_url.query, keep_blank_values=True)
+        extra_query = [(key, str(value)) for key, value in (query or {}).items() if value is not None]
+        request_path = f"{self._parsed_url.path.rstrip('/')}/{route.lstrip('/')}"
+        encoded_query = urlencode([*base_query, *extra_query])
+        return f"{request_path}?{encoded_query}" if encoded_query else request_path
+
+
 def extract_task_id(body: Dict[str, Any]) -> Optional[str]:
-    return get_nested(body, "data", "taskId") or get_nested(body, "Data", "TaskId")
+    return (
+        body.get("taskId")
+        or body.get("task_id")
+        or get_nested(body, "data", "taskId")
+        or get_nested(body, "Data", "TaskId")
+    )
 
 
 def ensure_aliyun_websocket_alias() -> None:
@@ -833,6 +968,25 @@ def main() -> int:
     parser.add_argument("--service", default="videoDetection")
     parser.add_argument("--region-id", default="cn-shanghai")
     parser.add_argument("--endpoint", default="green-cip.cn-shanghai.aliyuncs.com")
+    parser.add_argument(
+        "--aliyun-virtual-key",
+        default=os.getenv("ALIYUN_GREEN_VIRTUAL_KEY") or os.getenv("AIVIDEOEDITOR_ALIYUN_GREEN_VIRTUAL_KEY"),
+        help="Platform-issued virtual Key for Aliyun Green video moderation.",
+    )
+    parser.add_argument(
+        "--aliyun-virtual-runtime-base-url",
+        default=(
+            os.getenv("ALIYUN_GREEN_VIRTUAL_RUNTIME_BASE_URL")
+            or os.getenv("AIVIDEOEDITOR_ALIYUN_GREEN_VIRTUAL_RUNTIME_BASE_URL")
+        ),
+        help="Platform runtime route ending in /api-key-distribution/runtime/aliyun-green.",
+    )
+    parser.add_argument(
+        "--aliyun-virtual-timeout",
+        type=float,
+        default=900.0,
+        help="Timeout in seconds for virtual Key local-video uploads.",
+    )
     parser.add_argument("--poll", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=5.0)
     parser.add_argument("--poll-timeout", type=float, default=300.0)
@@ -852,7 +1006,19 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    client = AliyunGreenVideoClient(args.region_id, args.endpoint, args.is_vpc)
+    virtual_key = str(args.aliyun_virtual_key or "").strip()
+    direct_access_key_id = str(os.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID") or "").strip()
+    direct_access_key_secret = str(os.getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET") or "").strip()
+    if virtual_key and (direct_access_key_id or direct_access_key_secret):
+        raise RuntimeError("Use either Aliyun Green virtual Key or ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET, not both.")
+    if virtual_key:
+        client = AliyunGreenVirtualKeyClient(
+            virtual_key,
+            str(args.aliyun_virtual_runtime_base_url or ""),
+            args.aliyun_virtual_timeout,
+        )
+    else:
+        client = AliyunGreenVideoClient(args.region_id, args.endpoint, args.is_vpc)
     submit_body = None
     task_id = args.task_id
     if args.video:

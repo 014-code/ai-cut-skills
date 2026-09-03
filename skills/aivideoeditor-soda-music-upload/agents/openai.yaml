@@ -1,0 +1,4 @@
+interface:
+  display_name: "汽水音乐自动化上传"
+  short_description: "UserGrowth 汽水音乐上传、送审与 CID 证据回收"
+  default_prompt: "使用 $aivideoeditor-soda-music-upload。确认 workflow=soda_music，先校验源任务和选择范围，再按既有 UserGrowth 阶段执行。"

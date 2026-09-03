@@ -167,6 +167,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--live", action="store_true", help="真实写入 UserGrowth 自定义标签。")
     parser.add_argument("--confirm-live", action="store_true", help="与 --live 同时传入才允许真实提交。")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--storage-state",
+        help="可选：复用受控执行器提供的 Playwright storage state JSON。",
+    )
+    parser.add_argument(
+        "--storage-state-output",
+        help="可选：把已验证的 Playwright storage state 写到受控临时路径。",
+    )
     parser.add_argument("--account", help="优先使用 USERGROWTH_ACCOUNT 环境变量。")
     parser.add_argument("--password", help="优先使用 USERGROWTH_PASSWORD 环境变量。")
     parser.add_argument("--refresh-interval-seconds", type=float, default=12.0)
@@ -421,6 +429,14 @@ def main(argv: list[str] | None = None) -> int:
                 chunk_size=chunk_size,
                 concurrency=concurrency,
                 headless=bool(args.headless),
+                storage_state_path=(
+                    Path(args.storage_state).resolve() if args.storage_state else None
+                ),
+                storage_state_output_path=(
+                    Path(args.storage_state_output).resolve()
+                    if args.storage_state_output
+                    else None
+                ),
                 debug_dir=debug_dir,
                 refresh_interval_seconds=float(args.refresh_interval_seconds),
                 browser_slow_mo_ms=int(args.browser_slow_mo_ms),
@@ -476,6 +492,8 @@ async def _run_live_batches(
         chunk_size: int,
         concurrency: int,
         headless: bool,
+        storage_state_path: Path | None,
+        storage_state_output_path: Path | None,
         debug_dir: Path,
         refresh_interval_seconds: float,
         browser_slow_mo_ms: int,
@@ -514,6 +532,8 @@ async def _run_live_batches(
                 account,
                 password,
                 headless=headless,
+                storage_state_path=storage_state_path,
+                storage_state_output_path=storage_state_output_path,
                 debug_dir=batch_debug_dir,
                 refresh_interval_seconds=refresh_interval_seconds,
                 browser_slow_mo_ms=browser_slow_mo_ms,

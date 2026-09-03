@@ -46,6 +46,8 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-video-fission\scripts\frame_v
   --source D:\videos\a.mp4 D:\videos\b.mp4 `
   --output-root D:\outputs `
   --target-count 5 `
+  --source-concurrency 3 `
+  --skip-cover `
   --frames-per-second-drop 1 `
   --width 720 --height 1280 --resize-mode crop
 ```
@@ -86,9 +88,12 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-video-fission\scripts\release
 - Delete random discrete frames per second, not a continuous time span.
 - Never delete the first or last source frame. Preserve source presentation timestamps so frame deletion does not compress the main video timeline.
 - Avoid duplicate frame signatures per source when possible.
-- Pick cover candidates from separated timestamps and prepend a short still intro segment.
+- Pick cover candidates from separated timestamps and prepend a short still intro segment unless `--skip-cover` is set.
 - When the source has audio, prepend silence equal to the still-cover hold, re-encode the filtered audio, and trim audio/video together so the result stays synchronized.
 - Prefer distinct covers using average-hash distance when `Pillow` is available.
+- Render source videos with bounded concurrency (default 3); cache source metadata/MD5 and cover candidates in the output workspace for retries and repeated inputs.
+- In no-cover mode, preserve source timing, stream-copy audio, skip forced 30 FPS/faststart work, and render several variants from one FFmpeg decode pass using `--variant-batch-size`.
+- For platform basic frame fission, `--skip-cover` omits cover candidate extraction, cover similarity scoring, intro concatenation, and the cover audio delay while retaining per-second frame dropping and the normal output geometry/audio contract.
 
 ### 前贴排列组合
 

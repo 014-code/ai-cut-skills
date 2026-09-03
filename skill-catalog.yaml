@@ -710,6 +710,104 @@
       "requires": [],
       "optional": [],
       "next_stage": []
+    },
+    "aivideoeditor-soda-music-upload": {
+      "category": "distribution",
+      "summary": "执行汽水音乐 UserGrowth 上传、录入变色龙、送审、CID 回收和任务证据记录。",
+      "capability_path": [
+        "Video",
+        "Distribution",
+        "SodaMusicUpload"
+      ],
+      "tags": [
+        "汽水音乐",
+        "Soda Music",
+        "上传",
+        "自动上传",
+        "UserGrowth",
+        "变色龙",
+        "送审",
+        "CID",
+        "任务证据"
+      ],
+      "when_to_use": [
+        "需要将已验收的汽水音乐视频上传到 UserGrowth",
+        "需要执行汽水音乐上传、录入变色龙、送审并回收 CID",
+        "需要查看 Soda 上传任务状态和可恢复产物"
+      ],
+      "when_not_use": [
+        "需要生成或剪辑视频",
+        "需要番茄音乐 CID/BID 打标",
+        "需要红果短剧上传或 ARLP",
+        "需要只上传前贴或尾贴物料"
+      ],
+      "inputs": [
+        "workflow=soda_music",
+        "source_job_ids",
+        "artifact_ids",
+        "order_id",
+        "playlet_bid",
+        "live_confirmation",
+        "usergrowth_account_ref"
+      ],
+      "outputs": [
+        "upload_task_id",
+        "cid_results",
+        "review_status",
+        "task_evidence",
+        "resume_checkpoint"
+      ],
+      "requires": [],
+      "optional": [],
+      "next_stage": []
+    },
+    "aivideoeditor-video-compression": {
+      "category": "repurpose",
+      "summary": "独立执行质量优先的视频压缩、编码选择、大小控制和产物校验。",
+      "capability_path": [
+        "Video",
+        "Compression",
+        "Encoding",
+        "Validation"
+      ],
+      "tags": [
+        "视频压缩",
+        "H.264",
+        "H.265",
+        "HEVC",
+        "AV1",
+        "CRF",
+        "码率",
+        "转码",
+        "remux"
+      ],
+      "when_to_use": [
+        "需要独立压缩一个或多个视频文件",
+        "需要在保持时长和画面规格的前提下缩小视频体积",
+        "需要选择 H.264、H.265 或 AV1 编码并校验输出"
+      ],
+      "when_not_use": [
+        "需要视频裂变、抽帧或素材重混",
+        "需要前贴、尾板、字幕或利益点包装",
+        "需要 UserGrowth 或其他平台上传"
+      ],
+      "inputs": [
+        "input_video",
+        "compression_profile",
+        "mode",
+        "max_size_mb"
+      ],
+      "outputs": [
+        "compressed_video",
+        "compression_report",
+        "input_output_metadata",
+        "quality_validation"
+      ],
+      "requires": [],
+      "optional": [
+        "setup-video-editing-environment"
+      ],
+      "next_stage": []
     }
   }
 }

@@ -68,8 +68,8 @@ If desktop tests exist in the checkout, prefer targeted runs such as `tests\desk
 - Rules/classification/tag changes
   Verify `detect_material_type`, `extract_song_name`, `classification_path_for_material`, template rendering in `custom_tags_for_material`, planner preview values, and browser `_fill_card_defaults`.
 
-- Redfruit drama-type/ARLP changes
-  Run `python -m unittest discover -s tests -p 'test_usergrowth_redfruit_three_stage.py' -v`. Verify `动态漫/仿真人/纯短剧` aliases, unknown-type blocking, pure-short-drama fixed/AI-pre-roll tags, all ten post-review paths, exact three-stage ARLP products/platforms, stage-progress/classification-progress serialization, legacy empty-progress compatibility, and no double-counting of a completed ARLP task during resume. This is local validation only; do not claim a live UserGrowth run without explicit authorization and item-level task evidence.
+- Redfruit drama-type/ARLP/classification changes
+  Run `python -m unittest discover -s tests -p 'test_usergrowth_redfruit_three_stage.py' -v`. Verify `动态漫/仿真人/纯短剧` aliases, unknown-type blocking, pure-short-drama fixed/AI-pre-roll tags, all combined entry-time classification paths, exact three-stage ARLP products/platforms, stage-progress serialization, legacy empty-progress compatibility, and no double-counting of a completed ARLP task during resume. This is local validation only; do not claim a live UserGrowth run without explicit authorization and item-level task evidence.
 
 - Excel changes
   Use temporary `.xlsx` fixtures. Confirm header alias detection, `歌曲名称` insertion after `CID`, no overwrite of existing CID rows, missing-song-ID remarks, and dry-run versus live `include_ready` behavior.

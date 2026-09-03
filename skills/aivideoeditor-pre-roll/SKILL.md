@@ -5,7 +5,7 @@ description: Create pre-roll videos with the standalone local runner. Use when C
 
 # AIVideoEditor Pre-roll
 
-Use the standalone local runner bundled with this skill. This skill is designed for local rendering without any server connection or login.
+Use the standalone local runner bundled with this skill. Compose and render locally; optionally route only Ark background-video generation through the platform runtime proxy or the published online MCP Tool.
 
 Material assets should come from the caller's current project/workspace first. Do not assume the material folder has any fixed name; search the opened workspace/project and common roots such as `storage/temp`, `assets`, `materials`, `素材`, and `物料` for folders containing real Soda Music logos, SodaFont/方正兰亭 fonts, coin/reward screenshots, and body/overlay materials. Pass the discovered project paths explicitly through `--logo-light-path`, `--logo-dark-path`, `--subtitle-logo-path`, `--fonts-dir`, `--asset-root`, and `--asset-manifest`. Any material package inside the skill directory is only a compatibility fallback for local experiments, not the normal source of business material.
 
@@ -15,9 +15,9 @@ Material assets should come from the caller's current project/workspace first. D
 - The persistent Soda Music logo is required and fixed at the top-left: crop transparent padding, render the real logo at 190px wide, x=40, y=40, opacity 1.0. Do not disable it or vary its size/position per request.
 - Every deliverable video must include the persistent top-left Soda Music logo and the bottom-right visual-only disclaimer. These two layers are mandatory even when the user only asks for a quick test, disables main subtitles, or provides a custom payload.
 - Deliverable videos must have real visual content. Do not use color blocks, procedural test animations, blank clips, or other placeholder footage as the main video.
-- For any pre-roll that will create or replace the visual source with AI-generated video (`assetStrategy=generated`, Seedance/Ark video generation, or any equivalent AI video provider), require a current user-provided AI video generation API key before rendering. Ask the user for the key if it is not present in the current request or current environment (`ARK_API_KEY` / `AIVIDEOEDITOR_ARK_API_KEY`), and stop instead of rendering.
+- For any pre-roll that will create or replace the visual source with AI-generated video (`assetStrategy=generated`, Seedance/Ark video generation, or any equivalent AI video provider), require either a current user-provided Ark API key or a platform-issued virtual Key before rendering. Use `ARK_API_KEY` / `AIVIDEOEDITOR_ARK_API_KEY` for a direct Ark call, or `ARK_VIRTUAL_KEY` plus `ARK_VIRTUAL_RUNTIME_BASE_URL` for the platform runtime proxy; stop instead of rendering when neither is available.
 - Do not silently switch an AI-generated-video request to scraped, local, procedural, or bundled fallback footage because the key is missing. Only use scraped/local visuals without an AI video key when the user explicitly chose that non-AI source strategy.
-- Treat API keys as secrets: never hard-code them into scripts, configs, manifests, logs, final answers, or persisted skill files. Pass them through environment variables or runtime CLI arguments, and do not reuse a key remembered from an earlier conversation unless the user provides it again or it is already available in the current environment.
+- Treat API keys and virtual Keys as secrets: never hard-code them into scripts, configs, manifests, logs, final answers, or persisted skill files. Pass them through environment variables or runtime CLI arguments, and do not reuse a key remembered from an earlier conversation unless the user provides it again or it is already available in the current environment.
 - When revising an unsatisfactory video, always restart from a clean/uncomposited source video such as `baseVideoPath`, `revisionSourcePath`, `generatedVideoPath`, `scrapedVideoPath`, `imageVideoPath`, `backgroundVideo`, or `backgroundImage`. Do not use `finalVideoPath`, `final.mp4`, or any clip that already contains subtitles, logos, disclaimers, motion effects, BGM mixing, or overlays as the next input.
 - Copy/subtitles must not contain `红包` or `花不完`; do not send those words to voiceover.
 - Generated voiceover must use Edge Neural TTS. Do not use Windows SAPI, local system voices, silent fallback, or robotic/default voices. Use lively Chinese Edge voices such as `zh-CN-XiaoyiNeural`, `zh-CN-XiaoxiaoNeural`, `zh-CN-YunxiNeural`, `zh-CN-YunxiaNeural`, `zh-CN-liaoning-XiaobeiNeural`, and `zh-CN-shaanxi-XiaoniNeural`. If Edge TTS is unavailable, fail and ask for `edge-tts` installation or an approved lively `--voiceover-path`.
@@ -105,6 +105,27 @@ python scripts\run_pre_roll_standalone.py --script-text "打开汽水音乐，�
   --subtitle-logo-width-ratio 0.18
 ```
 
+Virtual Key through the platform Ark runtime proxy:
+
+```powershell
+python scripts\run_pre_roll_standalone.py --script-text "打开汽水音乐，每天听歌15分钟" `
+  --visual-template-id decompression `
+  --asset-strategy generated `
+  --ark-virtual-key "$env:ARK_VIRTUAL_KEY" `
+  --ark-virtual-runtime-base-url "$env:ARK_VIRTUAL_RUNTIME_BASE_URL"
+```
+
+Set `ARK_VIRTUAL_RUNTIME_BASE_URL` to the complete platform route ending in `/api-key-distribution/runtime/ark/api/v3`. The local runner sends the virtual Key only as the Bearer credential to that proxy; it never resolves or writes the upstream Ark Key locally.
+
+## Online MCP
+
+For server-side background generation, call the published `pre_roll_generate_video` Tool with `prompt` and exactly one credential field:
+
+- `virtualKey`: a platform-issued Ark virtual Key. The platform resolves it for this request only, injects the upstream Ark Key into the server-side generation call, and records only `virtualKeyProvided` in the invocation audit.
+- `credentialRef`: compatibility path for an existing controlled server credential reference.
+
+Do not send both fields. Poll through `pre_roll_get_status`, then use `artifact_download` only after the output is ready. Complete subtitles, logo/disclaimer overlays, and final composition remain local.
+
 ## Minimal Inputs
 
 Prefer these as the default user-facing form:
@@ -123,7 +144,7 @@ Standalone mode can:
 
 - use a caller-supplied background video or image
 - preserve the clean background as the revision source so later edits can recompose from a fresh base
-- call Ark/Seedance with `--ark-api-key` only after the user provides a current AI video generation API key; `assetStrategy=generated` must not run without one
+- call Ark/Seedance with `--ark-api-key`, or send `--ark-virtual-key` to `--ark-virtual-runtime-base-url`; `assetStrategy=generated` must not run without one of these current credentials
 - optionally call an OpenAI/Ark-compatible image API with `--image-api-key` for `assetStrategy=generated_image`, then convert the still image into a video background
 - generate subtitles and a visual-only disclaimer locally
 - overlay a caller-supplied logo image on every render
@@ -144,7 +165,7 @@ Recommended inputs:
 
 - `--script-text`
 - `--visual-template-id`
-- `--asset-strategy generated` with a current user-provided `--ark-api-key` or `ARK_API_KEY` / `AIVIDEOEDITOR_ARK_API_KEY`, `--asset-strategy generated_image` with `--image-api-key`, or `--asset-strategy local_video/local_image/scraped` with a real background source
+- `--asset-strategy generated` with a current user-provided `--ark-api-key` or `ARK_API_KEY` / `AIVIDEOEDITOR_ARK_API_KEY`, or with `--ark-virtual-key` plus `--ark-virtual-runtime-base-url`; `--asset-strategy generated_image` with `--image-api-key`; or `--asset-strategy local_video/local_image/scraped` with a real background source
 - `--image-model`, `--image-size`, and `--image-base-url` when using generated static images
 - `--background-video` or `--background-image` or `--background-url`
 - `--asset-root` and `--asset-manifest` when extra local visual files are used

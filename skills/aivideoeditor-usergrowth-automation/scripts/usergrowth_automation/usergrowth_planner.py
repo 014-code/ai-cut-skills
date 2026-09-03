@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -308,6 +309,17 @@ def build_usergrowth_plan(
         _attach_order(item, default_order_id)
         items.append(item)
 
+    if config.single_plan:
+        active_items = [
+            item for item in items
+            if item.status != "skipped" and item.order_id
+        ]
+        if not active_items:
+            return [], items
+        # 平台为本次上传指定一个工单。所有选中文件共用一个执行计划，
+        # 每个文件的任务明细和断点数据仍提供给平台集成使用。
+        return [UserGrowthOrderPlan(order_id=default_order_id, items=active_items)], items
+
     grouped: dict[str, list[UserGrowthVideoItem]] = defaultdict(list)
     skipped_items: list[UserGrowthVideoItem] = []
     for item in items:
@@ -323,7 +335,7 @@ def build_usergrowth_plan(
 
 
 def build_redfruit_plan(config: UserGrowthRunConfig) -> tuple[list[UserGrowthOrderPlan], list[UserGrowthVideoItem]]:
-    """红果短剧不走歌单/回填，直接按文件名构建上传与送审计划。"""
+    """红果短剧不走歌单/回填，直接按文件名构建上传、CID 和 ARLP 计划。"""
     scanned_videos = _scan_config_video_files(config)
     default_order_id = config.order_id.strip()
     if not default_order_id:
@@ -342,7 +354,6 @@ def build_redfruit_plan(config: UserGrowthRunConfig) -> tuple[list[UserGrowthOrd
             song_match_message="已识别红果短剧元数据",
             classification_path=list(metadata.get("genre_path") or []),
             classification_paths=list(metadata["classification_paths"]),
-            post_review_classification_paths=list(metadata["post_review_classification_paths"]),
             custom_tags=list(metadata["custom_tags"]),
             optional_tags=[],
             workflow_metadata=metadata,
@@ -352,17 +363,46 @@ def build_redfruit_plan(config: UserGrowthRunConfig) -> tuple[list[UserGrowthOrd
         item.message = _redfruit_warning_message(metadata)
         items.append(item)
 
+    if config.single_plan:
+        active_items = [
+            item for item in items
+            if item.status != "skipped" and item.order_id
+        ]
+        if not active_items:
+            return [], items
+        # 平台为本次上传指定一个工单。所有选中文件共用一个执行计划，
+        # 每个文件的任务明细和断点数据仍提供给平台集成使用。
+        return [UserGrowthOrderPlan(order_id=default_order_id, items=active_items)], items
+
     grouped: dict[str, list[UserGrowthVideoItem]] = defaultdict(list)
     for item in items:
         if item.status == "skipped" or not item.order_id:
             continue
-        grouped[item.order_id].append(item)
+        # 浏览器的“一键复用”会复制首张卡片的分类和自定义标签。
+        # 按来源配置拆分计划，避免同一浏览器计划把流量标签套到无关产物上。
+        signature = json.dumps(
+            {
+                "orderId": item.order_id,
+                "title": item.song_name,
+                "bid": item.song_id,
+                "classificationPaths": _merge_plan_paths(item.classification_paths),
+                "customTags": item.custom_tags,
+                "sourceCategoryTags": item.workflow_metadata.get("source_category_tag_names", []),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        grouped[signature].append(item)
 
-    plans = [UserGrowthOrderPlan(order_id=order_id, items=group_items) for order_id, group_items in grouped.items()]
+    plans = [
+        UserGrowthOrderPlan(order_id=group_items[0].order_id, items=group_items)
+        for group_items in grouped.values()
+    ]
     return plans, items
 
 
 def _redfruit_metadata_for_config(config: UserGrowthRunConfig, path: Path) -> dict:
+    source_categories = config.redfruit_source_categories_by_file.get(path.name, {})
     metadata = build_redfruit_metadata(
         path,
         default_genre=config.redfruit_default_genre or "",
@@ -371,6 +411,9 @@ def _redfruit_metadata_for_config(config: UserGrowthRunConfig, path: Path) -> di
         material_mode_override=config.redfruit_material_mode_override,
         ai_custom_tag=config.redfruit_ai_custom_tag,
         extra_custom_tags=config.redfruit_extra_custom_tags,
+        source_cid=str(source_categories.get("source_cid") or "").strip(),
+        source_category_tag_ids=source_categories.get("category_tag_ids") or [],
+        source_category_tag_names=source_categories.get("category_tag_names") or [],
     )
     if config.delivery_products:
         metadata["delivery_products"] = list(config.delivery_products)
@@ -392,7 +435,51 @@ def _redfruit_metadata_for_config(config: UserGrowthRunConfig, path: Path) -> di
             if config.arlp_platforms:
                 stages[0]["platforms"] = list(config.arlp_platforms)
             metadata["arlp_stages"] = stages
+    override = config.redfruit_plan_overrides_by_file.get(path.name)
+    if isinstance(override, dict):
+        if "classificationPaths" in override:
+            metadata["classification_paths"] = _normalise_plan_paths(override.get("classificationPaths"))
+        if "customTags" in override:
+            metadata["custom_tags"] = _normalise_plan_tags(override.get("customTags"))
+        metadata["manual_preflight_override"] = True
     return metadata
+
+
+def _normalise_plan_paths(value: object) -> list[list[str]]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[list[str]] = []
+    for raw_path in value:
+        if isinstance(raw_path, str):
+            parts = [part.strip() for part in raw_path.replace("/", ">").split(">")]
+        elif isinstance(raw_path, (list, tuple)):
+            parts = [str(part).strip() for part in raw_path]
+        else:
+            continue
+        parts = [part for part in parts if part]
+        if parts and parts not in result:
+            result.append(parts)
+    return result
+
+
+def _merge_plan_paths(*values: object) -> list[list[str]]:
+    """合并规范字段和旧字段中的分类路径，并去除重复项。"""
+    result: list[list[str]] = []
+    for value in values:
+        for path in _normalise_plan_paths(value):
+            if path not in result:
+                result.append(path)
+    return result
+
+
+def _normalise_plan_tags(value: object) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return list(dict.fromkeys(str(tag).strip() for tag in value if str(tag).strip()))
 
 
 def _redfruit_match_message(item: UserGrowthVideoItem) -> str:

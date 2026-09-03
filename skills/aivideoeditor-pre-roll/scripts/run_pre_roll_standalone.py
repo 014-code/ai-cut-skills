@@ -2333,6 +2333,34 @@ def generate_seedance_video(
     }
 
 
+def resolve_ark_video_generation_auth(
+    *,
+    ark_api_key: Optional[str],
+    ark_base_url: str,
+    ark_virtual_key: Optional[str],
+    ark_virtual_runtime_base_url: Optional[str],
+) -> Tuple[str, str, str]:
+    """Choose direct Ark authentication or a platform virtual-Key runtime proxy."""
+    direct_key = str(ark_api_key or "").strip()
+    virtual_key = str(ark_virtual_key or "").strip()
+    if direct_key and virtual_key:
+        raise RunnerError("Use either --ark-api-key or --ark-virtual-key, not both.")
+    if virtual_key:
+        runtime_base_url = str(ark_virtual_runtime_base_url or "").strip().rstrip("/")
+        if not runtime_base_url:
+            raise RunnerError(
+                "--ark-virtual-key requires --ark-virtual-runtime-base-url, ending in "
+                "/api-key-distribution/runtime/ark/api/v3."
+            )
+        if "/runtime/ark/api/v3" not in runtime_base_url:
+            raise RunnerError(
+                "--ark-virtual-runtime-base-url must target the platform Ark runtime route, "
+                "for example https://host/api/v1/api-key-distribution/runtime/ark/api/v3."
+            )
+        return virtual_key, runtime_base_url, "virtual_key_runtime_proxy"
+    return direct_key, str(ark_base_url or "").strip().rstrip("/"), "direct_ark_key"
+
+
 def make_base_video(
     *,
     ffmpeg_bin: str,
@@ -3010,11 +3038,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-tts", action="store_true", help="Deprecated compatibility flag. Generated pre-roll voiceover must use Edge Neural TTS.")
     parser.add_argument("--voice-name", default=None, help="Optional lively voice name/alias. Use | to provide multiple candidates.")
     parser.add_argument("--edge-voice", default=None, help="Optional Edge Neural voice or | separated lively candidates, e.g. zh-CN-XiaoyiNeural|zh-CN-XiaoxiaoNeural.")
-    parser.add_argument("--edge-rate", default=DEFAULT_EDGE_TTS_RATE, help="Edge TTS speaking rate, e.g. +12%.")
-    parser.add_argument("--edge-volume", default=DEFAULT_EDGE_TTS_VOLUME, help="Edge TTS volume, e.g. +0%.")
+    parser.add_argument("--edge-rate", default=DEFAULT_EDGE_TTS_RATE, help="Edge TTS speaking rate, e.g. +12%%.")
+    parser.add_argument("--edge-volume", default=DEFAULT_EDGE_TTS_VOLUME, help="Edge TTS volume, e.g. +0%%.")
     parser.add_argument("--edge-pitch", default=DEFAULT_EDGE_TTS_PITCH, help="Edge TTS pitch, e.g. +3Hz.")
     parser.add_argument("--ark-api-key", default=os.getenv("ARK_API_KEY") or os.getenv("AIVIDEOEDITOR_ARK_API_KEY"))
     parser.add_argument("--ark-base-url", default=os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"))
+    parser.add_argument(
+        "--ark-virtual-key",
+        default=os.getenv("ARK_VIRTUAL_KEY") or os.getenv("AIVIDEOEDITOR_ARK_VIRTUAL_KEY"),
+        help="Platform-issued virtual Key for Ark video generation. It is sent only to the runtime proxy.",
+    )
+    parser.add_argument(
+        "--ark-virtual-runtime-base-url",
+        default=(
+            os.getenv("ARK_VIRTUAL_RUNTIME_BASE_URL")
+            or os.getenv("AIVIDEOEDITOR_ARK_VIRTUAL_RUNTIME_BASE_URL")
+        ),
+        help="Platform runtime proxy base URL ending in /api-key-distribution/runtime/ark/api/v3.",
+    )
     parser.add_argument("--ark-model", default=os.getenv("SEEDANCE_MODEL", "doubao-seedance-1-0-pro-250528"))
     parser.add_argument("--ark-poll-interval", type=float, default=5.0)
     parser.add_argument("--ark-timeout-seconds", type=int, default=900)
@@ -3130,6 +3171,8 @@ def apply_config(args: argparse.Namespace, config: Dict[str, Any]) -> argparse.N
         "brandFontPath": "brand_font_path",
         "arkApiKey": "ark_api_key",
         "arkBaseUrl": "ark_base_url",
+        "arkVirtualKey": "ark_virtual_key",
+        "arkVirtualRuntimeBaseUrl": "ark_virtual_runtime_base_url",
         "arkModel": "ark_model",
         "imageApiKey": "image_api_key",
         "openaiImageApiKey": "image_api_key",
@@ -3259,6 +3302,16 @@ def main() -> int:
     scene = choose_scene(visual_type, args.seed)
     visual_prompt = build_visual_prompt(visual_type, scene, args.prompt_text)
     effective_asset_strategy = "generated_image" if visual_type == "ai_beauty_image" else args.asset_strategy
+    ark_video_api_key = str(args.ark_api_key or "").strip()
+    ark_video_base_url = str(args.ark_base_url or "").strip().rstrip("/")
+    ark_video_auth_mode = "direct_ark_key"
+    if effective_asset_strategy == "generated" and (ark_video_api_key or args.ark_virtual_key):
+        ark_video_api_key, ark_video_base_url, ark_video_auth_mode = resolve_ark_video_generation_auth(
+            ark_api_key=args.ark_api_key,
+            ark_base_url=args.ark_base_url,
+            ark_virtual_key=args.ark_virtual_key,
+            ark_virtual_runtime_base_url=args.ark_virtual_runtime_base_url,
+        )
     image_api_key = args.image_api_key
     image_base_url = args.image_base_url
     image_model = args.image_model
@@ -3496,15 +3549,15 @@ def main() -> int:
         and not background_image
         and not background_url
     ):
-        if not args.ark_api_key:
+        if not ark_video_api_key:
             raise RunnerError(
-                "assetStrategy=generated requires --ark-api-key so the workflow can create a real video background. "
+                "assetStrategy=generated requires --ark-api-key or --ark-virtual-key so the workflow can create a real video background. "
                 "Placeholder backgrounds are disabled."
             )
         ark_output = work_dir / "seedance.mp4"
         ark_result = generate_seedance_video(
-            api_key=args.ark_api_key,
-            base_url=args.ark_base_url,
+            api_key=ark_video_api_key,
+            base_url=ark_video_base_url,
             model=args.ark_model,
             prompt=visual_prompt,
             duration=int(max(4, min(math.ceil(estimated_duration), 15))),
@@ -3546,6 +3599,11 @@ def main() -> int:
         "visualPrompt": visual_prompt,
         "assetStrategy": effective_asset_strategy,
         "requestedAssetStrategy": args.asset_strategy,
+        "arkVideoGeneration": {
+            "authMode": ark_video_auth_mode,
+            "apiKeyConfigured": bool(ark_video_api_key),
+            "baseUrl": ark_video_base_url,
+        },
         "imageGeneration": {
             "apiKeyConfigured": bool(image_api_key),
             "baseUrl": clean_image_base_url(str(image_base_url or "")),
@@ -3564,7 +3622,7 @@ def main() -> int:
             background_video
             or background_image
             or background_url
-            or (effective_asset_strategy == "generated" and args.ark_api_key)
+            or (effective_asset_strategy == "generated" and ark_video_api_key)
             or (effective_asset_strategy == "generated_image" and image_api_key)
         ),
         "assetRoot": str(asset_root) if asset_root else None,

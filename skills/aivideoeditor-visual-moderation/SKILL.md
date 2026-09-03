@@ -59,7 +59,10 @@ The simulation rule is:
 
 For Aliyun provider review:
 
-- Aliyun video moderation credentials: `ALIBABA_CLOUD_ACCESS_KEY_ID` and `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
+- Choose exactly one credential mode:
+  - Direct Aliyun mode: `ALIBABA_CLOUD_ACCESS_KEY_ID` and `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
+  - Platform virtual Key mode: `ALIYUN_GREEN_VIRTUAL_KEY` and `ALIYUN_GREEN_VIRTUAL_RUNTIME_BASE_URL`
+- Virtual Key mode sends local videos to the platform proxy. The platform performs temporary OSS upload and Green CIP review with its stored upstream AK/SK; do not set the direct AK/SK in this mode.
 - One input target: `--video` or `--url`
 - Optional routing target: `--route-dir`
 - Optional runtime overrides only when the user explicitly wants them: `--region-id`, `--endpoint`, `--poll`, `--include-audio`, `--route-mode`
@@ -97,6 +100,15 @@ Set credentials through environment variables:
 $env:ALIBABA_CLOUD_ACCESS_KEY_ID = "..."
 $env:ALIBABA_CLOUD_ACCESS_KEY_SECRET = "..."
 ```
+
+Or use a platform-issued virtual Key:
+
+```powershell
+$env:ALIYUN_GREEN_VIRTUAL_KEY = "vk_..."
+$env:ALIYUN_GREEN_VIRTUAL_RUNTIME_BASE_URL = "https://<platform-host>/api/v1/api-key-distribution/runtime/aliyun-green"
+```
+
+The virtual Key and runtime address must be supplied together. Never store either one in task manifests, reports, or skill files.
 
 Run a local video review:
 

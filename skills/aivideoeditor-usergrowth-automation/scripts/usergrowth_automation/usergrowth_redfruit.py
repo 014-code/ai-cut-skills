@@ -108,8 +108,26 @@ _REDFRUIT_GENRE_ALIAS_LOOKUP = {
     for alias, target in REDFRUIT_GENRE_ALIASES.items()
 }
 
-REDFRUIT_DELIVERY_PRODUCTS = ["红果免费短剧(8662)"]
-REDFRUIT_DELIVERY_PLATFORMS = [
+# 录入素材弹窗固定投放配置。红果录入时一次性选择全部六个产品，
+# 仅保留头条内广，避免复用历史配置时带入其它平台。
+REDFRUIT_DELIVERY_PRODUCTS = [
+    "红果免费短剧(8662)",
+    "红果免费漫剧(8704)",
+    "蛋花免费小说(507427)",
+    "番茄免费小说(1967)",
+    "短剧端原生IAA(796433)",
+    "番茄畅听(3040)",
+]
+REDFRUIT_DELIVERY_PLATFORMS = ["头条内广"]
+
+# ARLP 按业务要求分三批执行。第一批的产品/平台也作为旧 checkpoint
+# 缺少 arlp_stages 时的兼容默认值。
+REDFRUIT_ARLP_PRODUCTS = [
+    "红果免费短剧(8662)",
+    "红果免费漫剧(8704)",
+    "番茄免费小说(1967)",
+]
+REDFRUIT_ARLP_PLATFORMS = [
     "广点通",
     "头条内广",
     "穿山甲联盟",
@@ -119,23 +137,21 @@ REDFRUIT_DELIVERY_PLATFORMS = [
     "UC浏览器",
     "sem",
 ]
-REDFRUIT_ARLP_PRODUCTS = ["红果免费漫剧(8704)", "番茄免费小说(1967)"]
-REDFRUIT_ARLP_PLATFORMS = list(REDFRUIT_DELIVERY_PLATFORMS)
 REDFRUIT_ARLP_STAGES = [
     {
-        "name": "红果漫剧/番茄小说",
+        "name": "红果短剧/红果漫剧/番茄小说",
         "products": list(REDFRUIT_ARLP_PRODUCTS),
         "platforms": list(REDFRUIT_ARLP_PLATFORMS),
-    },
-    {
-        "name": "短剧端原生IAA",
-        "products": ["短剧端原生IAA(796433)"],
-        "platforms": ["头条内广"],
     },
     {
         "name": "番茄畅听",
         "products": ["番茄畅听(3040)"],
         "platforms": ["广点通", "头条内广", "穿山甲联盟", "union_app", "sem"],
+    },
+    {
+        "name": "蛋花免费小说",
+        "products": ["蛋花免费小说(507427)"],
+        "platforms": ["union_app", "头条内广", "广点通", "穿山甲联盟"],
     },
 ]
 REDFRUIT_FIXED_CUSTOM_TAGS = [
@@ -173,14 +189,23 @@ REDFRUIT_PLAYLET_URL = "https://usergrowth.com.cn/aigc/insight/business/playlet?
 REDFRUIT_CONTENT_KINDS = ("动态漫", "仿真人", "纯短剧")
 
 
-def redfruit_content_kind(value: object) -> str:
-    """把文件名、工单名或短剧选剧剧名标签归一到三种红果剧目类型。"""
+def redfruit_content_kind(value: object, *, allow_bare_short_drama: bool = False) -> str:
+    """把红果剧目类型归一到动态漫、仿真人或纯短剧。
+
+    ``短剧`` 是裂变产物文件名中的公开类型，仅在解析文件名时接受；
+    普通工单或平台标签不会因此绕过纯短剧前置校验。
+    """
     compact = _normalise_key(value)
     if not compact:
         return ""
     if "仿真人" in compact or any(_normalise_key(label) in compact for label in REDFRUIT_REAL_PERSON_TITLE_LABELS):
         return "仿真人"
-    if "纯短剧" in compact or "真人实拍" in compact or "真人剧" in compact:
+    if (
+        "纯短剧" in compact
+        or "真人实拍" in compact
+        or "真人剧" in compact
+        or (allow_bare_short_drama and _has_bare_short_drama_token(value))
+    ):
         return "纯短剧"
     if (
         "动态漫" in compact
@@ -192,14 +217,20 @@ def redfruit_content_kind(value: object) -> str:
     return ""
 
 
-def require_redfruit_content_kind(value: object, *, source: str = "红果剧目类型") -> str:
+def require_redfruit_content_kind(
+    value: object,
+    *,
+    source: str = "红果剧目类型",
+    allow_bare_short_drama: bool = False,
+) -> str:
     """归一化并校验红果剧目类型，防止未知类型静默落到动态漫分支。"""
-    drama_type = redfruit_content_kind(value)
+    drama_type = redfruit_content_kind(value, allow_bare_short_drama=allow_bare_short_drama)
     if drama_type:
         return drama_type
-    raise ValueError(
-        f"{source}未识别到明确类型，必须包含动态漫、仿真人或纯短剧（真人剧/真人实拍短剧）之一。"
-    )
+    supported_types = "动态漫、仿真人或纯短剧（真人剧/真人实拍短剧）"
+    if allow_bare_short_drama:
+        supported_types += "；文件名中的短剧视为纯短剧"
+    raise ValueError(f"{source}未识别到明确类型，必须包含{supported_types}之一。")
 
 
 def redfruit_order_kind(value: object) -> str:
@@ -210,7 +241,9 @@ def redfruit_order_kind(value: object) -> str:
 def redfruit_expected_order_kind(file_name: object, *, drama_type: object = "", material_mode: object = "") -> str:
     """根据文件名上的剧目类型判断应使用哪类工单；素材类型不参与前置工单校验。"""
     _ = material_mode
-    return redfruit_content_kind(drama_type or file_name)
+    if drama_type:
+        return redfruit_content_kind(drama_type)
+    return redfruit_content_kind(file_name, allow_bare_short_drama=True)
 
 
 def redfruit_extract_order_title(body_text: str, order_id: str) -> str:
@@ -381,14 +414,25 @@ def build_redfruit_metadata(
         material_mode_override: str = "",
         ai_custom_tag: str = "创意AI素材",
         extra_custom_tags: list[str] | None = None,
+        source_cid: str = "",
+        source_category_tag_ids: list[str] | None = None,
+        source_category_tag_names: list[str] | None = None,
 ) -> dict[str, Any]:
     file_name = path.name
     stem = Path(file_name).stem
-    drama_type = require_redfruit_content_kind(file_name, source=f"文件【{file_name}】")
+    drama_type = require_redfruit_content_kind(
+        file_name,
+        source=f"文件【{file_name}】",
+        allow_bare_short_drama=True,
+    )
     material_mode = _normalise_redfruit_material_mode_override(material_mode_override) or redfruit_material_mode(file_name)
     title = redfruit_drama_title(file_name)
     bid = redfruit_bid(file_name) or _lookup_redfruit_bid(title, file_name, bid_map)
-    layout = _normalise_redfruit_layout_override(layout_override) or redfruit_layout_label(path)
+    source_layout = _source_layout_from_category_tags(source_category_tag_names)
+    layout = _normalise_redfruit_layout_override(layout_override) or redfruit_layout_label(
+        path,
+        source_layout=source_layout,
+    )
     genre_path = redfruit_genre_path(file_name, default_genre=default_genre)
     genre = genre_path[-1] if genre_path else REDFRUIT_GENRE_OTHER
     genre_group = genre_path[1] if len(genre_path) > 2 else REDFRUIT_GENRE_OTHER
@@ -404,7 +448,8 @@ def build_redfruit_metadata(
         ["有无短剧剧名", has_title_label],
         ["小说/短剧审核分流", "【测试】无logo纯短剧"],
     ]
-    post_review_classification_paths = redfruit_post_review_classification_paths(drama_type)
+    # 所有红果分类字段在录入弹窗一次性填写；不存在独立的送审后分类阶段。
+    classification_paths.extend(_redfruit_entry_classification_paths(drama_type))
     custom_tags = redfruit_custom_tags(
         file_name,
         bid=bid,
@@ -412,7 +457,7 @@ def build_redfruit_metadata(
         ai_custom_tag=ai_custom_tag,
         extra_tags=extra_custom_tags,
     )
-    return {
+    metadata = {
         "workflow": WORKFLOW_REDFRUIT_SHORT_DRAMA,
         "drama_title": title,
         "drama_type": drama_type,
@@ -424,7 +469,6 @@ def build_redfruit_metadata(
         "genre_path": genre_path,
         "has_drama_title": has_title_label,
         "classification_paths": classification_paths,
-        "post_review_classification_paths": post_review_classification_paths,
         "custom_tags": custom_tags,
         "delivery_products": list(REDFRUIT_DELIVERY_PRODUCTS),
         "delivery_platforms": list(REDFRUIT_DELIVERY_PLATFORMS),
@@ -435,6 +479,131 @@ def build_redfruit_metadata(
         "arlp_stages": default_arlp_stages(WORKFLOW_REDFRUIT_SHORT_DRAMA),
         "warnings": redfruit_warnings(title=title, bid=bid, genre_path=genre_path),
     }
+    return _apply_source_category_tags(
+        metadata,
+        source_cid=source_cid,
+        source_category_tag_ids=source_category_tag_ids,
+        source_category_tag_names=source_category_tag_names,
+    )
+
+
+def _normalise_category_tags(values: object) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _category_tag_choice(tags: list[str], candidates: tuple[str, ...]) -> str:
+    normalised = {_normalise_key(tag) for tag in tags}
+    return next((candidate for candidate in candidates if _normalise_key(candidate) in normalised), "")
+
+
+def _replace_category_path(
+    paths: list[list[str]],
+    root: str,
+    replacement: list[str],
+) -> list[list[str]]:
+    return [list(replacement) if path and path[0] == root else list(path) for path in paths]
+
+
+def _apply_source_category_tags(
+    metadata: dict[str, Any],
+    *,
+    source_cid: str,
+    source_category_tag_ids: list[str] | None,
+    source_category_tag_names: list[str] | None,
+) -> dict[str, Any]:
+    """复用来源流量素材中安全且无歧义的分类叶子。
+
+    UserGrowth 素材列表接口返回的是扁平叶子标签，而不是级联父级。
+    下面的映射只填充可以稳定一一对应的字段；未知或有歧义的值继续使用
+    原有红果规则，避免把扁平标签伪造为分类路径提交。
+    """
+    tags = _normalise_category_tags(source_category_tag_names)
+    metadata["source_cid"] = str(source_cid or "").strip()
+    metadata["source_category_tag_ids"] = _normalise_category_tags(source_category_tag_ids)
+    metadata["source_category_tag_names"] = tags
+    if not tags:
+        return metadata
+
+    classification_paths = [list(path) for path in metadata.get("classification_paths", []) if path]
+    inherited_paths: list[list[str]] = []
+
+    layout = _category_tag_choice(tags, ("横版-纯横版", "竖版-纯竖版", "竖版-横改竖"))
+    if layout:
+        # `build_redfruit_metadata` 可能依据来源方向和产物尺寸识别出横改竖/竖改横，
+        # 不要用来源素材的原始版式覆盖已经识别出的改版结果。
+        current_layout = str(metadata.get("layout") or "")
+        effective_layout = (
+            current_layout
+            if current_layout in {"竖版-横改竖", "横版-竖改横"}
+            else layout
+        )
+        path = ["番茄/红果小说素材版式", "视频版式", effective_layout]
+        classification_paths = _replace_category_path(classification_paths, path[0], path)
+        metadata["layout"] = effective_layout
+        inherited_paths.append(path)
+
+    source_material_type = _category_tag_choice(
+        tags,
+        ("AI前贴/后贴", "纯原片剪辑", "原片剪辑", "常规剪辑"),
+    )
+    if source_material_type == "AI前贴/后贴":
+        path = ["番茄/红果小说素材类型", "信息流素材类型", "AI素材", source_material_type]
+        classification_paths = _replace_category_path(classification_paths, path[0], path)
+        inherited_paths.append(path)
+    elif source_material_type in {"纯原片剪辑", "原片剪辑", "常规剪辑"}:
+        path = ["番茄/红果小说素材类型", "信息流素材类型", "纯原片剪辑"]
+        classification_paths = _replace_category_path(classification_paths, path[0], path)
+        inherited_paths.append(path)
+
+    for root, leaves in (
+        ("IOS/非IOS", ("短剧通用素材",)),
+        ("尺度素材", ("无尺度",)),
+        ("有无短剧剧名", ("原剧名素材", "无剧名素材")),
+        ("小说/短剧审核分流", ("【测试】无logo纯短剧",)),
+    ):
+        leaf = _category_tag_choice(tags, leaves)
+        if leaf:
+            path = [root, leaf]
+            classification_paths = _replace_category_path(classification_paths, root, path)
+            inherited_paths.append(path)
+
+    for tag in tags:
+        genre_path = redfruit_genre_path(tag, default_genre="")
+        if genre_path and (genre_path[-1] != REDFRUIT_GENRE_OTHER or _normalise_key(tag) in {_normalise_key(REDFRUIT_GENRE_OTHER), _normalise_key("其他")}):
+            classification_paths = _replace_category_path(classification_paths, REDFRUIT_GENRE_ROOT, genre_path)
+            metadata["genre_path"] = genre_path
+            metadata["genre"] = genre_path[-1]
+            metadata["genre_group"] = genre_path[1] if len(genre_path) > 2 else REDFRUIT_GENRE_OTHER
+            inherited_paths.append(genre_path)
+            break
+
+    entry_leaf_mappings = (
+        ("番茄畅听素材类型", ("常规剪辑",), "常规剪辑"),
+        ("番茄畅听IOS/非IOS", ("短剧通用素材", "通用素材"), "通用素材"),
+        ("有无logo", ("无logo以及其他的产品信息", "无logo动态漫"), "无logo以及其他的产品信息"),
+        ("自动过审", ("自动过审",), "自动过审"),
+        ("是否为AI素材", ("AI素材", "非AI素材"), ""),
+        # 流量素材标签可能包含历史叶子“纯原片剪辑”，这里只作为判断信号。
+        ("免费短剧-素材剪辑形式", ("纯原片剪辑", "原片剪辑"), "原片剪辑"),
+        ("有无歌曲名露出(非音乐类素材不要打)", ("非歌曲方向素材",), "非歌曲方向素材"),
+        ("小程序系产品-内容体裁", ("短剧", "漫剧"), ""),
+    )
+    for root, candidates, default_leaf in entry_leaf_mappings:
+        leaf = _category_tag_choice(tags, candidates)
+        if not leaf:
+            continue
+        path = next((current for current in classification_paths if current and current[0] == root), [root])
+        final_leaf = default_leaf or leaf
+        path = [*path[:-1], final_leaf]
+        classification_paths = _replace_category_path(classification_paths, root, path)
+        inherited_paths.append(path)
+
+    metadata["classification_paths"] = classification_paths
+    metadata["inherited_source_classification_paths"] = inherited_paths
+    metadata["classification_tag_source"] = "traffic_material"
+    return metadata
 
 
 def redfruit_warnings(*, title: str, bid: str, genre_path: list[str] | None = None) -> list[str]:
@@ -449,7 +618,7 @@ def redfruit_warnings(*, title: str, bid: str, genre_path: list[str] | None = No
 
 
 def redfruit_drama_type(file_name: str) -> str:
-    return redfruit_content_kind(file_name)
+    return redfruit_content_kind(file_name, allow_bare_short_drama=True)
 
 
 def redfruit_drama_title(file_name: str) -> str:
@@ -493,7 +662,38 @@ def redfruit_material_mode(file_name: str) -> str:
     return "原片"
 
 
-def redfruit_layout_label(path: Path) -> str:
+def _layout_orientation(value: object) -> str:
+    """返回版式的最终方向：``horizontal``、``vertical`` 或空。"""
+    text = _compact(value)
+    if "横改竖" in text:
+        return "vertical"
+    if "竖改横" in text:
+        return "horizontal"
+    if "横版" in text or "横板" in text:
+        return "horizontal"
+    if "竖版" in text or "竖板" in text:
+        return "vertical"
+    return ""
+
+
+def _source_layout_from_category_tags(values: object) -> str:
+    """从来源素材分类标签中提取可比较的原始横竖版式。"""
+    if not isinstance(values, (list, tuple, set)):
+        return ""
+    for value in values:
+        orientation = _layout_orientation(value)
+        if orientation:
+            return str(value).strip()
+    return ""
+
+
+def redfruit_layout_label(path: Path, source_layout: str = "") -> str:
+    """识别红果分类版式，支持尺寸判断和横竖改版判断。
+
+    文件名中的明确改版标识优先；没有标识时读取视频真实宽高。若同时
+    提供来源素材版式，且当前输出方向相反，则返回平台的“横改竖/竖改横”
+    选项。读取不到尺寸时不猜测改版，回退到原有的竖版默认值。
+    """
     text = _compact(path.name)
     if "横改竖" in text:
         return "竖版-横改竖"
@@ -510,7 +710,14 @@ def redfruit_layout_label(path: Path) -> str:
 
     width, height = _probe_video_dimensions(path)
     if width and height:
-        return "横版-纯横版" if width >= height else "竖版-纯竖版"
+        current_orientation = "horizontal" if width >= height else "vertical"
+        source_orientation = _layout_orientation(source_layout)
+        if source_orientation and source_orientation != current_orientation:
+            if source_orientation == "horizontal" and current_orientation == "vertical":
+                return "竖版-横改竖"
+            if source_orientation == "vertical" and current_orientation == "horizontal":
+                return "横版-竖改横"
+        return "横版-纯横版" if current_orientation == "horizontal" else "竖版-纯竖版"
     return "竖版-纯竖版"
 
 
@@ -545,7 +752,7 @@ def redfruit_feature_path(drama_type: str, material_mode: str) -> list[str]:
     ]
 
 
-def redfruit_post_review_classification_paths(drama_type: str) -> list[list[str]]:
+def _redfruit_entry_classification_paths(drama_type: str) -> list[list[str]]:
     normalized_type = require_redfruit_content_kind(drama_type)
     ai_label = "非AI素材" if normalized_type == "纯短剧" else "AI素材"
     content_form = "短剧" if normalized_type == "纯短剧" else "漫剧"
@@ -572,7 +779,7 @@ def redfruit_post_review_classification_paths(drama_type: str) -> list[list[str]
 def redfruit_material_type_path(material_mode: str) -> list[str]:
     if material_mode in {"AI前贴", "AI后贴"}:
         return ["番茄/红果小说素材类型", "信息流素材类型", "AI素材", "AI前贴/后贴"]
-    return ["番茄/红果小说素材类型", "剪辑制作", "常规剪辑"]
+    return ["番茄/红果小说素材类型", "信息流素材类型", "纯原片剪辑"]
 
 
 def redfruit_genre(file_name: str, *, default_genre: str = REDFRUIT_DEFAULT_GENRE) -> str:
@@ -732,7 +939,13 @@ def _split_name_parts_preserving_punctuation(file_name: str) -> list[str]:
 
 
 def _looks_like_redfruit_type(value: str) -> bool:
-    return any(token in value for token in ("动态漫", "仿真人", "漫剧", "纯短剧", "真人实拍", "真人剧"))
+    return any(token in value for token in ("动态漫", "仿真人", "漫剧", "纯短剧", "真人实拍", "真人剧", "短剧"))
+
+
+def _has_bare_short_drama_token(value: object) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    tokens = re.split(r"[\s_\-－—–/、（）()]+", normalized)
+    return any(token.strip() == "短剧" for token in tokens)
 
 
 def _compact(value: object) -> str:
@@ -771,7 +984,6 @@ def redfruit_batch_signature(
         meta.get("layout", ""),
         " > ".join(meta.get("genre_path", [])),
         " / ".join(" > ".join(path) for path in meta.get("classification_paths", [])),
-        " / ".join(" > ".join(path) for path in meta.get("post_review_classification_paths", [])),
         "、".join(meta.get("custom_tags", [])),
         json.dumps(meta.get("arlp_stages", []), ensure_ascii=False, sort_keys=True),
     ]
@@ -855,13 +1067,32 @@ def _probe_video_dimensions(path: Path) -> tuple[int, int]:
             timeout=8,
         )
     except Exception:
-        return 0, 0
-    if proc.returncode != 0:
-        return 0, 0
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        try:
+            payload = json.loads(proc.stdout or "{}")
+            stream = next(iter(payload.get("streams") or []), {})
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            if width and height:
+                return width, height
+        except Exception:
+            pass
+
+    # Windows 开发环境可能没有把 ffprobe 放进 PATH；OpenCV 作为可选
+    # 兜底只读取容器元数据，不解码整段视频，避免版式识别退回固定竖版。
     try:
-        payload = json.loads(proc.stdout or "{}")
-        stream = next(iter(payload.get("streams") or []), {})
-        return int(stream.get("width") or 0), int(stream.get("height") or 0)
+        import cv2
+
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if not capture.isOpened():
+                return 0, 0
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            return width, height
+        finally:
+            capture.release()
     except Exception:
         return 0, 0
 
