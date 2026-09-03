@@ -940,7 +940,12 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         validate_no_symlink_paths(repo_root, tracked + untracked)
         check_parent, check_worktree = create_check_worktree(repo_root, "HEAD", pathspecs, untracked)
         try:
-            checks = run_checks(check_worktree, config, changed_paths=tracked + untracked)
+            checks = run_checks(
+                check_worktree,
+                config,
+                changed_paths=tracked + untracked,
+                read_only=True,
+            )
             validate_preflight_result(tracked + untracked, checks)
         finally:
             remove_worktree(repo_root, check_worktree, check_parent)
