@@ -25,6 +25,17 @@ class SubmitPrHelpersTests(unittest.TestCase):
         with self.assertRaises(MODULE.ReleaseError):
             MODULE.build_branch_name("014-code", "fix", "../main", "20260903")
 
+    def test_rejects_multiline_summary(self) -> None:
+        with self.assertRaisesRegex(MODULE.ReleaseError, "摘要不能包含换行"):
+            MODULE.validate_summary("update skill\nwith extra instructions")
+
+    def test_rejects_summary_with_credential_assignment(self) -> None:
+        with self.assertRaisesRegex(MODULE.ReleaseError, "疑似包含凭据"):
+            MODULE.validate_summary("upload token=ghp_example_secret")
+
+    def test_accepts_normal_summary(self) -> None:
+        self.assertEqual(MODULE.validate_summary("harden automated PR release"), "harden automated PR release")
+
     def test_path_allowlist_is_directory_aware(self) -> None:
         allowed = ["skills/demo", "tests/test_demo.py"]
         self.assertTrue(MODULE.path_is_allowed("skills/demo/scripts/run.py", allowed))

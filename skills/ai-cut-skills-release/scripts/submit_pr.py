@@ -32,6 +32,12 @@ SENSITIVE_ENV_MARKERS = (
     "PRIVATE_KEY",
     "AUTH",
 )
+SUMMARY_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?:token|password|passwd|pwd|secret|credential|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+"
+)
+SUMMARY_SECRET_PREFIX = re.compile(
+    r"(?i)(?:ghp_[A-Za-z0-9_\-]{20,}|github_pat_[A-Za-z0-9_\-]{20,}|glpat-[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9_\-]{20,})"
+)
 EXCLUDED_NAMES = {
     ".DS_Store",
     ".idea",
@@ -154,6 +160,18 @@ def validate_date(value: str) -> str:
     except ValueError as exc:
         raise ReleaseError("日期必须是 YYYYMMDD") from exc
     return parsed.strftime("%Y%m%d")
+
+
+def validate_summary(value: str) -> str:
+    """Keep user-controlled commit and PR text safe for public history."""
+    summary = value.strip()
+    if not summary:
+        raise ReleaseError("摘要不能为空")
+    if "\r" in summary or "\n" in summary:
+        raise ReleaseError("摘要不能包含换行")
+    if SUMMARY_SECRET_ASSIGNMENT.search(summary) or SUMMARY_SECRET_PREFIX.search(summary):
+        raise ReleaseError("摘要疑似包含凭据或密钥，已拒绝写入 commit/PR")
+    return summary
 
 
 def build_branch_name(group: str, change_type: str, scope: str, date: str) -> str:
@@ -1066,7 +1084,7 @@ def parse_args(argv: list[str] | None = None) -> ReleaseConfig:
         includes=includes,
         group=validate_segment(args.group, "组别"),
         change_type=args.change_type,
-        summary=args.summary.strip(),
+        summary=validate_summary(args.summary),
         scope=validate_segment(scope, "作用域"),
         date=validate_date(args.date),
         base_remote=args.base_remote,
