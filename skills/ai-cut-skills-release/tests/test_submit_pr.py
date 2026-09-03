@@ -81,6 +81,16 @@ class SubmitPrHelpersTests(unittest.TestCase):
             ],
         )
 
+    def test_verifies_existing_base_without_fetching(self) -> None:
+        with patch.object(MODULE, "run_command", return_value="upstream/main") as run:
+            result = MODULE.verify_existing_base_ref(Path("."), "upstream", "main")
+
+        self.assertEqual(result, "upstream/main")
+        run.assert_called_once_with(
+            ["git", "rev-parse", "--verify", "upstream/main"],
+            Path("."),
+        )
+
     def test_preflight_rejects_empty_changes(self) -> None:
         with self.assertRaisesRegex(MODULE.ReleaseError, "没有可提交的变更"):
             MODULE.validate_preflight_result([], {"ok": True, "checks": []})

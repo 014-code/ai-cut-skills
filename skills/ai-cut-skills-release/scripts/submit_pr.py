@@ -624,6 +624,13 @@ def refresh_base_ref(repo_root: Path, remote: str, branch: str) -> str:
     return base_ref
 
 
+def verify_existing_base_ref(repo_root: Path, remote: str, branch: str) -> str:
+    """Use an existing local baseline without mutating Git refs."""
+    base_ref = f"{remote}/{branch}"
+    run_command(["git", "rev-parse", "--verify", base_ref], repo_root)
+    return base_ref
+
+
 def refresh_remote_branch_ref(repo_root: Path, remote: str, branch: str) -> str:
     """Fetch an existing managed branch and return its verified current SHA."""
     tracking_ref = f"refs/remotes/{remote}/{branch}"
@@ -1061,7 +1068,9 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     base_ref = f"{config.base_remote}/{config.base_branch}"
 
     if not config.execute:
-        base_ref = refresh_base_ref(repo_root, config.base_remote, config.base_branch)
+        # Plan mode is strictly read-only: do not fetch or rewrite remote-
+        # tracking refs. Execute mode refreshes the baseline explicitly.
+        base_ref = verify_existing_base_ref(repo_root, config.base_remote, config.base_branch)
         tracked, untracked, local_commit_base_ref = list_release_changed_paths(
             repo_root,
             base_ref,
