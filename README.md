@@ -36,10 +36,12 @@
 ### 5. 衍生加工
 
 - `aivideoeditor-video-fission`：本地视频裂变与素材重混，支持抽帧变体、前贴排列组合、文件夹组合和音视频配对输出。
+- `aivideoeditor-video-compression`：独立视频压缩与转码，支持质量优先的编码选择、体积限制、报告输出和压缩后校验。
 
 ### 6. 分发自动化
 
 - `aivideoeditor-usergrowth-automation`：UserGrowth 桌面自动上传，支持歌曲库匹配、Excel/CID 回填、素材标签、送审和诊断产物。
+- `aivideoeditor-soda-music-upload`：汽水音乐 UserGrowth 上传、录入变色龙、送审、CID 回收和任务证据记录；不包含番茄打标或红果短剧流程。
 
 ## 能力链路
 
@@ -114,7 +116,9 @@ python3 scripts/sync_skills.py --route "跑一个短剧从下载审核到包装�
     ├── edit-soda-music-video/
     ├── edit-short-drama-packaging/
     ├── aivideoeditor-video-fission/
-    └── aivideoeditor-usergrowth-automation/
+    ├── aivideoeditor-video-compression/
+    ├── aivideoeditor-usergrowth-automation/
+    └── aivideoeditor-soda-music-upload/
 ```
 
 ## 安装与同步

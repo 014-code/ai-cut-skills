@@ -86,7 +86,7 @@ On failure after a task folder is created, read `<output-root>/<timestamp>_<task
 
 ## Resume
 
-Live Soda Music and Redfruit runs write `task.json` plus a workflow checkpoint incrementally (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`). The checkpoint is per order, so concurrent batches do not overwrite each other. Soda stages include `pending`, `upload_processing`, `upload_task_created`, `upload_success`, `review_submitted`, `cid_backfilling`, `cid_backfilled_unreviewed`, and `completed`; Redfruit adds its ARLP/classification stages. During `upload_processing`, each duplicate-upload recovery and row-scoped `点击重试` action is persisted, so a resume does not blindly repeat already-handled upload rows. If `upload_processing` already contains an upload task ID, both workflows resume from that task and skip the file-upload stage; Soda does not run Redfruit's post-review classification stage.
+Live Soda Music and Redfruit runs write `task.json` plus a workflow checkpoint incrementally (`soda_music_checkpoint.json` or `redfruit_checkpoint.json`). The checkpoint is per order, so concurrent batches do not overwrite each other. Soda stages include `pending`, `upload_processing`, `upload_task_created`, `upload_success`, `review_submitted`, `cid_backfilling`, `cid_backfilled_unreviewed`, and `completed`; Redfruit uses `upload_success`, `cid_backfilling`, and its ARLP stages without review. During `upload_processing`, each duplicate-upload recovery and row-scoped `点击重试` action is persisted, so a resume does not blindly repeat already-handled upload rows. If `upload_processing` already contains an upload task ID, both workflows resume from that task and skip the file-upload stage.
 
 After an interruption, resume from the task folder, `task.json`, or `redfruit_checkpoint.json`:
 
@@ -100,9 +100,7 @@ python C:\Users\Donson\.codex\skills\aivideoeditor-usergrowth-automation\scripts
 
 Resume supports `soda_music` and `redfruit_short_drama`. Credentials are read again from CLI arguments or environment variables and are never stored in the checkpoint. A `completed` or `cid_backfilled_unreviewed` checkpoint returns the saved result without opening a browser; earlier stages are resumed from their saved task IDs and item metadata.
 
-For Redfruit, when the checkpoint already contains a unique CID for every active material and the stage is `review_submitted`, `arlp_submitting`, `arlp_success`, or `classification_submitting`, resume skips the historical upload/review task and goes directly to `墨攻AI -> 素材管理`. It searches the batch CIDs (space-separated), verifies that the result count covers the batch, then continues from `arlp_stage_index` through the remaining three-stage ARLP configurations and `修改分类标签`. `arlp_stage_progress` is authoritative for the current configuration: a saved task ID in `task_created`, `waiting_result`, or `partial_failure` is reopened and polled instead of creating another ARLP task; a `selection_started`, `modal_open`, or `submitting` checkpoint safely replays only the current ARLP configuration. Completed stage task IDs are retained in `arlp_stage_task_ids` and cannot advance the index twice. It must not wait for an old upload task in this case.
-
-For checkpoints created before the three-stage ARLP upgrade, `stage=arlp_success` or `classification_submitting` with no stage index is migrated as historical stage 1 complete (`arlp_stage_index=1`). Resume starts at `短剧端原生IAA`, then runs `番茄畅听`, instead of repeating stage 1 or skipping the two new stages. Checkpoints without `arlp_stage_progress` or `classification_progress` remain valid and use empty defaults.
+For Redfruit, when the checkpoint already contains a unique CID for every active material and the stage is `upload_success`, `cid_backfilling`, `arlp_submitting`, `arlp_verifying`, or `arlp_success`, resume goes directly to `墨攻AI -> 素材管理`. It searches the batch CIDs (space-separated), verifies that the result count covers the batch, then continues from `arlp_stage_index` through the remaining three ARLP configurations and marks the order complete. `arlp_stage_progress` is authoritative for the current configuration: a saved task ID in `task_created`, `waiting_result`, or `partial_failure` is reopened and polled instead of creating another ARLP task; a `selection_started`, `modal_open`, or `submitting` checkpoint safely replays only the current ARLP configuration. Completed stage task IDs are retained in `arlp_stage_task_ids` and cannot advance the index twice.
 
 For Redfruit `upload_processing` checkpoints without a task ID, resume never falls back to file upload. It only uses saved original creative-unit IDs to enter `工单管理 -> 创意单元 -> 录入素材`; if those IDs are missing, it stops with a checkpoint error instead of risking a duplicate upload.
 
@@ -244,7 +242,7 @@ In the desktop app, the automatic song splitter produces the same shape conceptu
 
 ## Live Upload
 
-Live upload writes successful orders directly back to the original backfill Excel and submits review on UserGrowth. Only run live after explicit user confirmation:
+Live Soda Music upload writes successful orders directly back to the original backfill Excel and submits review on UserGrowth. Redfruit live upload reads CID from the successful upload task detail and proceeds to ARLP without review. Only run live after explicit user confirmation:
 
 ```powershell
 $env:USERGROWTH_ACCOUNT = '<account>'
@@ -295,7 +293,7 @@ Manifest equivalents are `redfruit_layout_override`, `redfruit_material_mode_ove
 
 ## Existing Creative Unit Recovery
 
-When the platform reports that a file was uploaded before and provides the original creative-unit IDs, run direct recovery with repeated `--existing-creative-unit-id`. This path searches the order's creative-unit list, selects the IDs across pages, and continues through 录入素材, review, ARLP, and redfruit post-review classification. It does not upload source files or create new creative units.
+When the platform reports that a file was uploaded before and provides the original creative-unit IDs, run direct recovery with repeated `--existing-creative-unit-id`. This path searches the order's creative-unit list, selects the IDs across pages, and continues through 录入素材, upload-task CID extraction, and ARLP for Redfruit (or review/CID for Soda). It does not upload source files or create new creative units.
 
 This mode is redfruit-only and requires `--live --confirm-live`. Pass the batch metadata explicitly. `--existing-creative-unit-drama-type` is mandatory and must be `动态漫`, `仿真人`, or `纯短剧`; `真人剧` and `真人实拍短剧` normalize to `纯短剧`:
 

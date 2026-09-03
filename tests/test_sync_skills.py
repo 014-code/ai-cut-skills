@@ -22,7 +22,7 @@ class CatalogTests(unittest.TestCase):
         catalog = sync_skills.load_catalog(REPO_ROOT / "skill-catalog.yaml")
         sync_skills.validate_catalog(catalog, REPO_ROOT / "skills")
         self.assertEqual(len(catalog["categories"]), 6)
-        self.assertEqual(len(catalog["skills"]), 13)
+        self.assertEqual(len(catalog["skills"]), 15)
 
     def test_optional_routing_metadata_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -265,6 +265,7 @@ def _build_payload(
             "output_root": str(config.output_root),
             "order_id": config.order_id,
             "task_name": config.task_name,
+            "single_plan": config.single_plan,
             "delivery_products": list(config.delivery_products),
             "delivery_platforms": list(config.delivery_platforms),
             "delivery_platform_all": config.delivery_platform_all,

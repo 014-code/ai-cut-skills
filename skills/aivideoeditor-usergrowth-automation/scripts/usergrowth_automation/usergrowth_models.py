@@ -29,7 +29,6 @@ class UserGrowthVideoItem:
     custom_tags: list[str] = field(default_factory=list)
     classification_path: list[str] = field(default_factory=list)
     classification_paths: list[list[str]] = field(default_factory=list)
-    post_review_classification_paths: list[list[str]] = field(default_factory=list)
     optional_tags: list[str] = field(default_factory=list)
     workflow_metadata: dict[str, Any] = field(default_factory=dict)
     blocked: bool = False
@@ -52,7 +51,6 @@ class UserGrowthVideoItem:
             "custom_tags": self.custom_tags,
             "classification_path": self.classification_path,
             "classification_paths": self.classification_paths,
-            "post_review_classification_paths": self.post_review_classification_paths,
             "optional_tags": self.optional_tags,
             "workflow_metadata": self.workflow_metadata,
             "blocked": self.blocked,
@@ -101,8 +99,6 @@ class UserGrowthOrderPlan:
     arlp_stage_index: int = 0
     arlp_stage_task_ids: list[str] = field(default_factory=list)
     arlp_stage_progress: list[dict[str, Any]] = field(default_factory=list)
-    classification_task_id: str = ""
-    classification_progress: dict[str, Any] = field(default_factory=dict)
     operation_retry_counts: dict[str, int] = field(default_factory=dict)
     stage: str = "pending"
     checkpoint_message: str = ""
@@ -121,8 +117,6 @@ class UserGrowthOrderPlan:
             "arlp_stage_index": self.arlp_stage_index,
             "arlp_stage_task_ids": self.arlp_stage_task_ids,
             "arlp_stage_progress": self.arlp_stage_progress,
-            "classification_task_id": self.classification_task_id,
-            "classification_progress": self.classification_progress,
             "operation_retry_counts": self.operation_retry_counts,
             "stage": self.stage,
             "checkpoint_message": self.checkpoint_message,
@@ -148,6 +142,9 @@ class UserGrowthRunConfig:
     batch_name: str = ""
     selected_video_paths: list[Path] = field(default_factory=list)
     workflow: str = "soda_music"
+    # 平台集成可以请求按工单生成一个计划，让所有选中文件共用一个 UserGrowth
+    # 上传任务。独立 CLI 流程默认保留原有的元数据分组行为。
+    single_plan: bool = False
     delivery_products: list[str] = field(default_factory=list)
     delivery_platforms: list[str] = field(default_factory=list)
     delivery_platform_all: bool | None = None
@@ -160,6 +157,11 @@ class UserGrowthRunConfig:
     redfruit_material_mode_override: str = ""
     redfruit_ai_custom_tag: str = "创意AI素材"
     redfruit_extra_custom_tags: list[str] = field(default_factory=list)
+    # 平台集成提供的单个产物来源元数据。这里按文件名索引，因为执行器最终上传
+    # 的是文件路径，CID 只作为审计元数据，不作为浏览器输入。
+    redfruit_source_categories_by_file: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 平台预检编辑，按暂存产物文件名索引。
+    redfruit_plan_overrides_by_file: dict[str, dict[str, Any]] = field(default_factory=dict)
     existing_creative_unit_title: str = ""
     existing_creative_unit_drama_type: str = ""
     existing_creative_unit_bid: str = ""

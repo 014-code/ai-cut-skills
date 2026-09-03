@@ -81,6 +81,16 @@ def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
     args = parse_args(argv)
     cli_error_output_root: Path | None = None
+
+    def emit_progress(message: str) -> None:
+        # The platform runner may be cancelled/restarted while the browser
+        # process is still unwinding. A closed stdout pipe must not turn a
+        # completed UserGrowth task into a failed checkpoint.
+        try:
+            print(message, flush=True)
+        except BrokenPipeError:
+            return
+
     try:
         manifest_path = Path(args.manifest).resolve() if args.manifest else None
         manifest = _read_manifest(manifest_path)
@@ -90,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_resumed_usergrowth_task(
                 args,
                 Path(args.resume_task).resolve(),
-                progress=lambda message: print(message, flush=True),
+                progress=emit_progress,
             )
             print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
             return 1 if payload.get("summary", {}).get("failed") else 0
@@ -100,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
                 args,
                 manifest,
                 base_dir,
-                progress=lambda message: print(message, flush=True),
+                progress=emit_progress,
             )
             print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
             summary = payload.get("summary", {})
@@ -119,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_existing_creative_units_task(
                 config,
                 existing_unit_ids,
-                progress=lambda message: print(message, flush=True),
+                progress=emit_progress,
             )
             print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
             return 1 if payload.get("summary", {}).get("failed") else 0
@@ -148,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_dir,
                 config,
                 video_paths,
-                progress=lambda message: print(message, flush=True),
+                progress=emit_progress,
             )
             print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
             summary = payload.get("summary", {})
@@ -161,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = run_selected_usergrowth_task(
             config,
             video_paths,
-            progress=lambda message: print(message, flush=True),
+            progress=emit_progress,
         )
         print(json.dumps(_public_payload(payload), ensure_ascii=False, indent=2), flush=True)
         return 0
@@ -219,12 +229,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write the validated Playwright storage state to this runtime-only JSON path.",
     )
     parser.add_argument("--workflow", help="Workflow name such as soda_music or redfruit_short_drama.")
+    parser.add_argument(
+        "--single-plan",
+        action="store_true",
+        help="Platform integration mode: keep all selected files for one order in one upload plan.",
+    )
     parser.add_argument("--redfruit-default-genre", help="Default redfruit genre used when file names do not specify one.")
     parser.add_argument("--redfruit-bid-map", help="JSON string mapping drama titles to bid_... values.")
     parser.add_argument("--redfruit-layout-override", help="Force redfruit layout label, e.g. 竖版-横改竖.")
     parser.add_argument("--redfruit-material-mode-override", help="Force redfruit material mode, e.g. AI前贴 or 原片.")
     parser.add_argument("--redfruit-ai-custom-tag", help="AI redfruit custom tag used for AI前贴/后贴 materials.")
     parser.add_argument("--redfruit-extra-custom-tag", action="append", default=[], help="Extra redfruit custom tag. Can be repeated.")
+    parser.add_argument(
+        "--redfruit-source-category-manifest",
+        help="JSON mapping output file names to inherited traffic-material category tags.",
+    )
+    parser.add_argument(
+        "--redfruit-plan-overrides",
+        help="JSON mapping output file names to manually edited classification/tag plans.",
+    )
     parser.add_argument("--split-by-song", action="store_true", help="Auto-split selected videos into one batch per song before running.")
     parser.add_argument("--concurrency", type=int, default=None, help="Batch concurrency. Defaults to batch count, clamped to 1..10; explicitly use 1 for serial batches.")
     parser.add_argument("--account", help="UserGrowth account. Prefer USERGROWTH_ACCOUNT env var.")
@@ -503,6 +526,7 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
         task_name=str(_pick(args.task_name, manifest, "task_name") or "usergrowth_upload").strip() or "usergrowth_upload",
         batch_name=str(_pick(None, manifest, "batch_name", "name", "label") or "").strip(),
         workflow=workflow,
+        single_plan=bool(args.single_plan or manifest.get("single_plan", False)),
         redfruit_default_genre=str(_pick(args.redfruit_default_genre, manifest, "redfruit_default_genre") or "").strip(),
         redfruit_bid_map=_parse_redfruit_bid_map(_pick(args.redfruit_bid_map, manifest, "redfruit_bid_map")),
         redfruit_layout_override=str(
@@ -523,6 +547,8 @@ def _config_from_args(args: argparse.Namespace, manifest: dict[str, Any], base_d
             or "创意AI素材"
         ).strip(),
         redfruit_extra_custom_tags=_redfruit_extra_custom_tags_from_args(args, manifest),
+        redfruit_source_categories_by_file=_redfruit_source_categories_from_args(args, manifest, base_dir),
+        redfruit_plan_overrides_by_file=_redfruit_plan_overrides_from_args(args, manifest, base_dir),
         existing_creative_unit_title=str(
             _pick(args.existing_creative_unit_title, manifest, "existing_creative_unit_title") or ""
         ).strip(),
@@ -592,6 +618,69 @@ def _redfruit_extra_custom_tags_from_args(args: argparse.Namespace, manifest: di
         *_list_from_manifest(manifest, "redfruit_extra_custom_tag"),
     ]
     return normalise_template_tags(tags)
+
+
+def _redfruit_source_categories_from_args(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    base_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    value = _pick(
+        getattr(args, "redfruit_source_category_manifest", None),
+        manifest,
+        "redfruit_source_category_manifest",
+        "redfruit_source_categories",
+    )
+    if value in (None, ""):
+        return {}
+    try:
+        path = _resolve_manifest_path(value, base_dir)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for file_name, details in payload.items():
+        if not isinstance(details, dict):
+            continue
+        key = Path(str(file_name)).name.strip()
+        if key:
+            result[key] = dict(details)
+    return result
+
+
+def _redfruit_plan_overrides_from_args(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    base_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    value = _pick(
+        getattr(args, "redfruit_plan_overrides", None),
+        manifest,
+        "redfruit_plan_overrides",
+        "redfruit_plan_overrides_by_file",
+    )
+    if value in (None, ""):
+        return {}
+    try:
+        if isinstance(value, dict):
+            payload = value
+        else:
+            path = _resolve_manifest_path(value, base_dir)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for file_name, details in payload.items():
+        if not isinstance(details, dict):
+            continue
+        key = Path(str(file_name)).name.strip()
+        if key:
+            result[key] = dict(details)
+    return result
 
 
 def _parse_redfruit_bid_map(value: Any) -> dict[str, str]:
@@ -820,6 +909,21 @@ def run_resumed_usergrowth_task(
         order_excel = Path(saved_backfill).resolve()
         song_excel = Path(saved_song_excel).resolve()
 
+    saved_plan_overrides = {
+        Path(str(key)).name: dict(value)
+        for key, value in dict(saved_config.get("redfruit_plan_overrides_by_file") or {}).items()
+        if isinstance(value, dict) and Path(str(key)).name.strip()
+    }
+    # A platform preflight can be edited after the initial task.json was
+    # written.  Apply the current invocation's override file on top of the
+    # saved config so formal resume uses the latest manual labels.
+    resumed_plan_overrides = _redfruit_plan_overrides_from_args(
+        args,
+        {},
+        task_json_path.parent,
+    )
+    saved_plan_overrides.update(resumed_plan_overrides)
+
     config = UserGrowthRunConfig(
         video_folder=Path(str(saved_config.get("video_folder") or video_paths[0].parent)).resolve(),
         order_excel=order_excel,
@@ -832,6 +936,7 @@ def run_resumed_usergrowth_task(
         batch_name=str(saved_config.get("batch_name") or "").strip(),
         selected_video_paths=video_paths,
         workflow=workflow,
+        single_plan=bool(saved_config.get("single_plan", False)),
         delivery_products=saved_list("delivery_products", "delivery_products"),
         delivery_platforms=saved_list("delivery_platforms", "delivery_platforms"),
         delivery_platform_all=saved_config.get("delivery_platform_all"),
@@ -844,6 +949,7 @@ def run_resumed_usergrowth_task(
         redfruit_material_mode_override=str(saved_config.get("redfruit_material_mode_override") or "").strip(),
         redfruit_ai_custom_tag=str(saved_config.get("redfruit_ai_custom_tag") or "创意AI素材").strip(),
         redfruit_extra_custom_tags=[str(item) for item in (saved_config.get("redfruit_extra_custom_tags") or [])],
+        redfruit_plan_overrides_by_file=saved_plan_overrides,
         custom_tag_template_name=str(saved_config.get("custom_tag_template_name") or DEFAULT_CUSTOM_TAG_TEMPLATE_NAME),
         custom_tag_template_tags=[str(item) for item in (saved_config.get("custom_tag_template_tags") or [])],
         month_tag=str(saved_config.get("month_tag") or ""),
@@ -879,13 +985,6 @@ def run_resumed_usergrowth_task(
             for value in (saved_plan.get("arlp_stage_progress") or [])
             if isinstance(value, dict)
         ]
-        plan.classification_task_id = str(saved_plan.get("classification_task_id") or "")
-        saved_classification_progress = saved_plan.get("classification_progress")
-        plan.classification_progress = (
-            dict(saved_classification_progress)
-            if isinstance(saved_classification_progress, dict)
-            else {}
-        )
         plan.operation_retry_counts = {
             str(key): int(value)
             for key, value in dict(saved_plan.get("operation_retry_counts") or {}).items()
@@ -956,8 +1055,6 @@ def run_resumed_usergrowth_task(
                     "arlp_stage_index": plan.arlp_stage_index,
                     "arlp_stage_task_ids": list(plan.arlp_stage_task_ids),
                     "arlp_stage_progress": [dict(value) for value in plan.arlp_stage_progress],
-                    "classification_task_id": plan.classification_task_id,
-                    "classification_progress": dict(plan.classification_progress),
                     "operation_retry_counts": dict(plan.operation_retry_counts),
                     "items": {
                         item.file_name: {
@@ -1087,8 +1184,6 @@ def run_selected_usergrowth_task(
                     "arlp_stage_index": plan.arlp_stage_index,
                     "arlp_stage_task_ids": list(plan.arlp_stage_task_ids),
                     "arlp_stage_progress": [dict(value) for value in plan.arlp_stage_progress],
-                    "classification_task_id": plan.classification_task_id,
-                    "classification_progress": dict(plan.classification_progress),
                     "operation_retry_counts": dict(plan.operation_retry_counts),
                     "items": {
                         item.file_name: {
@@ -1262,7 +1357,6 @@ def run_existing_creative_units_task(
                 custom_tags=list(metadata.get("custom_tags") or []),
                 classification_path=list(metadata.get("genre_path") or []),
                 classification_paths=list(metadata.get("classification_paths") or []),
-                post_review_classification_paths=list(metadata.get("post_review_classification_paths") or []),
                 workflow_metadata={
                     **metadata,
                     "existing_creative_unit_id": unit_id,
@@ -1631,7 +1725,6 @@ def _write_diagnostic_summary(
                         "arlp_task_id": str(order.get("arlp_task_id") or ""),
                         "arlp_stage_index": int(order.get("arlp_stage_index") or 0),
                         "arlp_stage_task_ids": list(order.get("arlp_stage_task_ids") or []),
-                        "classification_task_id": str(order.get("classification_task_id") or ""),
                         "operation_retry_counts": dict(order.get("operation_retry_counts") or {}),
                     }
                 )
@@ -1650,7 +1743,6 @@ def _write_diagnostic_summary(
                         "arlp_task_id": str(order.get("arlp_task_id") or ""),
                         "arlp_stage_index": int(order.get("arlp_stage_index") or 0),
                         "arlp_stage_task_ids": list(order.get("arlp_stage_task_ids") or []),
-                        "classification_task_id": str(order.get("classification_task_id") or ""),
                         "operation_retry_counts": dict(order.get("operation_retry_counts") or {}),
                     }
                 )
@@ -1836,6 +1928,7 @@ def _safe_config_dict(config: UserGrowthRunConfig) -> dict[str, Any]:
         "task_name": config.task_name,
         "batch_name": config.batch_name,
         "workflow": config.workflow,
+        "single_plan": config.single_plan,
         "selected_videos": [str(path) for path in config.selected_video_paths],
         "custom_tag_template_name": config.custom_tag_template_name,
         "custom_tag_template_tags": list(config.custom_tag_template_tags),
@@ -1849,6 +1942,10 @@ def _safe_config_dict(config: UserGrowthRunConfig) -> dict[str, Any]:
         "redfruit_material_mode_override": config.redfruit_material_mode_override,
         "redfruit_ai_custom_tag": config.redfruit_ai_custom_tag,
         "redfruit_extra_custom_tags": list(config.redfruit_extra_custom_tags),
+        "redfruit_plan_overrides_by_file": {
+            str(key): dict(value)
+            for key, value in config.redfruit_plan_overrides_by_file.items()
+        },
         "existing_creative_unit_title": config.existing_creative_unit_title,
         "existing_creative_unit_drama_type": config.existing_creative_unit_drama_type,
         "existing_creative_unit_bid": config.existing_creative_unit_bid,

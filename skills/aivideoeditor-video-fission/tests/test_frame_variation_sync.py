@@ -105,6 +105,67 @@ class FrameVariationSyncTests(unittest.TestCase):
             self.assertLessEqual(abs(video_duration - audio_duration), 0.08)
             self.assertAlmostEqual(float(payload["format"]["duration"]), 2.4, delta=0.10)
 
+    def test_skip_cover_keeps_basic_fission_without_intro_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.mp4"
+            output = root / "variant.mp4"
+            subprocess.run(
+                [
+                    str(FFMPEG),
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=320x480:rate=30:duration=2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=880:sample_rate=48000:duration=2",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            frame_variation.render_frame_drop_variant_with_cover(
+                source,
+                output,
+                [10, 35],
+                0.0,
+                0.8,
+                320,
+                480,
+                "original",
+                str(FFMPEG),
+                has_audio=True,
+                include_cover=False,
+            )
+
+            probe = subprocess.run(
+                [
+                    str(FFPROBE),
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertAlmostEqual(float(probe.stdout.strip()), 2.0, delta=0.10)
+
 
 if __name__ == "__main__":
     unittest.main()
