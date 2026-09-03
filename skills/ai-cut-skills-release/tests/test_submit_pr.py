@@ -180,6 +180,26 @@ class SubmitPrHelpersTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ReleaseError, "允许范围外文件"):
                 MODULE.validate_committed_scope(Path("."), ["skills/demo"])
 
+    def test_validates_complete_branch_diff_against_allowlist(self) -> None:
+        with patch.object(
+            MODULE,
+            "run_command",
+            side_effect=["base-sha", "skills/demo/SKILL.md\nREADME.md"],
+        ):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "完整 diff.*允许范围外"):
+                MODULE.validate_branch_scope(Path("."), "upstream/main", "origin/demo", ["skills/demo"])
+
+    def test_complete_branch_diff_returns_allowed_paths(self) -> None:
+        with patch.object(
+            MODULE,
+            "run_command",
+            side_effect=["base-sha", "skills/demo/SKILL.md"],
+        ):
+            self.assertEqual(
+                MODULE.validate_branch_scope(Path("."), "upstream/main", "origin/demo", ["skills/demo"]),
+                ["skills/demo/SKILL.md"],
+            )
+
     def test_finds_only_matching_open_pr(self) -> None:
         with patch.object(
             MODULE,

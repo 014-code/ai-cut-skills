@@ -714,6 +714,23 @@ def validate_committed_scope(worktree: Path, pathspecs: list[str]) -> list[str]:
     return changed
 
 
+def validate_branch_scope(repo_root: Path, base_ref: str, branch_ref: str, pathspecs: list[str]) -> list[str]:
+    """Validate the complete branch diff, excluding changes that belong only to the base."""
+    merge_base = run_command(["git", "merge-base", base_ref, branch_ref], repo_root)
+    changed = [
+        line
+        for line in run_command(
+            ["git", "diff", "--name-only", merge_base, branch_ref],
+            repo_root,
+        ).splitlines()
+        if line
+    ]
+    outside = [path for path in changed if not path_is_allowed(path, pathspecs)]
+    if outside:
+        raise ReleaseError(f"分支完整 diff 出现允许范围外文件：{', '.join(outside)}")
+    return changed
+
+
 def create_temporary_body_file(body: str) -> Path:
     file_descriptor, file_name = tempfile.mkstemp(prefix="ai-cut-skills-pr-", suffix=".md")
     os.close(file_descriptor)
@@ -1066,6 +1083,12 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     managed_remote_branch = False
     if existing_remote_sha:
         existing_remote_sha = refresh_remote_branch_ref(repo_root, config.push_remote, branch)
+        validate_branch_scope(
+            repo_root,
+            base_ref,
+            f"{config.push_remote}/{branch}",
+            pathspecs,
+        )
         managed_remote_branch = remote_branch_is_managed(repo_root, config.push_remote, branch)
         validate_branch_reconcile(repo_root, base_ref, f"{config.push_remote}/{branch}")
     validate_remote_branch_reuse(
@@ -1115,6 +1138,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             run_command(["git", "commit", "-m", title, "-m", release_commit_marker(branch)], worktree)
             pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
             validate_committed_scope(worktree, pathspecs)
+            validate_branch_scope(worktree, base_ref, "HEAD", pathspecs)
             run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
         try:
             pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
