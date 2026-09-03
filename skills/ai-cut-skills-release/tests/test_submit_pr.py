@@ -102,6 +102,29 @@ class SubmitPrHelpersTests(unittest.TestCase):
             "upstream/main",
         )
 
+    def test_existing_pr_source_base_uses_only_local_commits_after_remote_branch(self) -> None:
+        with patch.object(MODULE, "run_command_result", side_effect=[(0, "", "")]):
+            self.assertEqual(
+                MODULE.select_source_commit_base(Path("."), "origin/demo"),
+                "origin/demo",
+            )
+
+        with patch.object(
+            MODULE,
+            "run_command_result",
+            side_effect=[(1, "", "not ancestor"), (0, "", "")],
+        ):
+            self.assertIsNone(MODULE.select_source_commit_base(Path("."), "origin/demo"))
+
+    def test_rejects_diverged_local_and_existing_pr_branches(self) -> None:
+        with patch.object(
+            MODULE,
+            "run_command_result",
+            side_effect=[(1, "", "remote is not ancestor"), (1, "", "head is not ancestor")],
+        ):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "已分叉"):
+                MODULE.select_source_commit_base(Path("."), "origin/demo")
+
     def test_refuses_existing_remote_branch_without_open_pr(self) -> None:
         with self.assertRaisesRegex(MODULE.ReleaseError, "没有找到.*打开 PR"):
             MODULE.validate_remote_branch_reuse("014-code/fix-demo-20260903", "a" * 40, None)

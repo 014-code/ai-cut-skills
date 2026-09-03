@@ -51,6 +51,6 @@ python skills/ai-cut-skills-release/scripts/submit_pr.py `
 
 如需跳过 GitHub fork 的创建和 parent 校验，可显式增加 `--no-auto-fork`。该选项仍会严格校验推送远端的 fetch URL 和所有有效 push URL 必须指向当前账户 fork，不会放宽提交范围、分支和 PR 安全校验。
 
-执行模式保持可审计：默认只读预检；`--execute` 先在临时 worktree 中完成变更范围、Skill 校验、语法检查和测试，全部通过后才创建/确认 fork、修改 push remote、提交和推送。空变更或校验失败不会产生 GitHub 或本地 remote 配置副作用。已有受管 PR 的分支更新使用 `git push --force-with-lease`，提交后会再次核验实际 commit 的变更范围；与最新基线无法安全合并时停止。这个 Skill 只创建或更新 PR，不自动审批或合并。
+执行模式保持可审计：默认只读预检；`--execute` 先在临时 worktree 中完成变更范围、Skill 校验、语法检查和测试，全部通过后才创建/确认 fork、修改 push remote、提交和推送。空变更或校验失败不会产生 GitHub 或本地 remote 配置副作用。已有受管 PR 的更新以远端 PR 分支作为 worktree 基线，只应用当前工作区差异；本地若有远端之后的新提交则仅应用这些增量，分支分叉时停止。更新使用 `git push --force-with-lease`，提交后会再次核验实际 commit 的变更范围；与最新基线无法安全合并时停止。这个 Skill 只创建或更新 PR，不自动审批或合并。
 
 详细的分支、提交范围和 PR 规则见 [references/release-policy.md](references/release-policy.md)。

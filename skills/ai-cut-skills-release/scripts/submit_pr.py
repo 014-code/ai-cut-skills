@@ -576,6 +576,32 @@ def select_worktree_ref(base_ref: str, push_remote: str, branch: str, existing_r
     return f"{push_remote}/{branch}" if existing_remote_sha else base_ref
 
 
+def select_source_commit_base(repo_root: Path, remote_branch_ref: str) -> str | None:
+    """Return a safe base for local commits that are not on an existing PR branch.
+
+    The PR branch is the worktree base, so its commits must never be included in
+    the source patch. When the local branch is ahead, only the commits after the
+    PR branch are copied. When it is behind, the current working-tree diff is
+    sufficient. Diverged histories are rejected instead of guessing a patch.
+    """
+    remote_is_ancestor, _, remote_error = run_command_result(
+        ["git", "merge-base", "--is-ancestor", remote_branch_ref, "HEAD"],
+        repo_root,
+    )
+    if remote_is_ancestor == 0:
+        return remote_branch_ref
+
+    head_is_ancestor, _, head_error = run_command_result(
+        ["git", "merge-base", "--is-ancestor", "HEAD", remote_branch_ref],
+        repo_root,
+    )
+    if head_is_ancestor == 0:
+        return None
+
+    detail = head_error or remote_error or "本地分支与已有 PR 分支没有可安全复用的祖先关系"
+    raise ReleaseError(f"本地分支与已有 PR 分支已分叉，无法安全计算增量：{detail[-1000:]}")
+
+
 def validate_remote_branch_reuse(
     branch: str,
     remote_sha: str | None,
@@ -657,10 +683,31 @@ def remove_temporary_file(path: Path) -> None:
             time.sleep(0.1 * (2**attempt))
 
 
-def apply_source_changes(repo_root: Path, worktree: Path, base_ref: str, pathspecs: list[str], untracked: list[str]) -> None:
-    patch = run_bytes(["git", "diff", "--binary", base_ref, "--", *pathspecs], repo_root)
-    if patch:
-        patch_path = worktree.parent / "source-changes.patch"
+def apply_source_changes(
+    repo_root: Path,
+    worktree: Path,
+    base_ref: str,
+    pathspecs: list[str],
+    untracked: list[str],
+    *,
+    commit_base_ref: str | None = None,
+) -> None:
+    patches: list[bytes] = []
+    if commit_base_ref:
+        # Apply only local commits after the existing PR branch. This avoids
+        # replaying the PR branch's own commits when the local branch is behind.
+        patches.append(
+            run_bytes(
+                ["git", "diff", "--binary", commit_base_ref, "HEAD", "--", *pathspecs],
+                repo_root,
+            )
+        )
+    # Always apply the current staged/unstaged working-tree delta separately.
+    patches.append(run_bytes(["git", "diff", "--binary", base_ref, "--", *pathspecs], repo_root))
+    for index, patch in enumerate(patches):
+        if not patch:
+            continue
+        patch_path = worktree.parent / f"source-changes-{index}.patch"
         patch_path.write_bytes(patch)
         try:
             run_command(["git", "apply", "--3way", "--index", str(patch_path)], worktree)
@@ -688,6 +735,7 @@ def create_worktree(
     untracked: list[str],
     *,
     source_base_ref: str | None = None,
+    source_commit_base_ref: str | None = None,
 ) -> tuple[Path, Path]:
     source_base_ref = source_base_ref or base_ref
     parent = Path(tempfile.mkdtemp(prefix="ai-cut-skills-release-"))
@@ -696,7 +744,14 @@ def create_worktree(
     try:
         run_command(["git", "worktree", "add", "-b", branch, str(worktree), base_ref], repo_root)
         branch_created = True
-        apply_source_changes(repo_root, worktree, source_base_ref, pathspecs, untracked)
+        apply_source_changes(
+            repo_root,
+            worktree,
+            source_base_ref,
+            pathspecs,
+            untracked,
+            commit_base_ref=source_commit_base_ref,
+        )
         return parent, worktree
     except Exception:
         if worktree.exists():
@@ -909,7 +964,13 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     # The remote branch was fetched above; use it as the worktree base so
     # previous PR commits are retained during an update or retry.
     worktree_ref = select_worktree_ref(base_ref, config.push_remote, branch, existing_remote_sha)
-    source_base_ref = worktree_ref if existing_remote_sha else base_ref
+    source_base_ref = "HEAD" if existing_remote_sha else base_ref
+    source_commit_base_ref = None
+    if existing_remote_sha:
+        source_commit_base_ref = select_source_commit_base(
+            repo_root,
+            f"{config.push_remote}/{branch}",
+        )
     parent, worktree = create_worktree(
         repo_root,
         branch,
@@ -917,6 +978,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         pathspecs,
         untracked,
         source_base_ref=source_base_ref,
+        source_commit_base_ref=source_commit_base_ref,
     )
     try:
         commit_needed = True
