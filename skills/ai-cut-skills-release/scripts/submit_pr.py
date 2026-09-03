@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RELEASE_MARKER_PREFIX = "AI-Cut-Skills-Release:"
+CANONICAL_REPOSITORY = "liudu2326526/ai-cut-skills"
 CHANGE_TYPES = {"feat", "fix", "docs", "refactor", "test", "chore"}
 SENSITIVE_ENV_MARKERS = (
     "TOKEN",
@@ -420,16 +421,21 @@ def validate_no_symlink_paths(repo_root: Path, relative_paths: list[str]) -> Non
 
 
 def resolve_target_repository(repo_root: Path, base_remote: str, target_repository: str | None) -> str:
-    """Keep PR mutations scoped to the repository represented by the base remote."""
+    """Keep every release mutation scoped to this Skill's canonical repository."""
     base_repository = remote_repository(repo_root, base_remote)
-    if not target_repository:
-        return base_repository
-    target = "/".join(split_repository(target_repository))
-    if target.casefold() != base_repository.casefold():
+    if base_repository.casefold() != CANONICAL_REPOSITORY.casefold():
         raise ReleaseError(
-            f"目标仓库 {target} 与基线远端 {base_repository} 不一致；为避免跨仓库写入，已停止。"
+            f"基线远端 {base_repository} 不是规范仓库 {CANONICAL_REPOSITORY}；"
+            "为避免跨仓库写入，已停止。"
         )
-    return target
+    if not target_repository:
+        return CANONICAL_REPOSITORY
+    target = "/".join(split_repository(target_repository))
+    if target.casefold() != CANONICAL_REPOSITORY.casefold():
+        raise ReleaseError(
+            f"目标仓库 {target} 不是规范仓库 {CANONICAL_REPOSITORY}；为避免跨仓库写入，已停止。"
+        )
+    return CANONICAL_REPOSITORY
 
 
 def github_login(repo_root: Path, expected: str | None) -> str:

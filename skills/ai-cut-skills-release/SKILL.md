@@ -47,7 +47,7 @@ python skills/ai-cut-skills-release/scripts/submit_pr.py `
   --execute
 ```
 
-多个 Skill 或测试文件需要显式重复 `--skill` / `--include`。`--target-repository` 只能显式指定与 `upstream` 相同的仓库，不能跨仓库写入。没有目标变更、校验失败、GitHub 账户不匹配、远端同名分支没有可复用的打开 PR，或 PR 已产生不可安全判断的冲突时停止并报告，不覆盖现有工作。
+多个 Skill 或测试文件需要显式重复 `--skill` / `--include`。发布目标固定为规范仓库 `liudu2326526/ai-cut-skills`；`--target-repository` 只能显式指定该仓库，不能通过自定义 remote 或参数改向其他仓库。没有目标变更、校验失败、GitHub 账户不匹配、远端同名分支没有可复用的打开 PR，或 PR 已产生不可安全判断的冲突时停止并报告，不覆盖现有工作。
 
 如需跳过 GitHub fork 的创建和 parent 校验，可显式增加 `--no-auto-fork`。该选项仍会严格校验推送远端的 fetch URL 和所有有效 push URL 必须指向当前账户 fork，不会放宽提交范围、分支和 PR 安全校验。
 

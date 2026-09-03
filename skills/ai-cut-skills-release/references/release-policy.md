@@ -32,7 +32,7 @@ commit/PR 摘要必须是单行且不能匹配凭据键值对或常见 Token 前
 
 ## GitHub Fork 与 PR
 
-仓库当前以 `upstream` 作为 PR 基线，以 `origin` 作为推送远端。脚本从 upstream remote 解析唯一目标仓库，使用 GitHub CLI 当前登录账户作为 head owner；`--github-account` 仅用于账户一致性校验。`--target-repository` 如果提供，必须与 upstream 解析出的仓库完全一致，否则停止，禁止跨仓库写入。
+仓库当前以 `upstream` 作为 PR 基线，以 `origin` 作为推送远端。发布目标固定为规范仓库 `liudu2326526/ai-cut-skills`；脚本仍检查 upstream remote，但只接受它精确指向该仓库，使用 GitHub CLI 当前登录账户作为 head owner。`--target-repository` 如果提供，也必须精确匹配该规范仓库，否则停止，禁止通过 remote 或参数把操作导向其他仓库。
 
 执行模式在本地变更和全部校验通过后，才按以下顺序准备 fork：
 

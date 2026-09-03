@@ -270,6 +270,11 @@ class SubmitPrHelpersTests(unittest.TestCase):
                     "other-owner/other-repository",
                 )
 
+    def test_rejects_noncanonical_base_remote(self) -> None:
+        with patch.object(MODULE, "remote_repository", return_value="other-owner/ai-cut-skills"):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不是规范仓库"):
+                MODULE.resolve_target_repository(Path("."), "upstream", None)
+
     def test_rejects_symlink_change_paths(self) -> None:
         with patch.object(MODULE, "path_contains_symlink", return_value=True):
             with self.assertRaisesRegex(MODULE.ReleaseError, "符号链接"):
