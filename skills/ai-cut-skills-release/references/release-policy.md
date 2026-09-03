@@ -23,12 +23,12 @@ commit/PR 摘要必须是单行且不能匹配凭据键值对或常见 Token 前
 执行提交前依次执行：
 
 - `quick_validate.py` 校验每个目标 Skill 的 frontmatter、目录和占位内容；
-- `scripts/sync_skills.py --check` 校验仓库 catalog；
+- GitHub PR Checks 中的 `scripts/sync_skills.py --check` 校验仓库 catalog；
 - Python 文件语法检查；
 - `git diff --check`；
-- 仓库 `tests/` 和本次目标 Skill `skills/<skill>/tests/` 下的 unittest（可用 `--skip-tests` 明确跳过）。
+- GitHub PR Checks 中的仓库 `tests/` 和本次目标 Skill `skills/<skill>/tests/` 下的 unittest。
 
-任何失败都会阻止 commit 和 push。提交和本地钩子完成后，脚本还会检查最终 commit 的变更路径；越界时不会 push。校验结果会写入 PR 描述，不写入凭据。
+本地发布脚本只执行静态/可信校验，不执行仓库脚本和测试；任何本地静态校验失败都会阻止 commit 和 push。GitHub PR Checks 负责执行仓库 catalog 和测试。提交和本地钩子完成后，脚本还会检查最终 commit 的变更路径；越界时不会 push。校验结果会写入 PR 描述，不写入凭据。
 
 ## GitHub Fork 与 PR
 

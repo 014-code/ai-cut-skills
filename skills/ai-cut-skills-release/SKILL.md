@@ -13,7 +13,7 @@ description: "提交 AI Cut Skills 仓库改动并创建或更新 GitHub PR；�
 2. 从 `upstream/main` 获取最新基线，创建 `<组别>/<类型>-<作用域>-<YYYYMMDD>` 分支。
 3. 执行模式默认检查当前 GitHub 账户是否已有目标仓库的 fork；没有时自动创建，并等待 fork 可用。
 4. 只带入目标 Skill 及显式指定的附加文件，不把其他工作区改动混入提交；符号链接路径会被拒绝，避免把仓库外文件复制进提交。
-5. 执行 Skill 结构校验、仓库清单校验、语法检查、仓库根目录测试和目标 Skill 自带测试；计划模式仅执行静态/可信校验，不运行仓库脚本和测试，也不刷新远端引用。
+5. 执行 Skill 结构校验、语法检查和 Git 差异检查；仓库清单与测试由 GitHub PR Checks 在其受控工作流中执行，发布脚本本地不运行仓库脚本和测试。计划模式同样只执行静态/可信校验，也不刷新远端引用。
 6. 生成规范 commit，推送到当前账户 fork，创建或更新对应 GitHub PR。
 7. 重复执行同一组别/作用域/日期时，只允许在检测到当前账户、当前 base 分支下的打开 PR 后安全更新远端分支；PR 创建 API 返回不确定时保留带有受管提交标记的远端分支，后续可安全重试，陌生的同名远端分支会直接停止。
 
@@ -51,6 +51,6 @@ python skills/ai-cut-skills-release/scripts/submit_pr.py `
 
 如需跳过 GitHub fork 的创建和 parent 校验，可显式增加 `--no-auto-fork`。该选项仍会严格校验推送远端的 fetch URL 和所有有效 push URL 必须指向当前账户 fork，不会放宽提交范围、分支和 PR 安全校验。
 
-执行模式保持可审计：默认只读预检；`--execute` 先在临时 worktree 中完成变更范围、Skill 校验、语法检查和测试，全部通过后才创建/确认 fork、修改 push remote、提交和推送。摘要会经过单行和凭据模式校验，疑似包含密钥时拒绝写入 commit 或 PR。空变更或校验失败不会产生 GitHub 或本地 remote 配置副作用。已有受管 PR 的更新以远端 PR 分支作为 worktree 基线，只应用当前工作区差异；本地若有远端之后的新提交则仅应用这些增量，分支分叉时停止。更新使用 `git push --force-with-lease`，提交后会再次核验实际 commit 的变更范围；与最新基线无法安全合并时停止。这个 Skill 只创建或更新 PR，不自动审批或合并。
+执行模式保持可审计：默认只读预检；`--execute` 先在临时 worktree 中完成变更范围、Skill 校验和静态检查，仓库脚本和测试由 GitHub PR Checks 执行；全部通过后才创建/确认 fork、修改 push remote、提交和推送。摘要会经过单行和凭据模式校验，疑似包含密钥时拒绝写入 commit 或 PR。空变更或校验失败不会产生 GitHub 或本地 remote 配置副作用。已有受管 PR 的更新以远端 PR 分支作为 worktree 基线，只应用当前工作区差异；本地若有远端之后的新提交则仅应用这些增量，分支分叉时停止。更新使用 `git push --force-with-lease`，提交后会再次核验实际 commit 的变更范围；与最新基线无法安全合并时停止。这个 Skill 只创建或更新 PR，不自动审批或合并。
 
 详细的分支、提交范围和 PR 规则见 [references/release-policy.md](references/release-policy.md)。

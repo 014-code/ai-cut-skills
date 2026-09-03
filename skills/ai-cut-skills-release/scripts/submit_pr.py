@@ -285,11 +285,10 @@ def run_checks(
             else:
                 checks.append({"name": f"quick_validate:{skill}", "ok": False, "output": "找不到 quick_validate.py"})
 
-        sync_script = repo_root / "scripts" / "sync_skills.py"
-        if read_only:
-            checks.append({"name": "catalog", "ok": True, "output": "skipped in read-only plan mode"})
-        elif sync_script.is_file():
-            check("catalog", [sys.executable, "-I", "-X", "utf8", str(sync_script), "--check"])
+        # Repository scripts are untrusted input. Catalog and repository
+        # tests run in the GitHub PR workflow, which is the actual boundary;
+        # this local release helper never executes them.
+        checks.append({"name": "catalog", "ok": True, "output": "deferred to GitHub PR Checks"})
 
         python_files = []
         for skill in config.skills:
@@ -310,34 +309,10 @@ def run_checks(
             ["git", "-c", "core.whitespace=cr-at-eol", "diff", "--cached", "--check"],
         )
 
-        if read_only:
-            checks.append({"name": "tests", "ok": True, "output": "skipped in read-only plan mode"})
-        elif config.skip_tests:
-            checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
-        else:
-            test_roots = discover_test_roots(repo_root, config.skills)
-            if not test_roots:
-                checks.append({"name": "tests", "ok": True, "output": "no repository or Skill unittest files"})
-            else:
-                for name, test_root in test_roots:
-                    relative_root = test_root.relative_to(repo_root).as_posix()
-                    check(
-                        name,
-                        [
-                            sys.executable,
-                            "-I",
-                            "-X",
-                            "utf8",
-                            "-m",
-                            "unittest",
-                            "discover",
-                            "-s",
-                            relative_root,
-                            "-p",
-                            "test_*.py",
-                            "-v",
-                        ],
-                    )
+        tests_note = "deferred to GitHub PR Checks"
+        if config.skip_tests:
+            tests_note += "; local --skip-tests requested"
+        checks.append({"name": "tests", "ok": True, "output": tests_note})
 
     checks.append({"name": "changed_paths", "ok": True, "output": "\n".join(changed_paths)})
     return {"ok": all(bool(item.get("ok")) for item in checks), "checks": checks}
