@@ -81,6 +81,74 @@ class SubmitPrHelpersTests(unittest.TestCase):
             ],
         )
 
+    def test_preflight_rejects_empty_changes(self) -> None:
+        with self.assertRaisesRegex(MODULE.ReleaseError, "没有可提交的变更"):
+            MODULE.validate_preflight_result([], {"ok": True, "checks": []})
+
+    def test_preflight_rejects_failed_checks(self) -> None:
+        with self.assertRaisesRegex(MODULE.ReleaseError, "提交前校验失败.*tests"):
+            MODULE.validate_preflight_result(
+                ["skills/demo/SKILL.md"],
+                {"ok": False, "checks": [{"name": "tests", "ok": False}]},
+            )
+
+    def test_existing_pr_updates_are_based_on_managed_remote_branch(self) -> None:
+        self.assertEqual(
+            MODULE.select_worktree_ref("upstream/main", "origin", "014-code/fix-demo-20260903", "a" * 40),
+            "origin/014-code/fix-demo-20260903",
+        )
+        self.assertEqual(
+            MODULE.select_worktree_ref("upstream/main", "origin", "014-code/fix-demo-20260903", None),
+            "upstream/main",
+        )
+
+    def test_builds_force_with_lease_delete_for_unclaimed_branch(self) -> None:
+        self.assertEqual(
+            MODULE.build_delete_args("origin", "014-code/fix-demo-20260903", "a" * 40),
+            [
+                "git",
+                "push",
+                "--force-with-lease=refs/heads/014-code/fix-demo-20260903:" + "a" * 40,
+                "origin",
+                ":refs/heads/014-code/fix-demo-20260903",
+            ],
+        )
+
+    def test_cleans_new_branch_only_when_pr_is_still_missing_and_sha_matches(self) -> None:
+        expected_sha = "a" * 40
+        with patch.object(MODULE, "find_open_pr", return_value=None):
+            with patch.object(MODULE, "remote_branch_sha", return_value=expected_sha):
+                with patch.object(MODULE, "run_command_result", return_value=(0, "", "")) as run:
+                    MODULE.cleanup_unclaimed_remote_branch(
+                        Path("."),
+                        "origin",
+                        "014-code/fix-demo-20260903",
+                        expected_sha,
+                        "liudu2326526/ai-cut-skills",
+                        "014-code",
+                        "main",
+                    )
+
+        run.assert_called_once_with(
+            MODULE.build_delete_args("origin", "014-code/fix-demo-20260903", expected_sha),
+            Path("."),
+        )
+
+    def test_does_not_clean_branch_when_pr_query_fails(self) -> None:
+        with patch.object(MODULE, "find_open_pr", side_effect=MODULE.ReleaseError("network")):
+            with patch.object(MODULE, "run_command_result") as run:
+                MODULE.cleanup_unclaimed_remote_branch(
+                    Path("."),
+                    "origin",
+                    "014-code/fix-demo-20260903",
+                    "a" * 40,
+                    "liudu2326526/ai-cut-skills",
+                    "014-code",
+                    "main",
+                )
+
+        run.assert_not_called()
+
     def test_refuses_existing_remote_branch_without_open_pr(self) -> None:
         with self.assertRaisesRegex(MODULE.ReleaseError, "没有找到.*打开 PR"):
             MODULE.validate_remote_branch_reuse("014-code/fix-demo-20260903", "a" * 40, None)

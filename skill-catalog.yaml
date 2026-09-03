@@ -844,8 +844,7 @@
         "skill_names",
         "group",
         "change_type",
-        "summary",
-        "github_account"
+        "summary"
       ],
       "outputs": [
         "branch_name",

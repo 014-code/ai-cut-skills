@@ -256,6 +256,21 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
     return {"ok": all(bool(item.get("ok")) for item in checks), "checks": checks}
 
 
+def validate_preflight_result(changed_paths: list[str], checks: dict[str, object]) -> None:
+    """Make a failed or empty plan fail closed instead of reporting success."""
+    if not changed_paths:
+        raise ReleaseError("目标路径没有可提交的变更")
+    if checks.get("ok") is True:
+        return
+    failed = [
+        str(row.get("name"))
+        for row in checks.get("checks", [])
+        if isinstance(row, dict) and not row.get("ok")
+    ]
+    detail = "、".join(failed) if failed else "未知校验"
+    raise ReleaseError(f"提交前校验失败：{detail}")
+
+
 def remote_repository(repo_root: Path, remote: str) -> str:
     url = run_command(["git", "remote", "get-url", remote], repo_root)
     if url.startswith("git@github.com:"):
@@ -532,6 +547,21 @@ def refresh_base_ref(repo_root: Path, remote: str, branch: str) -> str:
     return base_ref
 
 
+def refresh_remote_branch_ref(repo_root: Path, remote: str, branch: str) -> str:
+    """Fetch an existing managed branch and return its verified current SHA."""
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    run_command(
+        ["git", "fetch", remote, f"+refs/heads/{branch}:{tracking_ref}"],
+        repo_root,
+    )
+    return run_command(["git", "rev-parse", "--verify", tracking_ref], repo_root)
+
+
+def select_worktree_ref(base_ref: str, push_remote: str, branch: str, existing_remote_sha: str | None) -> str:
+    """Use the managed remote branch as the update base when it already exists."""
+    return f"{push_remote}/{branch}" if existing_remote_sha else base_ref
+
+
 def validate_remote_branch_reuse(branch: str, remote_sha: str | None, existing_pr: dict[str, object] | None) -> None:
     if remote_sha and not existing_pr:
         raise ReleaseError(
@@ -551,6 +581,17 @@ def build_push_args(remote: str, branch: str, remote_sha: str | None) -> list[st
         "--set-upstream",
         remote,
         branch,
+    ]
+
+
+def build_delete_args(remote: str, branch: str, expected_sha: str) -> list[str]:
+    """Delete only a branch that is still at the SHA we just pushed."""
+    return [
+        "git",
+        "push",
+        f"--force-with-lease=refs/heads/{branch}:{expected_sha}",
+        remote,
+        f":refs/heads/{branch}",
     ]
 
 
@@ -597,14 +638,23 @@ def apply_source_changes(repo_root: Path, worktree: Path, base_ref: str, pathspe
         shutil.copy2(source, destination)
 
 
-def create_worktree(repo_root: Path, branch: str, base_ref: str, pathspecs: list[str], untracked: list[str]) -> tuple[Path, Path]:
+def create_worktree(
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    pathspecs: list[str],
+    untracked: list[str],
+    *,
+    source_base_ref: str | None = None,
+) -> tuple[Path, Path]:
+    source_base_ref = source_base_ref or base_ref
     parent = Path(tempfile.mkdtemp(prefix="ai-cut-skills-release-"))
     worktree = parent / "repo"
     branch_created = False
     try:
         run_command(["git", "worktree", "add", "-b", branch, str(worktree), base_ref], repo_root)
         branch_created = True
-        apply_source_changes(repo_root, worktree, base_ref, pathspecs, untracked)
+        apply_source_changes(repo_root, worktree, source_base_ref, pathspecs, untracked)
         return parent, worktree
     except Exception:
         if worktree.exists():
@@ -635,6 +685,41 @@ def remove_worktree(repo_root: Path, worktree: Path, parent: Path, branch: str |
     if branch:
         run_command(["git", "branch", "-D", branch], repo_root, check=False)
     shutil.rmtree(parent, ignore_errors=True)
+
+
+def cleanup_unclaimed_remote_branch(
+    repo_root: Path,
+    remote: str,
+    branch: str,
+    expected_sha: str,
+    repository: str,
+    head_owner: str,
+    base_branch: str,
+) -> None:
+    """Remove a branch left by a failed new PR creation only when ownership is proven."""
+    try:
+        if find_open_pr(repo_root, repository, branch, head_owner, base_branch):
+            return
+    except ReleaseError as exc:
+        print(f"WARNING: 无法确认 PR 是否已创建，保留远端分支：{exc}", file=sys.stderr)
+        return
+
+    try:
+        current_sha = remote_branch_sha(repo_root, remote, branch)
+    except ReleaseError as exc:
+        print(f"WARNING: 无法确认远端分支状态，保留远端分支：{exc}", file=sys.stderr)
+        return
+    if current_sha != expected_sha:
+        print(
+            f"WARNING: 远端分支 {branch} 已发生变化，保留该分支，不执行清理。",
+            file=sys.stderr,
+        )
+        return
+
+    status, output, error = run_command_result(build_delete_args(remote, branch, expected_sha), repo_root)
+    if status != 0:
+        detail = error or output or "未知 Git 错误"
+        print(f"WARNING: 清理未关联 PR 的远端分支失败：{detail[-1000:]}", file=sys.stderr)
 
 
 def ensure_staged_scope(worktree: Path, pathspecs: list[str]) -> list[str]:
@@ -689,7 +774,7 @@ def create_or_update_pr(worktree: Path, repository: str, branch: str, head_owner
                 worktree,
             )
             return url
-        return run_command(
+        output = run_command(
             [
                 "gh",
                 "pr",
@@ -706,7 +791,11 @@ def create_or_update_pr(worktree: Path, repository: str, branch: str, head_owner
                 str(body_file),
             ],
             worktree,
-        ).splitlines()[-1].strip()
+        )
+        url = output.splitlines()[-1].strip() if output.splitlines() else ""
+        if not url:
+            raise ReleaseError("GitHub CLI 创建 PR 未返回 PR URL")
+        return url
     finally:
         remove_temporary_file(body_file)
 
@@ -775,6 +864,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         check_parent, check_worktree = create_check_worktree(repo_root, "HEAD", pathspecs, untracked)
         try:
             checks = run_checks(check_worktree, config, changed_paths=tracked + untracked)
+            validate_preflight_result(tracked + untracked, checks)
         finally:
             remove_worktree(repo_root, check_worktree, check_parent)
         return {
@@ -810,7 +900,18 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
     validate_remote_branch_reuse(branch, existing_remote_sha, existing_pr)
-    parent, worktree = create_worktree(repo_root, branch, base_ref, pathspecs, untracked)
+    if existing_remote_sha:
+        existing_remote_sha = refresh_remote_branch_ref(repo_root, config.push_remote, branch)
+    worktree_ref = select_worktree_ref(base_ref, config.push_remote, branch, existing_remote_sha)
+    source_base_ref = worktree_ref if existing_remote_sha else base_ref
+    parent, worktree = create_worktree(
+        repo_root,
+        branch,
+        worktree_ref,
+        pathspecs,
+        untracked,
+        source_base_ref=source_base_ref,
+    )
     try:
         staged = ensure_staged_scope(worktree, pathspecs)
         checks = run_checks(worktree, config, changed_paths=staged)
@@ -819,8 +920,22 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
         run_command(["git", "commit", "-m", title], worktree)
+        pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
         run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
-        pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
+        try:
+            pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
+        except ReleaseError:
+            if existing_remote_sha is None:
+                cleanup_unclaimed_remote_branch(
+                    repo_root,
+                    config.push_remote,
+                    branch,
+                    pushed_sha,
+                    repository,
+                    head_owner,
+                    config.base_branch,
+                )
+            raise
         result = {
             "status": "submitted",
             "branch": branch,
