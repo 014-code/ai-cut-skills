@@ -617,6 +617,42 @@ def select_source_commit_base(repo_root: Path, remote_branch_ref: str) -> str | 
     raise ReleaseError(f"本地分支与已有 PR 分支已分叉，无法安全计算增量：{detail[-1000:]}")
 
 
+def list_release_changed_paths(
+    repo_root: Path,
+    base_ref: str,
+    pathspecs: list[str],
+) -> tuple[list[str], list[str], str | None]:
+    """Collect only local changes without treating an ahead remote as deletions."""
+    commit_base_ref = select_source_commit_base(repo_root, base_ref)
+    tracked: list[str] = []
+    if commit_base_ref:
+        tracked.extend(
+            line
+            for line in run_command(
+                ["git", "diff", "--name-only", commit_base_ref, "HEAD", "--", *pathspecs],
+                repo_root,
+            ).splitlines()
+            if line
+        )
+    tracked.extend(
+        line
+        for line in run_command(
+            ["git", "diff", "--name-only", "HEAD", "--", *pathspecs],
+            repo_root,
+        ).splitlines()
+        if line
+    )
+    untracked = [
+        line
+        for line in run_command(
+            ["git", "ls-files", "--others", "--exclude-standard", "--", *pathspecs],
+            repo_root,
+        ).splitlines()
+        if line
+    ]
+    return list(dict.fromkeys(tracked)), list(dict.fromkeys(untracked)), commit_base_ref
+
+
 def validate_remote_branch_reuse(
     branch: str,
     remote_sha: str | None,
@@ -777,13 +813,28 @@ def create_worktree(
         raise
 
 
-def create_check_worktree(repo_root: Path, base_ref: str, pathspecs: list[str], untracked: list[str]) -> tuple[Path, Path]:
+def create_check_worktree(
+    repo_root: Path,
+    base_ref: str,
+    pathspecs: list[str],
+    untracked: list[str],
+    *,
+    source_base_ref: str | None = None,
+    source_commit_base_ref: str | None = None,
+) -> tuple[Path, Path]:
     """Create a detached, disposable worktree for read-only plan checks."""
     parent = Path(tempfile.mkdtemp(prefix="ai-cut-skills-check-"))
     worktree = parent / "repo"
     try:
         run_command(["git", "worktree", "add", "--detach", str(worktree), base_ref], repo_root)
-        apply_source_changes(repo_root, worktree, base_ref, pathspecs, untracked)
+        apply_source_changes(
+            repo_root,
+            worktree,
+            source_base_ref or base_ref,
+            pathspecs,
+            untracked,
+            commit_base_ref=source_commit_base_ref,
+        )
         return parent, worktree
     except Exception:
         if worktree.exists():
@@ -960,7 +1011,11 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         }
 
     base_ref = refresh_base_ref(repo_root, config.base_remote, config.base_branch)
-    tracked, untracked = list_changed_paths(repo_root, base_ref, pathspecs)
+    tracked, untracked, local_commit_base_ref = list_release_changed_paths(
+        repo_root,
+        base_ref,
+        pathspecs,
+    )
     changed = tracked + untracked
     validate_no_symlink_paths(repo_root, changed)
 
@@ -978,6 +1033,8 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         base_ref,
         pathspecs,
         untracked,
+        source_base_ref="HEAD",
+        source_commit_base_ref=local_commit_base_ref,
     )
     try:
         preflight_checks = run_checks(
@@ -1023,8 +1080,8 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     # The remote branch was fetched above; use it as the worktree base so
     # previous PR commits are retained during an update or retry.
     worktree_ref = select_worktree_ref(base_ref, config.push_remote, branch, existing_remote_sha)
-    source_base_ref = "HEAD" if existing_remote_sha else base_ref
-    source_commit_base_ref = None
+    source_base_ref = "HEAD"
+    source_commit_base_ref = local_commit_base_ref if not existing_remote_sha else None
     if existing_remote_sha:
         source_commit_base_ref = select_source_commit_base(
             repo_root,

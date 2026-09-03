@@ -125,6 +125,28 @@ class SubmitPrHelpersTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ReleaseError, "已分叉"):
                 MODULE.select_source_commit_base(Path("."), "origin/demo")
 
+    def test_release_change_collection_ignores_remote_only_commits_when_local_is_behind(self) -> None:
+        with patch.object(
+            MODULE,
+            "run_command_result",
+            side_effect=[(1, "", "base is not ancestor"), (0, "", "")],
+        ):
+            with patch.object(
+                MODULE,
+                "run_command",
+                side_effect=["skills/demo/SKILL.md", "skills/demo/new.py"],
+            ) as run:
+                tracked, untracked, commit_base = MODULE.list_release_changed_paths(
+                    Path("."),
+                    "upstream/main",
+                    ["skills/demo"],
+                )
+
+        self.assertEqual(tracked, ["skills/demo/SKILL.md"])
+        self.assertEqual(untracked, ["skills/demo/new.py"])
+        self.assertIsNone(commit_base)
+        self.assertEqual(run.call_args_list[0].args[0][0:5], ["git", "diff", "--name-only", "HEAD", "--"])
+
     def test_refuses_existing_remote_branch_without_open_pr(self) -> None:
         with self.assertRaisesRegex(MODULE.ReleaseError, "没有找到.*打开 PR"):
             MODULE.validate_remote_branch_reuse("014-code/fix-demo-20260903", "a" * 40, None)
@@ -437,7 +459,11 @@ class SubmitPrHelpersTests(unittest.TestCase):
             failed_checks = {"ok": False, "checks": [{"name": "tests", "ok": False}]}
             with patch.object(MODULE, "run_command", return_value=str(root)):
                 with patch.object(MODULE, "refresh_base_ref", return_value="upstream/main"):
-                    with patch.object(MODULE, "list_changed_paths", return_value=(["skills/demo/SKILL.md"], [])):
+                    with patch.object(
+                        MODULE,
+                        "list_release_changed_paths",
+                        return_value=(["skills/demo/SKILL.md"], [], None),
+                    ):
                         with patch.object(MODULE, "validate_no_symlink_paths"):
                             with patch.object(
                                 MODULE,
