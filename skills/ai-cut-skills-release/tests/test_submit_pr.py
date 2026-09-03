@@ -374,6 +374,42 @@ class SubmitPrHelpersTests(unittest.TestCase):
             self.assertTrue(syntax["ok"])
             self.assertFalse(any(path.name == "__pycache__" for path in root.rglob("__pycache__")))
 
+    def test_read_only_checks_skip_repository_scripts_and_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "demo"
+            skill.mkdir(parents=True)
+            (skill / "main.py").write_text("value = 1\n", encoding="utf-8")
+            (root / "scripts").mkdir()
+            (root / "scripts" / "sync_skills.py").write_text("raise RuntimeError('must not run')\n", encoding="utf-8")
+            config = MODULE.ReleaseConfig(
+                repo_root=root,
+                skills=("demo",),
+                includes=(),
+                group="014-code",
+                change_type="fix",
+                summary="test",
+                scope="demo",
+                date="20260903",
+                base_remote="upstream",
+                base_branch="main",
+                push_remote="origin",
+                github_account=None,
+                target_repository=None,
+                execute=False,
+                skip_tests=False,
+                keep_worktree=False,
+                auto_fork=True,
+            )
+            with patch.object(MODULE, "quick_validator_path", return_value=None):
+                with patch.object(MODULE, "run_command", return_value="") as run:
+                    checks = MODULE.run_checks(root, config, changed_paths=["skills/demo/main.py"], read_only=True)
+
+            names = {row["name"] for row in checks["checks"]}
+            self.assertIn("catalog", names)
+            self.assertIn("tests", names)
+            self.assertFalse(any("sync_skills.py" in call.args[0] for call in run.call_args_list))
+
     def test_failed_preflight_does_not_create_fork_or_change_push_remote(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

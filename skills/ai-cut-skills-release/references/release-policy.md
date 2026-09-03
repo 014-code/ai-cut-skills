@@ -19,7 +19,7 @@
 
 ## 校验
 
-提交前依次执行：
+执行提交前依次执行：
 
 - `quick_validate.py` 校验每个目标 Skill 的 frontmatter、目录和占位内容；
 - `scripts/sync_skills.py --check` 校验仓库 catalog；
@@ -40,7 +40,7 @@
 3. 不存在（404）时执行 `gh repo fork <upstream> --clone=false`，再轮询 GitHub API 直到 fork 可用；其他 API 错误不会被当作“需要创建 fork”。
 4. 推送远端不存在时添加当前账户 fork URL；已有远端若指向其他仓库，停止且不改写。
 
-计划模式是只读的，不会创建或修改 fork；会在临时 detached worktree 中运行可能产生文件的检查，结束后清理。需要跳过 GitHub fork 创建和 parent 校验时可使用 `--no-auto-fork`，但仍必须确认 fetch URL 以及所有有效 push URL 都指向当前账户 fork，并遵守远端分支和 PR 的安全校验。
+计划模式是只读的，不会创建或修改 fork，也不会执行仓库脚本或测试；只在临时 detached worktree 中做 Skill 结构、语法和 Git 差异等静态/可信校验，结束后清理。用户明确使用 `--execute` 后，脚本才会在临时 worktree 中执行仓库清单检查和测试。需要跳过 GitHub fork 创建和 parent 校验时可使用 `--no-auto-fork`，但仍必须确认 fetch URL 以及所有有效 push URL 都指向当前账户 fork，并遵守远端分支和 PR 的安全校验。
 
 同一 head 分支已有打开的 PR 时更新标题和正文，不重复创建。只有在 PR 编号、URL、head 分支、head owner 和 base 分支字段全部存在且精确匹配时才允许复用；字段缺失时按不可复用处理。已有远端分支会先刷新并用 `git merge-tree --write-tree` 检查与最新基线的可合并性，再以该远端分支为更新基线，保留已有提交。执行前会先检查远端是否已有同名分支；临时 worktree 结束后会清理脚本创建的本地分支引用：
 

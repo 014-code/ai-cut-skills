@@ -188,7 +188,13 @@ def discover_test_roots(repo_root: Path, skills: tuple[str, ...]) -> list[tuple[
     return roots
 
 
-def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[str]) -> dict[str, object]:
+def run_checks(
+    repo_root: Path,
+    config: ReleaseConfig,
+    *,
+    changed_paths: list[str],
+    read_only: bool = False,
+) -> dict[str, object]:
     checks: list[dict[str, object]] = []
 
     def check(name: str, args: list[str]) -> None:
@@ -209,7 +215,9 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
             checks.append({"name": f"quick_validate:{skill}", "ok": False, "output": "找不到 quick_validate.py"})
 
     sync_script = repo_root / "scripts" / "sync_skills.py"
-    if sync_script.is_file():
+    if read_only:
+        checks.append({"name": "catalog", "ok": True, "output": "skipped in read-only plan mode"})
+    elif sync_script.is_file():
         check("catalog", [sys.executable, "-X", "utf8", str(sync_script), "--check"])
 
     python_files = []
@@ -227,7 +235,9 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
     check("diff_check", ["git", "diff", "--check"])
     check("cached_diff_check", ["git", "diff", "--cached", "--check"])
 
-    if config.skip_tests:
+    if read_only:
+        checks.append({"name": "tests", "ok": True, "output": "skipped in read-only plan mode"})
+    elif config.skip_tests:
         checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
     else:
         test_roots = discover_test_roots(repo_root, config.skills)
@@ -965,7 +975,12 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         untracked,
     )
     try:
-        preflight_checks = run_checks(preflight_worktree, config, changed_paths=changed)
+        preflight_checks = run_checks(
+            preflight_worktree,
+            config,
+            changed_paths=changed,
+            read_only=True,
+        )
         validate_preflight_result(
             changed,
             preflight_checks,
