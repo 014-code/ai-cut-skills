@@ -28,7 +28,7 @@ commit/PR 摘要必须是单行且不能匹配凭据键值对或常见 Token 前
 - `git diff --check`；
 - GitHub PR Checks 中的仓库 `tests/` 和本次目标 Skill `skills/<skill>/tests/` 下的 unittest。
 
-本地发布脚本只执行静态/可信校验，不执行仓库脚本和测试；任何本地静态校验失败都会阻止 commit 和 push。GitHub PR Checks 负责执行仓库 catalog 和测试。提交和本地钩子完成后，脚本还会检查最终 commit 的变更路径；越界时不会 push。校验结果会写入 PR 描述，不写入凭据。
+本地发布脚本只执行静态/可信校验，不执行仓库脚本和测试；任何本地静态校验失败都会阻止 commit 和 push。GitHub PR Checks 负责执行仓库 catalog 和测试。commit/push 使用临时空 hooks 目录，仓库自带 hooks 不会在发布过程中执行。提交完成后，脚本还会检查最终 commit 的变更路径；越界时不会 push。校验结果会写入 PR 描述，不写入凭据。
 
 ## GitHub Fork 与 PR
 

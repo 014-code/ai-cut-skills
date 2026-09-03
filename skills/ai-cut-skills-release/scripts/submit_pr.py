@@ -140,6 +140,22 @@ def isolated_validation_environment() -> Iterator[dict[str, str]]:
         yield env
 
 
+@contextmanager
+def empty_git_hooks() -> Iterator[str]:
+    """Provide a temporary empty hooks directory for release Git commands."""
+    with tempfile.TemporaryDirectory(prefix="ai-cut-skills-hooks-") as temporary:
+        hooks = Path(temporary) / "hooks"
+        hooks.mkdir()
+        yield str(hooks)
+
+
+def git_args_without_hooks(args: list[str], hooks_path: str) -> list[str]:
+    """Override repository hook configuration for a single Git invocation."""
+    if not args or args[0] != "git":
+        raise ReleaseError("只能为 Git 命令禁用 hooks")
+    return ["git", "-c", f"core.hooksPath={hooks_path}", *args[1:]]
+
+
 def run_bytes(args: list[str], cwd: Path) -> bytes:
     completed = subprocess.run(args, cwd=str(cwd), capture_output=True)
     if completed.returncode != 0:
@@ -1229,11 +1245,24 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
         if commit_needed:
-            run_command(["git", "commit", "-m", title, "-m", release_commit_marker(branch)], worktree)
-            pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
-            validate_committed_scope(worktree, pathspecs)
-            validate_branch_scope(worktree, base_ref, "HEAD", pathspecs)
-            run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
+            with empty_git_hooks() as hooks_path:
+                run_command(
+                    git_args_without_hooks(
+                        ["git", "commit", "-m", title, "-m", release_commit_marker(branch)],
+                        hooks_path,
+                    ),
+                    worktree,
+                )
+                pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)
+                validate_committed_scope(worktree, pathspecs)
+                validate_branch_scope(worktree, base_ref, "HEAD", pathspecs)
+                run_command(
+                    git_args_without_hooks(
+                        build_push_args(config.push_remote, branch, existing_remote_sha),
+                        hooks_path,
+                    ),
+                    worktree,
+                )
         try:
             pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
         except ReleaseError:

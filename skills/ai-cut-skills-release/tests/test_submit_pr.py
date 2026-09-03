@@ -71,6 +71,12 @@ class SubmitPrHelpersTests(unittest.TestCase):
             ],
         )
 
+    def test_git_release_commands_override_repository_hooks(self) -> None:
+        self.assertEqual(
+            MODULE.git_args_without_hooks(["git", "commit", "-m", "release"], "C:/empty-hooks"),
+            ["git", "-c", "core.hooksPath=C:/empty-hooks", "commit", "-m", "release"],
+        )
+
     def test_refreshes_base_with_explicit_refspec(self) -> None:
         with patch.object(MODULE, "run_command", side_effect=["", "upstream/main"]) as run:
             result = MODULE.refresh_base_ref(Path("."), "upstream", "main")
