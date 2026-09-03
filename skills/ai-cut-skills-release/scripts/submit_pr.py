@@ -257,9 +257,14 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
     return {"ok": all(bool(item.get("ok")) for item in checks), "checks": checks}
 
 
-def validate_preflight_result(changed_paths: list[str], checks: dict[str, object]) -> None:
+def validate_preflight_result(
+    changed_paths: list[str],
+    checks: dict[str, object],
+    *,
+    allow_empty: bool = False,
+) -> None:
     """Make a failed or empty plan fail closed instead of reporting success."""
-    if not changed_paths:
+    if not changed_paths and not allow_empty:
         raise ReleaseError("目标路径没有可提交的变更")
     if checks.get("ok") is True:
         return
@@ -947,6 +952,40 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     repository = resolve_target_repository(repo_root, config.base_remote, config.target_repository)
     head_owner = github_login(repo_root, config.github_account)
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
+
+    # Run a complete local preflight from the fresh base before touching the
+    # configured push remote. This keeps empty/invalid releases free of fork,
+    # remote, and branch-network side effects.
+    if not changed and not existing_pr:
+        raise ReleaseError("目标 Skill 相对最新基线没有可提交的变更")
+    preflight_parent, preflight_worktree = create_check_worktree(
+        repo_root,
+        base_ref,
+        pathspecs,
+        untracked,
+    )
+    try:
+        preflight_checks = run_checks(preflight_worktree, config, changed_paths=changed)
+        validate_preflight_result(
+            changed,
+            preflight_checks,
+            allow_empty=existing_pr is not None,
+        )
+    finally:
+        remove_worktree(repo_root, preflight_worktree, preflight_parent)
+
+    if config.auto_fork:
+        _, upstream_repo = split_repository(repository)
+        ensure_fork_repository(
+            repo_root,
+            repository,
+            head_owner,
+            upstream_repo,
+            config.push_remote,
+        )
+    else:
+        ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
+
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
     managed_remote_branch = False
     if existing_remote_sha:
@@ -996,21 +1035,6 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         validate_preflight_result(staged, checks)
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
-
-        # Do not create a fork or change local remote configuration until the
-        # scoped worktree has passed every local validation. A failed or empty
-        # preflight must remain completely free of GitHub-side mutations.
-        if config.auto_fork:
-            _, upstream_repo = split_repository(repository)
-            ensure_fork_repository(
-                repo_root,
-                repository,
-                head_owner,
-                upstream_repo,
-                config.push_remote,
-            )
-        else:
-            ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
         if commit_needed:
             run_command(["git", "commit", "-m", title, "-m", release_commit_marker(branch)], worktree)
             pushed_sha = run_command(["git", "rev-parse", "HEAD"], worktree)

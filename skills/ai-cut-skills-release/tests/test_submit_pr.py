@@ -418,28 +418,33 @@ class SubmitPrHelpersTests(unittest.TestCase):
                                             ):
                                                 with patch.object(
                                                     MODULE,
-                                                    "ensure_staged_scope",
-                                                    return_value=["skills/demo/SKILL.md"],
+                                                    "create_check_worktree",
+                                                    return_value=(root, root),
                                                 ):
                                                     with patch.object(
                                                         MODULE,
-                                                        "run_checks",
-                                                        return_value=failed_checks,
+                                                        "ensure_staged_scope",
+                                                        return_value=["skills/demo/SKILL.md"],
                                                     ):
-                                                        with patch.object(MODULE, "remove_worktree"):
-                                                            with patch.object(
-                                                                MODULE,
-                                                                "ensure_fork_repository",
-                                                            ) as ensure_fork:
+                                                        with patch.object(
+                                                            MODULE,
+                                                            "run_checks",
+                                                            return_value=failed_checks,
+                                                        ):
+                                                            with patch.object(MODULE, "remove_worktree"):
                                                                 with patch.object(
                                                                     MODULE,
-                                                                    "ensure_release_push_remote",
-                                                                ) as ensure_remote:
-                                                                    with self.assertRaisesRegex(
-                                                                        MODULE.ReleaseError,
-                                                                        "提交前校验失败",
-                                                                    ):
-                                                                        MODULE.run_release(config)
+                                                                    "ensure_fork_repository",
+                                                                ) as ensure_fork:
+                                                                    with patch.object(
+                                                                        MODULE,
+                                                                        "ensure_release_push_remote",
+                                                                    ) as ensure_remote:
+                                                                        with self.assertRaisesRegex(
+                                                                            MODULE.ReleaseError,
+                                                                            "提交前校验失败",
+                                                                        ):
+                                                                            MODULE.run_release(config)
 
             ensure_fork.assert_not_called()
             ensure_remote.assert_not_called()
