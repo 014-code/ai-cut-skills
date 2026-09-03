@@ -3931,81 +3931,6 @@ class UserGrowthBrowserClient:
                 f"field={field_text}, value={value_text}, attempt={attempt}"
             )
 
-    async def _ensure_arlp_delivery_field_values(
-            self,
-            page,
-            field_text: str,
-            value_texts: Iterable[str],
-    ) -> bool:
-        """ARLP 弹窗使用录入弹窗改动前的字段选择流程。"""
-        values = [str(value or "").strip() for value in value_texts if str(value or "").strip()]
-        if not values:
-            return True
-        selected = True
-        keep_dropdown_open = field_text == "投放平台"
-        for value_text in values:
-            if await self._delivery_field_has_value(page, field_text, value_text):
-                continue
-            success = await self._ensure_arlp_delivery_field_value(
-                page,
-                field_text,
-                value_text,
-                keep_dropdown_open=keep_dropdown_open,
-            )
-            selected = selected and success
-        await self._close_open_delivery_dropdown_if_needed(page)
-        return selected
-
-    async def _ensure_arlp_delivery_field_value(
-            self,
-            page,
-            field_text: str,
-            value_text: str,
-            *,
-            keep_dropdown_open: bool = False,
-    ) -> bool:
-        """按旧版 ARLP 产品/平台逻辑选择一个值。"""
-        if await self._delivery_field_has_value(page, field_text, value_text):
-            return True
-        attempt = 0
-        while True:
-            self._raise_if_cancelled()
-            attempt += 1
-            if keep_dropdown_open:
-                if not await self._delivery_dropdown_opened(page):
-                    if not await self._open_delivery_dropdown_by_label(page, field_text):
-                        await page.wait_for_timeout(120)
-                        continue
-                await page.wait_for_timeout(120)
-            else:
-                await self._close_open_delivery_dropdown_if_needed(page)
-                if not await self._open_delivery_dropdown_by_label(page, field_text):
-                    await page.wait_for_timeout(200)
-                    continue
-                await page.wait_for_timeout(220)
-
-            # ARLP 产品保持原来从已渲染列表定位的方式，只有平台字段输入搜索词。
-            if field_text == "投放平台":
-                await self._snapshot(page, f"arlp_delivery_platform_dropdown_{attempt}")
-                await self._type_into_open_dropdown(page, value_text)
-                await self._snapshot(page, f"arlp_delivery_platform_after_type_{attempt}")
-            clicked = await self._click_dropdown_option(page, value_text)
-            if not clicked:
-                await page.wait_for_timeout(120 if keep_dropdown_open else 200)
-                continue
-
-            async def value_selected() -> bool:
-                return await self._delivery_field_has_value(page, field_text, value_text)
-
-            if await self._wait_for_result(value_selected, timeout_ms=None, interval_ms=400):
-                if not keep_dropdown_open:
-                    await self._close_open_delivery_dropdown_if_needed(page)
-                return True
-            self._write_run_log(
-                f"[{datetime.now().isoformat(timespec='seconds')}] ARLP delivery field waiting "
-                f"field={field_text}, value={value_text}, attempt={attempt}"
-            )
-
     @staticmethod
     def _delivery_search_terms(field_text: str, value_text: str) -> tuple[str, ...]:
         """返回投放字段搜索词，兼容产品接口只接受名称或编号的实现。"""
@@ -4169,8 +4094,13 @@ class UserGrowthBrowserClient:
         if aria_selected == "true" or "selected" in class_name:
             return True
         try:
-            # 多选项里有 check 图标时也视为已选中，避免重复点击导致反选。
-            return bool(await option.locator(".arco-icon-check").count())
+            # Arco 可能为每个选项都渲染隐藏的 check 节点；只有可见或明确
+            # 已勾选的标记才代表已选，否则搜索结果会被误判为已选而不点击。
+            markers = option.locator(
+                "[aria-checked='true'], [data-selected='true'], [data-state='checked'], "
+                "input[type='checkbox']:checked, .arco-checkbox-checked, .arco-icon-check:visible"
+            )
+            return bool(await markers.count())
         except Exception:
             return False
 
@@ -6743,11 +6673,11 @@ class UserGrowthBrowserClient:
     ) -> None:
         """填写红果增加 ARLP 弹窗中的投放产品和平台。"""
         products = list(stage_config.get("products") or [])
-        if not await self._ensure_arlp_delivery_field_values(page, "投放产品", products):
+        if not await self._ensure_delivery_field_values(page, "投放产品", products):
             await self._snapshot_error(page, "redfruit_arlp_product_not_selected")
             raise RuntimeError(f"增加 ARLP 未选中投放产品：{'、'.join(products)}")
         platform_values = list(stage_config.get("platforms") or [])
-        platform_ok = await self._ensure_arlp_delivery_field_values(page, "投放平台", platform_values)
+        platform_ok = await self._ensure_delivery_field_values(page, "投放平台", platform_values)
         if not platform_ok:
             await self._snapshot_error(page, "redfruit_arlp_platform_not_selected")
             raise RuntimeError("增加 ARLP 未选中投放平台")
