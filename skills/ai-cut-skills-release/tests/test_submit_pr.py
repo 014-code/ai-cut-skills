@@ -52,12 +52,12 @@ class SubmitPrHelpersTests(unittest.TestCase):
     def test_refuses_orphan_branch_with_different_tree(self) -> None:
         with patch.object(MODULE, "run_command", side_effect=["head base", "tree-a", "tree-b"]):
             with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
-                MODULE.verify_orphan_submission(Path("."), "base", "head")
+                MODULE.verify_retry_submission(Path("."), "base", "head", "base")
 
     def test_refuses_orphan_branch_with_different_parent(self) -> None:
         with patch.object(MODULE, "run_command", side_effect=["head other-base", "tree", "tree"]):
             with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
-                MODULE.verify_orphan_submission(Path("."), "base", "head")
+                MODULE.verify_retry_submission(Path("."), "base", "head", "base")
 
     def test_finds_only_matching_open_pr(self) -> None:
         with patch.object(
@@ -376,6 +376,21 @@ class SubmitPrHelpersTests(unittest.TestCase):
         for url in ("https://github.com/owner/repo.git", "ssh://git@github.com/owner/repo.git", "git@github.com:owner/repo.git"):
             self.assertEqual(MODULE.repository_from_url(url), "owner/repo")
 
+    def test_option_like_remotes_are_rejected_before_git_execution(self) -> None:
+        for remote in ("--upload-pack=invalid", "--receive-pack=invalid", "../other", "https://github.com/o/r"):
+            with self.subTest(remote=remote):
+                for flag in ("--base-remote", "--push-remote"):
+                    with self.assertRaises(MODULE.ReleaseError):
+                        release_config(Path("."), f"{flag}={remote}")
+                with patch.object(MODULE, "run_command") as run:
+                    with self.assertRaises(MODULE.ReleaseError):
+                        MODULE.fetch_base_commit(Path("."), remote, "main")
+                    with self.assertRaises(MODULE.ReleaseError):
+                        MODULE.remote_branch_sha(Path("."), remote, "branch")
+                    with self.assertRaises(MODULE.ReleaseError):
+                        MODULE.build_push_args(remote, "branch", None)
+                run.assert_not_called()
+
     def test_auto_fork_is_enabled_by_default_and_can_be_disabled(self) -> None:
         config = MODULE.parse_args(
             [
@@ -490,7 +505,10 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.assertEqual(create.call_args.args[2], self.latest_sha)
 
     def test_stale_checkout_is_rejected_before_any_github_mutation(self) -> None:
-        with patch.object(MODULE, "ensure_fork_repository") as fork:
+        with (
+            patch.object(MODULE, "ensure_fork_repository") as fork,
+            patch.object(MODULE, "resolve_target_repository", return_value="owner/repo"),
+        ):
             with self.assertRaisesRegex(MODULE.ReleaseError, "不包含最新基线"):
                 MODULE.run_release(release_config(self.local, "--execute"))
         fork.assert_not_called()
@@ -556,7 +574,7 @@ class ReleaseExecutionTests(unittest.TestCase):
         existing_sha = self.publish_existing_pr()
         (self.local / "skills/demo/local.txt").write_text("local change\n")
         with self.stubs(self.pr):
-            with self.assertRaisesRegex(MODULE.ReleaseError, "不包含已有 PR"):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
                 MODULE.run_release(self.config)
         self.assertEqual(self.git(self.remote, "rev-parse", self.branch), existing_sha)
 
@@ -590,6 +608,32 @@ class ReleaseExecutionTests(unittest.TestCase):
         self.assertEqual(self.git(self.remote, "rev-parse", self.branch), orphan_sha)
         self.assertFalse(any(item.args[0][:2] == ["git", "push"] for item in run.call_args_list))
 
+    def test_created_pr_with_lost_response_retries_without_sync_or_push(self) -> None:
+        orphan_sha = self.create_orphan()
+        with self.stubs(self.pr):
+            with patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run:
+                result = MODULE.run_release(self.config)
+        self.assertEqual(result["commit"], orphan_sha)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.branch), orphan_sha)
+        self.assertFalse(any(item.args[0][:2] == ["git", "push"] for item in run.call_args_list))
+
+    def test_existing_pr_update_api_failure_can_retry_identical_content(self) -> None:
+        previous_sha = self.publish_existing_pr()
+        self.git(self.local, "fetch", "origin", self.branch)
+        self.git(self.local, "merge", "--ff-only", previous_sha)
+        (self.local / "skills/demo/local.txt").write_text("additional change\n")
+        with self.stubs(self.pr):
+            with patch.object(MODULE, "create_or_update_pr", side_effect=MODULE.ReleaseError("PR API timeout")):
+                with self.assertRaisesRegex(MODULE.ReleaseError, "PR API timeout"):
+                    MODULE.run_release(self.config)
+        submitted_sha = self.git(self.remote, "rev-parse", self.branch)
+        with self.stubs(self.pr):
+            with patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run:
+                result = MODULE.run_release(self.config)
+        self.assertEqual(result["commit"], submitted_sha)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.branch), submitted_sha)
+        self.assertFalse(any(item.args[0][:2] == ["git", "push"] for item in run.call_args_list))
+
     def test_orphan_retry_with_changed_submission_is_rejected(self) -> None:
         orphan_sha = self.create_orphan()
         (self.local / "skills/demo/local.txt").write_text("different change\n")
@@ -600,16 +644,16 @@ class ReleaseExecutionTests(unittest.TestCase):
 
     def test_remote_change_after_orphan_verification_prevents_pr_creation(self) -> None:
         self.create_orphan()
-        original_verify = MODULE.verify_orphan_submission
+        original_verify = MODULE.verify_retry_submission
         original_create = MODULE.create_or_update_pr
 
-        def change_remote_after_verification(worktree, base_commit, remote_sha):
-            original_verify(worktree, base_commit, remote_sha)
+        def change_remote_after_verification(worktree, base_commit, remote_sha, source_head):
+            original_verify(worktree, base_commit, remote_sha, source_head)
             self.git(self.remote, "update-ref", f"refs/heads/{self.branch}", self.latest_sha)
 
         with (
             self.stubs(),
-            patch.object(MODULE, "verify_orphan_submission", side_effect=change_remote_after_verification),
+            patch.object(MODULE, "verify_retry_submission", side_effect=change_remote_after_verification),
             patch.object(MODULE, "create_or_update_pr", new=original_create),
             patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run,
         ):

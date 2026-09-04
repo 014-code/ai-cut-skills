@@ -15,12 +15,14 @@ description: "提交 AI Cut Skills 仓库改动并创建或更新 GitHub PR；�
 4. 只带入目标 Skill 及显式指定的附加文件，不把其他工作区改动混入提交；符号链接路径会被拒绝，避免把仓库外文件复制进提交。
 5. 提交前执行 Skill 结构校验、仓库清单校验、语法检查，以及仓库 `tests/` 和每个所选 Skill 的 `tests/` 下的 unittest。默认静态预检不执行清单脚本和 unittest，结果中明确标为未运行。
 6. 生成规范 commit，推送到当前账户 fork，创建或更新对应 GitHub PR。
-7. 更新已有 PR 时，PR 分支须包含最新基线，当前 `HEAD` 须包含 PR 全部提交；在 PR 原头提交上追加 commit 并普通快进推送，不重建覆盖历史。若只有已推送分支而无 PR，仅当它的单一父提交和完整文件树精确匹配本次提交时才重试创建 PR，不重复推送。
+7. 新增 PR 改动时，PR 分支须包含最新基线，当前 `HEAD` 须包含 PR 全部提交；在 PR 原头提交上追加 commit 并普通快进推送，不重建覆盖历史。若推送成功后 PR API 失败，无论 PR 是否已创建，只在远端提交的单一父提交属于当前工作区历史且包含最新基线、完整文件树与本次提交完全相同时重试 PR API，不重复推送。
 
 ## 认证
 
 使用本机现有的 GitHub CLI 登录态或 Git Credential Manager/SSH Agent。通过 `--github-account` 可以校验登录账户；不要把 GitHub 密码、Token 或私钥写入参数、配置、任务文件、日志或 PR 内容。
 自动 fork 通过 GitHub CLI 完成，仍然只使用登录态，不接受或保存密码。已有的 `origin`（或 `--push-remote` 指定远端）如果缺失会添加为当前账户 fork；如果已指向其他仓库则停止，不自动改写。
+
+`--base-remote` 和 `--push-remote` 只接受以字母或数字开头的简单远端名称，不接受 URL、路径或命令选项；基线远端必须已配置为安全的 GitHub URL。
 
 ## 命令
 

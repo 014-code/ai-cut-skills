@@ -250,6 +250,7 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
 
 
 def remote_repository(repo_root: Path, remote: str) -> str:
+    remote = validate_segment(remote, "远端名称")
     url = run_command(["git", "remote", "get-url", remote], repo_root)
     return repository_from_url(url)
 
@@ -361,6 +362,7 @@ def fork_clone_url(owner: str, repo: str) -> str:
 
 
 def ensure_push_remote(repo_root: Path, remote: str, expected_repository: str, owner: str, repo: str) -> None:
+    remote = validate_segment(remote, "远端名称")
     expected_full_name = f"{owner}/{repo}"
     status, output, error = run_command_result(["git", "remote", "get-url", "--all", remote], repo_root)
     if status != 0 or not output:
@@ -497,6 +499,7 @@ def find_open_pr(
 
 
 def remote_branch_sha(repo_root: Path, remote: str, branch: str) -> str | None:
+    remote = validate_segment(remote, "远端名称")
     output = run_command(
         ["git", "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
         repo_root,
@@ -513,6 +516,7 @@ def remote_branch_sha(repo_root: Path, remote: str, branch: str) -> str | None:
 
 
 def build_push_args(remote: str, branch: str, remote_sha: str | None) -> list[str]:
+    remote = validate_segment(remote, "远端名称")
     # Existing PR updates are descendants of their fetched remote head.
     # A concurrent remote update must be rejected, never overwritten.
     return ["git", "push", "--set-upstream", remote, branch]
@@ -721,9 +725,9 @@ def parse_args(argv: list[str] | None = None) -> ReleaseConfig:
         summary=args.summary.strip(),
         scope=validate_segment(scope, "作用域"),
         date=validate_date(args.date),
-        base_remote=args.base_remote,
+        base_remote=validate_segment(args.base_remote, "基线远端"),
         base_branch=validate_segment(args.base_branch, "基线分支"),
-        push_remote=args.push_remote,
+        push_remote=validate_segment(args.push_remote, "推送远端"),
         github_account=args.github_account,
         target_repository=args.target_repository,
         execute=args.execute,
@@ -736,6 +740,7 @@ def parse_args(argv: list[str] | None = None) -> ReleaseConfig:
 
 def fetch_base_commit(repo_root: Path, remote: str, branch: str) -> str:
     """Refresh an explicit tracking ref, then pin this release to its commit."""
+    remote = validate_segment(remote, "远端名称")
     tracking_ref = f"refs/remotes/{remote}/{branch}"
     run_command([
         "git", "fetch", "--no-tags", "--refmap=", remote,
@@ -750,18 +755,21 @@ def require_ancestor(repo_root: Path, ancestor: str, descendant: str, message: s
         raise ReleaseError(message)
 
 
-def verify_orphan_submission(worktree: Path, base_commit: str, remote_sha: str) -> None:
-    """Retry PR creation only for exactly the intended one-commit submission."""
+def verify_retry_submission(worktree: Path, base_commit: str, remote_sha: str, source_head: str) -> None:
+    """Retry only for an identical tree appended to history the caller contains."""
     parents = run_command(["git", "rev-list", "--parents", "-n", "1", remote_sha], worktree).split()
     intended_tree = run_command(["git", "write-tree"], worktree)
     remote_tree = run_command(["git", "rev-parse", f"{remote_sha}^{{tree}}"], worktree)
-    if parents != [remote_sha, base_commit] or intended_tree != remote_tree:
-        raise ReleaseError(
-            "远端分支没有打开的 PR，且不精确匹配本次提交的基线和文件树；已停止，不覆盖未知改动。"
-        )
+    message = "远端分支不精确匹配本次提交的历史和文件树；已停止，不覆盖未知改动。"
+    if len(parents) != 2 or parents[0] != remote_sha or intended_tree != remote_tree:
+        raise ReleaseError(message)
+    require_ancestor(worktree, base_commit, parents[1], message)
+    require_ancestor(worktree, parents[1], source_head, message)
 
 
 def run_release(config: ReleaseConfig) -> dict[str, object]:
+    validate_segment(config.base_remote, "基线远端")
+    validate_segment(config.push_remote, "推送远端")
     repo_root = Path(run_command(["git", "rev-parse", "--show-toplevel"], config.repo_root)).resolve()
     validate_skill_paths(repo_root, config.skills)
     pathspecs = selected_pathspecs(config)
@@ -791,10 +799,10 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             "execute_command": "加 --execute 执行提交、推送和创建 PR",
         }
 
-    base_commit = fetch_base_commit(repo_root, config.base_remote, config.base_branch)
-    require_ancestor(repo_root, base_commit, "HEAD", "当前 HEAD 不包含最新基线；请先同步上游，避免生成回退 PR。")
-
     repository = resolve_target_repository(repo_root, config.base_remote, config.target_repository)
+    base_commit = fetch_base_commit(repo_root, config.base_remote, config.base_branch)
+    source_head = run_command(["git", "rev-parse", "--verify", "HEAD^{commit}"], repo_root)
+    require_ancestor(repo_root, base_commit, source_head, "当前 HEAD 不包含最新基线；请先同步上游，避免生成回退 PR。")
     head_owner = github_login(repo_root, config.github_account)
     if config.auto_fork:
         _, upstream_repo = split_repository(repository)
@@ -810,6 +818,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
     release_base = base_commit
+    retry_submission = False
     if existing_pr and not existing_remote_sha:
         raise ReleaseError("已有 PR 的远端分支不可用；请先检查 PR 状态。")
     if existing_remote_sha:
@@ -819,9 +828,17 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         if existing_pr:
             require_ancestor(repo_root, base_commit, existing_remote_sha,
                              "已有 PR 分支不包含最新基线；请先更新 PR 分支并同步当前 HEAD。")
-            require_ancestor(repo_root, existing_remote_sha, "HEAD",
-                             "当前 HEAD 不包含已有 PR 的全部提交；请先同步 PR 分支，避免丢失改动。")
-            release_base = existing_remote_sha
+            status, _, _ = run_command_result(
+                ["git", "merge-base", "--is-ancestor", existing_remote_sha, source_head], repo_root,
+            )
+            if status == 0:
+                release_base = existing_remote_sha
+            elif status == 1:
+                retry_submission = True
+            else:
+                raise ReleaseError("无法验证已有 PR 历史；已停止。")
+        else:
+            retry_submission = True
     tracked, untracked = list_changed_paths(repo_root, release_base, pathspecs)
     changed = tracked + untracked
     if not changed:
@@ -835,10 +852,11 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             raise ReleaseError("提交前校验失败，请先处理 PR 检查结果")
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
-        if existing_remote_sha and not existing_pr:
-            # A prior push may have succeeded before the PR API failed.
-            # Never rewrite this orphan: verify its content and retry only PR creation.
-            verify_orphan_submission(worktree, base_commit, existing_remote_sha)
+        if retry_submission:
+            # The PR API may have failed before or after creating the PR.
+            # Matching local content can retry the API, but never rewrite the branch.
+            assert existing_remote_sha is not None
+            verify_retry_submission(worktree, base_commit, existing_remote_sha, source_head)
             commit = existing_remote_sha
         else:
             run_command(["git", "commit", "-m", title], worktree)
