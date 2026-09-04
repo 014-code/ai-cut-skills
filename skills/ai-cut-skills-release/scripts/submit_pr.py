@@ -206,7 +206,7 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
     if sync_script.is_file() and allow_repo_code:
         check("catalog", [sys.executable, "-X", "utf8", str(sync_script), "--check"])
     elif sync_script.is_file():
-        checks.append({"name": "catalog", "ok": True, "output": "not run: repository code requires --run-tests or --execute"})
+        checks.append({"name": "catalog", "ok": True, "skipped": True, "output": "repository code requires --run-tests or --execute"})
 
     python_files = []
     for skill in config.skills:
@@ -224,9 +224,9 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
     check("cached_diff_check", ["git", "diff", "--no-ext-diff", "--no-textconv", "--cached", "--check"])
 
     if config.skip_tests:
-        checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
+        checks.append({"name": "tests", "ok": True, "skipped": True, "output": "skipped by --skip-tests"})
     elif not allow_repo_code:
-        checks.append({"name": "tests", "ok": True, "output": "not run: repository code requires --run-tests or --execute"})
+        checks.append({"name": "tests", "ok": True, "skipped": True, "output": "repository code requires --run-tests or --execute"})
     else:
         test_roots = [("tests", Path("tests"))]
         test_roots.extend(
@@ -243,7 +243,7 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
                     "-s", relative.as_posix(), "-p", "test_*.py", "-v",
                 ])
             else:
-                checks.append({"name": name, "ok": True, "output": f"no unittest files in {relative}"})
+                checks.append({"name": name, "ok": True, "skipped": True, "output": f"no unittest files in {relative}"})
 
     checks.append({"name": "changed_paths", "ok": True, "output": "\n".join(changed_paths)})
     return {"ok": all(bool(item.get("ok")) for item in checks), "checks": checks}
@@ -367,7 +367,10 @@ def ensure_push_remote(repo_root: Path, remote: str, expected_repository: str, o
     status, output, error = run_command_result(["git", "remote", "get-url", "--all", remote], repo_root)
     if status != 0 or not output:
         run_command(["git", "remote", "add", remote, fork_clone_url(owner, repo)], repo_root)
-        return
+        # Global insteadOf/pushInsteadOf rules also affect newly added remotes.
+        status, output, error = run_command_result(["git", "remote", "get-url", "--all", remote], repo_root)
+        if status != 0 or not output:
+            raise ReleaseError(f"无法复核新增推送远端 {remote} 的有效 URL")
 
     fetch_urls = [line for line in output.splitlines() if line.strip()]
     if not fetch_urls:
@@ -618,9 +621,15 @@ def ensure_staged_scope(worktree: Path, pathspecs: list[str]) -> list[str]:
 
 def pr_body(config: ReleaseConfig, branch: str, staged: list[str], checks: dict[str, object]) -> str:
     rows = checks.get("checks", [])
-    status = "通过" if checks.get("ok") else "失败"
+    status = "失败" if not checks.get("ok") else (
+        "部分未运行" if any(row.get("skipped") for row in rows) else "通过"
+    )
     check_lines = "\n".join(
-        f"- {'通过' if row.get('ok') else '失败'}：{row.get('name')}"
+        (
+            f"- 未运行：{row.get('name')}（{row.get('output', '')}）"
+            if row.get("skipped") else
+            f"- {'通过' if row.get('ok') else '失败'}：{row.get('name')}"
+        )
         for row in rows
         if row.get("name") not in {"changed_paths"}
     )

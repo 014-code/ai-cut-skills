@@ -35,7 +35,7 @@
 
 `ai-cut-skills-release` 的安全测试还通过仓库级测试入口加入现有 PR CI，无需修改工作流或降低门禁。
 
-任何失败都会阻止 commit 和 push。校验结果会写入 PR 描述，不写入凭据。
+任何失败都会阻止 commit 和 push。校验结果会写入 PR 描述，不写入凭据。跳过测试、未授权运行仓库代码或没有测试文件的项目会独立标为“未运行”并附原因，不能显示为通过。
 
 默认计划模式仅用可信的 Skill 校验器、Python 静态语法检查和 Git 空白检查，不运行仓库清单脚本或测试，也不创建 worktree。`--run-tests` 显式允许计划模式运行仓库代码，`--execute` 的提交检查默认运行这些代码；`--skip-tests` 仅跳过 unittest。检查 worktree 不是沙箱，仓库代码仍有当前进程的文件和网络权限。
 
@@ -62,7 +62,7 @@
 
 创建或更新 PR 前再次查询远端分支 SHA，必须仍等于本次已验证或推送的 commit，否则停止。GitHub PR 创建 API 不能原子锁定分支，创建后的远端变更仍由 PR 自身的 head-SHA 门禁重新审查。
 
-推送前会分别读取 remote 的 fetch URL 和 `remote.<name>.pushurl` 展开的所有有效 push URL。任何 URL 不是当前账户 fork 都会停止；不能只依赖 fetch URL 判断推送目标。
+推送前会分别读取 remote 的 fetch URL 和 `remote.<name>.pushurl` 展开的所有有效 push URL，新建 remote 后也必须立即重新读取和验证，包含 Git `insteadOf`/`pushInsteadOf` 的重写结果。任何 URL 不是当前账户 fork 都会停止；不能只依赖 fetch URL 判断推送目标。
 
 远端只接受 HTTPS、SSH 或 `git@github.com:owner/repo.git`，拒绝 HTTP、git 明文协议等其他传输。URL 不得携带 HTTPS 用户信息或查询参数；错误信息统一隐藏 URL 和可识别的凭据，避免 Git 诊断回显认证信息。
 

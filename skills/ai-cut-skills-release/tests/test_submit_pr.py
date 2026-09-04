@@ -164,7 +164,11 @@ class SubmitPrHelpersTests(unittest.TestCase):
             )
 
     def test_adds_missing_push_remote_to_current_account_fork(self) -> None:
-        with patch.object(MODULE, "run_command_result", return_value=(2, "", "No such remote")):
+        with patch.object(MODULE, "run_command_result", side_effect=[
+            (2, "", "No such remote"),
+            (0, "https://github.com/014-code/ai-cut-skills.git", ""),
+            (0, "https://github.com/014-code/ai-cut-skills.git", ""),
+        ]):
             with patch.object(MODULE, "run_command") as run:
                 MODULE.ensure_push_remote(
                     Path("."),
@@ -178,6 +182,19 @@ class SubmitPrHelpersTests(unittest.TestCase):
             ["git", "remote", "add", "origin", "https://github.com/014-code/ai-cut-skills.git"],
             Path("."),
         )
+
+    def test_new_remote_rejects_effective_push_url_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            MODULE.run_command(["git", "init"], root)
+            MODULE.run_command([
+                "git", "config", "url.https://github.com/other-account/.pushInsteadOf",
+                "https://github.com/014-code/",
+            ], root)
+            with self.assertRaisesRegex(MODULE.ReleaseError, "push URL.*不匹配"):
+                MODULE.ensure_push_remote(root, "origin", "liudu2326526/ai-cut-skills", "014-code", "ai-cut-skills")
+            effective = MODULE.run_command(["git", "remote", "get-url", "--push", "origin"], root)
+            self.assertEqual(effective, "https://github.com/other-account/ai-cut-skills.git")
 
     def test_does_not_rewrite_push_remote_pointing_to_another_repository(self) -> None:
         with patch.object(MODULE, "run_command_result", return_value=(0, "git@github.com:someone/other.git", "")):
@@ -746,6 +763,15 @@ class ReleaseTestDiscoveryTests(unittest.TestCase):
             results = self.check_results("--skip-tests")
         self.assertTrue(results["ok"], results)
         self.assertFalse(any("unittest" in item.args[0] for item in run.call_args_list))
+
+    def test_pr_body_does_not_claim_skipped_tests_passed(self) -> None:
+        self.write_test("tests", passing=False)
+        results = self.check_results("--skip-tests")
+        body = MODULE.pr_body(release_config(self.root, "--skip-tests"), "branch", [], results)
+        self.assertIn("部分未运行", body)
+        self.assertIn("未运行：tests", body)
+        self.assertIn("--skip-tests", body)
+        self.assertNotIn("通过：tests", body)
 
 
 if __name__ == "__main__":
