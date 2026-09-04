@@ -373,5 +373,146 @@ class SubmitPrHelpersTests(unittest.TestCase):
         )
 
 
+def release_config(root: Path, *extra: str):
+    return MODULE.parse_args([
+        "--repo-root", str(root), "--skill", "demo", "--group", "test",
+        "--change-type", "fix", "--summary", "regression test", *extra,
+    ])
+
+
+class ReleaseBaselineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        self.git(self.source, "init", "--initial-branch=main")
+        self.git(self.source, "config", "user.name", "Release Test")
+        self.git(self.source, "config", "user.email", "test@example.invalid")
+        skill = self.source / "skills" / "demo"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("demo\n", encoding="utf-8")
+        self.git(self.source, "add", ".")
+        self.git(self.source, "commit", "-m", "initial")
+        self.old_sha = self.git(self.source, "rev-parse", "HEAD")
+        self.remote = self.root / "remote.git"
+        self.git(self.root, "clone", "--bare", str(self.source), str(self.remote))
+        self.local = self.root / "local"
+        self.git(self.root, "clone", "--origin", "upstream", str(self.remote), str(self.local))
+        (self.source / "upstream.txt").write_text("new upstream content\n", encoding="utf-8")
+        self.git(self.source, "add", ".")
+        self.git(self.source, "commit", "-m", "advance upstream")
+        self.latest_sha = self.git(self.source, "rev-parse", "HEAD")
+        self.git(self.source, "push", str(self.remote), "main")
+        self.git(self.local, "config", "remote.upstream.fetch",
+                 "+refs/heads/release:refs/remotes/upstream/release")
+
+    @staticmethod
+    def git(root: Path, *args: str) -> str:
+        return MODULE.run_command(["git", *args], root)
+
+    def test_fetch_refreshes_stale_tracking_ref_and_worktree_baseline(self) -> None:
+        # With a narrowed configured refmap, the old command leaves main stale.
+        self.git(self.local, "fetch", "upstream", "main")
+        self.assertEqual(self.git(self.local, "rev-parse", "FETCH_HEAD"), self.latest_sha)
+        self.assertEqual(self.git(self.local, "rev-parse", "upstream/main"), self.old_sha)
+
+        sha = MODULE.fetch_base_commit(self.local, "upstream", "main")
+        self.assertEqual(sha, self.latest_sha)
+        self.assertEqual(self.git(self.local, "rev-parse", "upstream/main"), self.latest_sha)
+        parent, worktree = MODULE.create_check_worktree(self.local, sha, ["skills/demo"], [])
+        try:
+            self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), self.latest_sha)
+            self.assertEqual((worktree / "upstream.txt").read_text(), "new upstream content\n")
+        finally:
+            MODULE.remove_worktree(self.local, worktree, parent)
+
+    def test_failed_fetch_does_not_fall_back_to_existing_tracking_ref(self) -> None:
+        self.git(self.remote, "update-ref", "-d", "refs/heads/main")
+        with self.assertRaises(MODULE.ReleaseError):
+            MODULE.fetch_base_commit(self.local, "upstream", "main")
+        self.assertEqual(self.git(self.local, "rev-parse", "upstream/main"), self.old_sha)
+
+    def test_execute_uses_same_resolved_sha_for_diff_and_worktree(self) -> None:
+        config = release_config(self.local, "--execute")
+        with (
+            patch.object(MODULE, "fetch_base_commit", return_value=self.latest_sha),
+            patch.object(MODULE, "list_changed_paths", return_value=(["skills/demo/SKILL.md"], [])) as changes,
+            patch.object(MODULE, "resolve_target_repository", return_value="owner/repo"),
+            patch.object(MODULE, "github_login", return_value="owner"),
+            patch.object(MODULE, "ensure_fork_repository"),
+            patch.object(MODULE, "find_open_pr", return_value=None),
+            patch.object(MODULE, "remote_branch_sha", return_value=None),
+            patch.object(MODULE, "create_worktree", side_effect=MODULE.ReleaseError("stop before writes")) as create,
+        ):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "stop before writes"):
+                MODULE.run_release(config)
+        self.assertEqual(changes.call_args.args[1], self.latest_sha)
+        self.assertEqual(create.call_args.args[2], self.latest_sha)
+
+
+class ReleaseTestDiscoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        MODULE.run_command(["git", "init"], self.root)
+        skill = self.root / "skills" / "demo"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("demo\n", encoding="utf-8")
+        validator = self.root / "validate.py"
+        validator.write_text("", encoding="utf-8")
+        validator_patch = patch.object(MODULE, "quick_validator_path", return_value=validator)
+        validator_patch.start()
+        self.addCleanup(validator_patch.stop)
+
+    def write_test(self, directory: str, *, passing: bool) -> None:
+        tests = self.root / directory
+        tests.mkdir(parents=True)
+        (tests / "test_contract.py").write_text(
+            "import unittest\nclass ContractTest(unittest.TestCase):\n"
+            f"    def test_contract(self):\n        self.assertTrue({passing!r})\n",
+            encoding="utf-8",
+        )
+
+    def check_results(self, *extra: str) -> dict:
+        return MODULE.run_checks(self.root, release_config(self.root, *extra), changed_paths=[])
+
+    def test_root_pass_does_not_hide_selected_skill_failure_with_same_module_name(self) -> None:
+        self.write_test("tests", passing=True)
+        self.write_test("skills/demo/tests", passing=False)
+        results = self.check_results()
+        checks = {check["name"]: check for check in results["checks"]}
+        self.assertTrue(checks["tests"]["ok"])
+        self.assertFalse(checks["tests:demo"]["ok"])
+        self.assertFalse(results["ok"])
+
+    def test_skill_tests_run_without_repository_tests(self) -> None:
+        self.write_test("skills/demo/tests", passing=False)
+        results = self.check_results()
+        self.assertFalse(results["ok"])
+        self.assertTrue(any(check["name"] == "tests:demo" for check in results["checks"]))
+
+    def test_passing_selected_tests_do_not_run_unselected_skill_tests(self) -> None:
+        self.write_test("tests", passing=True)
+        self.write_test("skills/demo/tests", passing=True)
+        self.write_test("skills/unselected/tests", passing=False)
+        results = self.check_results()
+        self.assertTrue(results["ok"], results)
+        self.assertEqual(
+            {check["name"] for check in results["checks"] if check["name"].startswith("tests")},
+            {"tests", "tests:demo"},
+        )
+
+    def test_skip_tests_skips_both_repository_and_selected_skill_suites(self) -> None:
+        self.write_test("tests", passing=False)
+        self.write_test("skills/demo/tests", passing=False)
+        with patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run:
+            results = self.check_results("--skip-tests")
+        self.assertTrue(results["ok"], results)
+        self.assertFalse(any("unittest" in item.args[0] for item in run.call_args_list))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,8 @@
 
 目标 Skill 通过重复的 `--skill` 指定，额外测试或清单文件必须通过 `--include` 明确指定。脚本会从最新基线重建临时 worktree，再把这些路径的已提交、已暂存和未暂存差异应用到新分支，避免把当前工作区的其他改动带入 PR。
 
+执行模式使用显式的 `refs/heads/<base>:refs/remotes/<remote>/<base>` 抓取映射，不依赖本地 remote 的默认 fetch 配置。抓取成功后解析并固定 commit SHA，差异比较和 worktree 都使用该 SHA；抓取失败则停止，不能退回陈旧的远端跟踪引用。
+
 运行时缓存、编译产物和其他未列入允许范围的文件不会被提交。
 符号链接路径也不允许进入变更范围；脚本会在收集变更和复制未跟踪文件时检查每一级路径，避免跟随链接读取仓库外内容。
 
@@ -25,7 +27,9 @@
 - `scripts/sync_skills.py --check` 校验仓库 catalog；
 - Python 文件语法检查；
 - `git diff --check`；
-- 仓库 `tests/` 下的 unittest（可用 `--skip-tests` 明确跳过）。
+- 仓库 `tests/` 和每个所选 Skill 的 `tests/` 下的 unittest，分别启动独立进程，避免同名测试模块冲突（`--skip-tests` 会明确跳过这两类测试）。
+
+`ai-cut-skills-release` 的安全测试还通过仓库级测试入口加入现有 PR CI，无需修改工作流或降低门禁。
 
 任何失败都会阻止 commit 和 push。校验结果会写入 PR 描述，不写入凭据。
 

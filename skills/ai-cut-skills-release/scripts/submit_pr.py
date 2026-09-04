@@ -212,16 +212,25 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
     check("diff_check", ["git", "diff", "--check"])
     check("cached_diff_check", ["git", "diff", "--cached", "--check"])
 
-    tests_root = repo_root / "tests"
     if config.skip_tests:
         checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
-    elif tests_root.is_dir() and any(tests_root.glob("test_*.py")):
-        check(
-            "tests",
-            [sys.executable, "-X", "utf8", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"],
-        )
     else:
-        checks.append({"name": "tests", "ok": True, "output": "no repository unittest files"})
+        test_roots = [("tests", Path("tests"))]
+        test_roots.extend(
+            (f"tests:{skill}", Path("skills") / skill / "tests")
+            for skill in config.skills
+        )
+        for name, relative in test_roots:
+            tests_root = repo_root / relative
+            if tests_root.is_dir() and any(tests_root.glob("test_*.py")):
+                # Separate interpreters prevent same-named test modules in
+                # different Skills from shadowing one another.
+                check(name, [
+                    sys.executable, "-X", "utf8", "-m", "unittest", "discover",
+                    "-s", relative.as_posix(), "-p", "test_*.py", "-v",
+                ])
+            else:
+                checks.append({"name": name, "ok": True, "output": f"no unittest files in {relative}"})
 
     checks.append({"name": "changed_paths", "ok": True, "output": "\n".join(changed_paths)})
     return {"ok": all(bool(item.get("ok")) for item in checks), "checks": checks}
@@ -721,6 +730,16 @@ def parse_args(argv: list[str] | None = None) -> ReleaseConfig:
     )
 
 
+def fetch_base_commit(repo_root: Path, remote: str, branch: str) -> str:
+    """Refresh an explicit tracking ref, then pin this release to its commit."""
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    run_command([
+        "git", "fetch", "--no-tags", "--refmap=", remote,
+        f"+refs/heads/{branch}:{tracking_ref}",
+    ], repo_root)
+    return run_command(["git", "rev-parse", "--verify", f"{tracking_ref}^{{commit}}"], repo_root)
+
+
 def run_release(config: ReleaseConfig) -> dict[str, object]:
     repo_root = Path(run_command(["git", "rev-parse", "--show-toplevel"], config.repo_root)).resolve()
     validate_skill_paths(repo_root, config.skills)
@@ -746,9 +765,8 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             "execute_command": "加 --execute 执行提交、推送和创建 PR",
         }
 
-    run_command(["git", "fetch", config.base_remote, config.base_branch], repo_root)
-    run_command(["git", "rev-parse", "--verify", base_ref], repo_root)
-    tracked, untracked = list_changed_paths(repo_root, base_ref, pathspecs)
+    base_commit = fetch_base_commit(repo_root, config.base_remote, config.base_branch)
+    tracked, untracked = list_changed_paths(repo_root, base_commit, pathspecs)
     changed = tracked + untracked
     if not changed:
         raise ReleaseError("目标 Skill 相对最新基线没有可提交变更")
@@ -770,7 +788,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
     validate_remote_branch_reuse(branch, existing_remote_sha, existing_pr)
-    parent, worktree = create_worktree(repo_root, branch, base_ref, pathspecs, untracked)
+    parent, worktree = create_worktree(repo_root, branch, base_commit, pathspecs, untracked)
     try:
         staged = ensure_staged_scope(worktree, pathspecs)
         checks = run_checks(worktree, config, changed_paths=staged)
@@ -784,6 +802,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         result = {
             "status": "submitted",
             "branch": branch,
+            "base_commit": base_commit,
             "commit": run_command(["git", "rev-parse", "HEAD"], worktree),
             "repository": repository,
             "pr_url": pr_url,
