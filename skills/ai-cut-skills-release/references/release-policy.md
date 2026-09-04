@@ -56,7 +56,11 @@
 
 这允许“push 成功、PR API 随后失败”的相同提交安全重试。若 PR 已经创建而 API 响应丢失，先同步已创建的 PR 头再进行后续增量提交。所有推送都不带 force 选项，远端并发变化导致非快进时由 Git 拒绝。
 
+创建或更新 PR 前再次查询远端分支 SHA，必须仍等于本次已验证或推送的 commit，否则停止。GitHub PR 创建 API 不能原子锁定分支，创建后的远端变更仍由 PR 自身的 head-SHA 门禁重新审查。
+
 推送前会分别读取 remote 的 fetch URL 和 `remote.<name>.pushurl` 展开的所有有效 push URL。任何 URL 不是当前账户 fork 都会停止；不能只依赖 fetch URL 判断推送目标。
+
+远端 URL 不得携带 HTTPS 用户信息或查询参数；错误信息统一隐藏 URL 和可识别的凭据，避免 Git 诊断回显认证信息。
 
 PR 创建和更新都要求 GitHub CLI 已登录并具备目标仓库权限。PR 的 head owner、head branch 和 base branch 必须与本次执行一致。
 

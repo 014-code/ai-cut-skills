@@ -319,10 +319,9 @@ class SubmitPrHelpersTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_updates_existing_pr_through_rest_api(self) -> None:
-        with patch.object(
-            MODULE,
-            "find_open_pr",
-            return_value={"number": 15, "url": "https://example.test/pr/15"},
+        with (
+            patch.object(MODULE, "remote_branch_sha", return_value="a" * 40),
+            patch.object(MODULE, "find_open_pr", return_value={"number": 15, "url": "https://example.test/pr/15"}),
         ):
             with patch.object(MODULE, "run_command", return_value="") as run:
                 result = MODULE.create_or_update_pr(
@@ -333,6 +332,8 @@ class SubmitPrHelpersTests(unittest.TestCase):
                     "fix(demo): update",
                     "## 变更\n\n自动 fork\n",
                     "main",
+                    push_remote="origin",
+                    expected_head_sha="a" * 40,
                 )
 
         self.assertEqual(result, "https://example.test/pr/15")
@@ -340,6 +341,33 @@ class SubmitPrHelpersTests(unittest.TestCase):
         self.assertEqual(args[:5], ["gh", "api", "--method", "PATCH", "repos/liudu2326526/ai-cut-skills/pulls/15"])
         self.assertIn("--raw-field", args)
         self.assertTrue(any(value.startswith("body=## 变更") for value in args))
+
+    def test_remote_url_credentials_do_not_appear_in_errors(self) -> None:
+        secret = "synthetic-password-for-test"
+        for url in (
+            f"https://user:{secret}@other.test/owner/repo.git",
+            f"https://user:{secret}@github.com/owner/repo.git",
+            f"https://github.com/owner/repo.git?token={secret}",
+            f"https://user:{secret}@github.com/malformed",
+        ):
+            with self.subTest(url_kind=url.split("@")[-1]):
+                with self.assertRaises(MODULE.ReleaseError) as caught:
+                    MODULE.repository_from_url(url)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertNotIn(secret, str(MODULE.ReleaseError(f"Git command failed: {url}")))
+
+    def test_rejects_changed_remote_head_before_pr_mutation(self) -> None:
+        with (
+            patch.object(MODULE, "find_open_pr", return_value=None),
+            patch.object(MODULE, "remote_branch_sha", return_value="b" * 40),
+            patch.object(MODULE, "run_command") as run,
+        ):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "在校验后变化"):
+                MODULE.create_or_update_pr(
+                    Path("."), "owner/repo", "branch", "owner", "title", "body", "main",
+                    push_remote="origin", expected_head_sha="a" * 40,
+                )
+        run.assert_not_called()
 
     def test_auto_fork_is_enabled_by_default_and_can_be_disabled(self) -> None:
         config = MODULE.parse_args(
@@ -546,6 +574,25 @@ class ReleaseExecutionTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
                 MODULE.run_release(self.config)
         self.assertEqual(self.git(self.remote, "rev-parse", self.branch), orphan_sha)
+
+    def test_remote_change_after_orphan_verification_prevents_pr_creation(self) -> None:
+        self.create_orphan()
+        original_verify = MODULE.verify_orphan_submission
+        original_create = MODULE.create_or_update_pr
+
+        def change_remote_after_verification(worktree, base_commit, remote_sha):
+            original_verify(worktree, base_commit, remote_sha)
+            self.git(self.remote, "update-ref", f"refs/heads/{self.branch}", self.latest_sha)
+
+        with (
+            self.stubs(),
+            patch.object(MODULE, "verify_orphan_submission", side_effect=change_remote_after_verification),
+            patch.object(MODULE, "create_or_update_pr", new=original_create),
+            patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run,
+        ):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "在校验后变化"):
+                MODULE.run_release(self.config)
+        self.assertFalse(any(item.args[0][0] == "gh" for item in run.call_args_list))
 
 
 class ReleaseTestDiscoveryTests(unittest.TestCase):

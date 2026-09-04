@@ -38,6 +38,13 @@ EXCLUDED_SUFFIXES = (".pyc", ".pyo")
 class ReleaseError(RuntimeError):
     """A validation or repository operation failed."""
 
+    def __init__(self, message: str) -> None:
+        # Git diagnostics can echo configured URLs containing credentials.
+        safe = re.sub(r"(?i)\b(?:https?|ssh)://[^\s]+", "[REDACTED_URL]", str(message))
+        safe = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[opusr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)",
+                      "[REDACTED_SECRET]", safe)
+        super().__init__(safe)
+
 
 @dataclass(frozen=True)
 class ReleaseConfig:
@@ -238,17 +245,7 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
 
 def remote_repository(repo_root: Path, remote: str) -> str:
     url = run_command(["git", "remote", "get-url", remote], repo_root)
-    if url.startswith("git@github.com:"):
-        value = url.split(":", 1)[1]
-    else:
-        parsed = urlparse(url)
-        if parsed.hostname != "github.com":
-            raise ReleaseError(f"远端不是 GitHub 仓库，无法自动创建 PR：{url}")
-        value = parsed.path.lstrip("/")
-    value = value.removesuffix(".git").strip("/")
-    if value.count("/") != 1:
-        raise ReleaseError(f"无法解析 GitHub 仓库：{url}")
-    return value
+    return repository_from_url(url)
 
 
 def repository_from_url(url: str) -> str:
@@ -257,13 +254,20 @@ def repository_from_url(url: str) -> str:
     if url.startswith("git@github.com:"):
         value = url.split(":", 1)[1]
     else:
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+        except ValueError as exc:
+            raise ReleaseError("远端 URL 格式无效") from exc
         if parsed.hostname != "github.com":
-            raise ReleaseError(f"远端不是 GitHub 仓库：{url}")
+            raise ReleaseError("远端不是 GitHub 仓库")
+        if (parsed.password or parsed.query or parsed.fragment or
+                (parsed.username and not (parsed.scheme == "ssh" and parsed.username == "git"))):
+            raise ReleaseError("远端 URL 不得包含凭据、查询参数或片段；请使用 Git 登录态或 SSH Agent")
         value = parsed.path.lstrip("/")
     value = value.removesuffix(".git").strip("/")
-    if value.count("/") != 1:
-        raise ReleaseError(f"无法解析 GitHub 仓库：{url}")
+    parts = value.split("/")
+    if len(parts) != 2 or any(not SAFE_SEGMENT.fullmatch(part) or part in {".", ".."} for part in parts):
+        raise ReleaseError("无法解析 GitHub 仓库 owner/repo")
     return value
 
 
@@ -617,10 +621,15 @@ def pr_body(config: ReleaseConfig, branch: str, staged: list[str], checks: dict[
     )
 
 
-def create_or_update_pr(worktree: Path, repository: str, branch: str, head_owner: str, title: str, body: str, base_branch: str) -> str:
+def create_or_update_pr(
+    worktree: Path, repository: str, branch: str, head_owner: str,
+    title: str, body: str, base_branch: str, *, push_remote: str, expected_head_sha: str,
+) -> str:
     body_file = create_temporary_body_file(body)
     try:
         existing = find_open_pr(worktree, repository, branch, head_owner, base_branch)
+        if remote_branch_sha(worktree, push_remote, branch) != expected_head_sha:
+            raise ReleaseError("远端分支在校验后变化；已停止创建或更新 PR，请重新检查。")
         if existing:
             number = existing.get("number")
             url = existing.get("url")
@@ -819,7 +828,10 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             run_command(["git", "commit", "-m", title], worktree)
             run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
             commit = run_command(["git", "rev-parse", "HEAD"], worktree)
-        pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
+        pr_url = create_or_update_pr(
+            worktree, repository, branch, head_owner, title, body, config.base_branch,
+            push_remote=config.push_remote, expected_head_sha=commit,
+        )
         result = {
             "status": "submitted",
             "branch": branch,
