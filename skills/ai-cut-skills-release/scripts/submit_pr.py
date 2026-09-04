@@ -500,26 +500,10 @@ def remote_branch_sha(repo_root: Path, remote: str, branch: str) -> str | None:
     return None
 
 
-def validate_remote_branch_reuse(branch: str, remote_sha: str | None, existing_pr: dict[str, object] | None) -> None:
-    if remote_sha and not existing_pr:
-        raise ReleaseError(
-            f"远端分支 {branch} 已存在，但没有找到当前账户在目标 base 分支下的打开 PR；"
-            "为避免覆盖未知改动，已停止。请更换作用域/日期，或先人工处理该分支。"
-        )
-
-
 def build_push_args(remote: str, branch: str, remote_sha: str | None) -> list[str]:
-    if not remote_sha:
-        return ["git", "push", "--set-upstream", remote, branch]
-
-    return [
-        "git",
-        "push",
-        f"--force-with-lease=refs/heads/{branch}:{remote_sha}",
-        "--set-upstream",
-        remote,
-        branch,
-    ]
+    # Existing PR updates are descendants of their fetched remote head.
+    # A concurrent remote update must be rejected, never overwritten.
+    return ["git", "push", "--set-upstream", remote, branch]
 
 
 def create_temporary_body_file(body: str) -> Path:
@@ -740,6 +724,23 @@ def fetch_base_commit(repo_root: Path, remote: str, branch: str) -> str:
     return run_command(["git", "rev-parse", "--verify", f"{tracking_ref}^{{commit}}"], repo_root)
 
 
+def require_ancestor(repo_root: Path, ancestor: str, descendant: str, message: str) -> None:
+    status, _, _ = run_command_result(["git", "merge-base", "--is-ancestor", ancestor, descendant], repo_root)
+    if status != 0:
+        raise ReleaseError(message)
+
+
+def verify_orphan_submission(worktree: Path, base_commit: str, remote_sha: str) -> None:
+    """Retry PR creation only for exactly the intended one-commit submission."""
+    parents = run_command(["git", "rev-list", "--parents", "-n", "1", remote_sha], worktree).split()
+    intended_tree = run_command(["git", "write-tree"], worktree)
+    remote_tree = run_command(["git", "rev-parse", f"{remote_sha}^{{tree}}"], worktree)
+    if parents != [remote_sha, base_commit] or intended_tree != remote_tree:
+        raise ReleaseError(
+            "远端分支没有打开的 PR，且不精确匹配本次提交的基线和文件树；已停止，不覆盖未知改动。"
+        )
+
+
 def run_release(config: ReleaseConfig) -> dict[str, object]:
     repo_root = Path(run_command(["git", "rev-parse", "--show-toplevel"], config.repo_root)).resolve()
     validate_skill_paths(repo_root, config.skills)
@@ -766,11 +767,7 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         }
 
     base_commit = fetch_base_commit(repo_root, config.base_remote, config.base_branch)
-    tracked, untracked = list_changed_paths(repo_root, base_commit, pathspecs)
-    changed = tracked + untracked
-    if not changed:
-        raise ReleaseError("目标 Skill 相对最新基线没有可提交变更")
-    validate_no_symlink_paths(repo_root, changed)
+    require_ancestor(repo_root, base_commit, "HEAD", "当前 HEAD 不包含最新基线；请先同步上游，避免生成回退 PR。")
 
     repository = resolve_target_repository(repo_root, config.base_remote, config.target_repository)
     head_owner = github_login(repo_root, config.github_account)
@@ -787,8 +784,25 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
         ensure_release_push_remote(repo_root, repository, head_owner, config.push_remote)
     existing_pr = find_open_pr(repo_root, repository, branch, head_owner, config.base_branch)
     existing_remote_sha = remote_branch_sha(repo_root, config.push_remote, branch)
-    validate_remote_branch_reuse(branch, existing_remote_sha, existing_pr)
-    parent, worktree = create_worktree(repo_root, branch, base_commit, pathspecs, untracked)
+    release_base = base_commit
+    if existing_pr and not existing_remote_sha:
+        raise ReleaseError("已有 PR 的远端分支不可用；请先检查 PR 状态。")
+    if existing_remote_sha:
+        fetched_sha = fetch_base_commit(repo_root, config.push_remote, branch)
+        if fetched_sha != existing_remote_sha:
+            raise ReleaseError("远端分支在检查期间变化；请重新检查后重试。")
+        if existing_pr:
+            require_ancestor(repo_root, base_commit, existing_remote_sha,
+                             "已有 PR 分支不包含最新基线；请先更新 PR 分支并同步当前 HEAD。")
+            require_ancestor(repo_root, existing_remote_sha, "HEAD",
+                             "当前 HEAD 不包含已有 PR 的全部提交；请先同步 PR 分支，避免丢失改动。")
+            release_base = existing_remote_sha
+    tracked, untracked = list_changed_paths(repo_root, release_base, pathspecs)
+    changed = tracked + untracked
+    if not changed:
+        raise ReleaseError("目标 Skill 相对发布基线没有可提交变更")
+    validate_no_symlink_paths(repo_root, changed)
+    parent, worktree = create_worktree(repo_root, branch, release_base, pathspecs, untracked)
     try:
         staged = ensure_staged_scope(worktree, pathspecs)
         checks = run_checks(worktree, config, changed_paths=staged)
@@ -796,14 +810,21 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
             raise ReleaseError("提交前校验失败，请先处理 PR 检查结果")
         title = f"{config.change_type}({config.scope}): {config.summary}"
         body = pr_body(config, branch, staged, checks)
-        run_command(["git", "commit", "-m", title], worktree)
-        run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
+        if existing_remote_sha and not existing_pr:
+            # A prior push may have succeeded before the PR API failed.
+            # Never rewrite this orphan: verify its content and retry only PR creation.
+            verify_orphan_submission(worktree, base_commit, existing_remote_sha)
+            commit = existing_remote_sha
+        else:
+            run_command(["git", "commit", "-m", title], worktree)
+            run_command(build_push_args(config.push_remote, branch, existing_remote_sha), worktree)
+            commit = run_command(["git", "rev-parse", "HEAD"], worktree)
         pr_url = create_or_update_pr(worktree, repository, branch, head_owner, title, body, config.base_branch)
         result = {
             "status": "submitted",
             "branch": branch,
             "base_commit": base_commit,
-            "commit": run_command(["git", "rev-parse", "HEAD"], worktree),
+            "commit": commit,
             "repository": repository,
             "pr_url": pr_url,
             "files": staged,

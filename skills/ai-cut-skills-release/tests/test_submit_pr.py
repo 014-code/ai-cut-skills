@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -36,29 +37,27 @@ class SubmitPrHelpersTests(unittest.TestCase):
         with self.assertRaises(MODULE.ReleaseError):
             MODULE.normalize_relative_path("../outside.txt")
 
-    def test_builds_force_with_lease_push_for_existing_managed_branch(self) -> None:
+    def test_managed_branch_updates_never_force_push(self) -> None:
         self.assertEqual(
             MODULE.build_push_args("origin", "014-code/fix-demo-20260903", "a" * 40),
             [
                 "git",
                 "push",
-                "--force-with-lease=refs/heads/014-code/fix-demo-20260903:" + "a" * 40,
                 "--set-upstream",
                 "origin",
                 "014-code/fix-demo-20260903",
             ],
         )
 
-    def test_refuses_existing_remote_branch_without_open_pr(self) -> None:
-        with self.assertRaisesRegex(MODULE.ReleaseError, "没有找到.*打开 PR"):
-            MODULE.validate_remote_branch_reuse("014-code/fix-demo-20260903", "a" * 40, None)
+    def test_refuses_orphan_branch_with_different_tree(self) -> None:
+        with patch.object(MODULE, "run_command", side_effect=["head base", "tree-a", "tree-b"]):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
+                MODULE.verify_orphan_submission(Path("."), "base", "head")
 
-    def test_allows_existing_remote_branch_only_with_open_pr(self) -> None:
-        MODULE.validate_remote_branch_reuse(
-            "014-code/fix-demo-20260903",
-            "a" * 40,
-            {"number": 12, "url": "https://github.com/acme/demo/pull/12"},
-        )
+    def test_refuses_orphan_branch_with_different_parent(self) -> None:
+        with patch.object(MODULE, "run_command", side_effect=["head other-base", "tree", "tree"]):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
+                MODULE.verify_orphan_submission(Path("."), "base", "head")
 
     def test_finds_only_matching_open_pr(self) -> None:
         with patch.object(
@@ -401,6 +400,7 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.local = self.root / "local"
         self.git(self.root, "clone", "--origin", "upstream", str(self.remote), str(self.local))
         (self.source / "upstream.txt").write_text("new upstream content\n", encoding="utf-8")
+        (skill / "SKILL.md").write_text("new upstream skill content\n", encoding="utf-8")
         self.git(self.source, "add", ".")
         self.git(self.source, "commit", "-m", "advance upstream")
         self.latest_sha = self.git(self.source, "rev-parse", "HEAD")
@@ -421,10 +421,11 @@ class ReleaseBaselineTests(unittest.TestCase):
         sha = MODULE.fetch_base_commit(self.local, "upstream", "main")
         self.assertEqual(sha, self.latest_sha)
         self.assertEqual(self.git(self.local, "rev-parse", "upstream/main"), self.latest_sha)
-        parent, worktree = MODULE.create_check_worktree(self.local, sha, ["skills/demo"], [])
+        parent, worktree = MODULE.create_check_worktree(self.local, sha, ["not-selected"], [])
         try:
             self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), self.latest_sha)
             self.assertEqual((worktree / "upstream.txt").read_text(), "new upstream content\n")
+            self.assertEqual((worktree / "skills/demo/SKILL.md").read_text(), "new upstream skill content\n")
         finally:
             MODULE.remove_worktree(self.local, worktree, parent)
 
@@ -435,6 +436,8 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.assertEqual(self.git(self.local, "rev-parse", "upstream/main"), self.old_sha)
 
     def test_execute_uses_same_resolved_sha_for_diff_and_worktree(self) -> None:
+        self.git(self.local, "fetch", "upstream", "main")
+        self.git(self.local, "merge", "--ff-only", self.latest_sha)
         config = release_config(self.local, "--execute")
         with (
             patch.object(MODULE, "fetch_base_commit", return_value=self.latest_sha),
@@ -450,6 +453,99 @@ class ReleaseBaselineTests(unittest.TestCase):
                 MODULE.run_release(config)
         self.assertEqual(changes.call_args.args[1], self.latest_sha)
         self.assertEqual(create.call_args.args[2], self.latest_sha)
+
+    def test_stale_checkout_is_rejected_before_any_github_mutation(self) -> None:
+        with patch.object(MODULE, "ensure_fork_repository") as fork:
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不包含最新基线"):
+                MODULE.run_release(release_config(self.local, "--execute"))
+        fork.assert_not_called()
+        self.assertEqual(self.git(self.local, "rev-parse", "HEAD"), self.old_sha)
+        self.assertEqual((self.local / "skills/demo/SKILL.md").read_text(), "demo\n")
+
+
+class ReleaseExecutionTests(unittest.TestCase):
+    git = staticmethod(ReleaseBaselineTests.git)
+
+    def setUp(self) -> None:
+        ReleaseBaselineTests.setUp(self)
+        self.git(self.local, "fetch", "upstream", "main")
+        self.git(self.local, "merge", "--ff-only", self.latest_sha)
+        self.git(self.local, "config", "user.name", "Release Test")
+        self.git(self.local, "config", "user.email", "test@example.invalid")
+        self.git(self.local, "remote", "add", "origin", str(self.remote))
+        self.config = release_config(self.local, "--execute")
+        self.branch = MODULE.build_branch_name(
+            self.config.group, self.config.change_type, self.config.scope, self.config.date,
+        )
+        self.pr = {"number": 15, "url": "https://example.test/pr/15"}
+
+    def stubs(self, existing_pr=None):
+        # Keep Git and worktree operations real; never call GitHub from fixtures.
+        stack = ExitStack()
+        for name, value in (
+            ("resolve_target_repository", "owner/repo"),
+            ("github_login", "owner"),
+            ("ensure_fork_repository", None),
+            ("find_open_pr", existing_pr),
+            ("run_checks", {"ok": True, "checks": []}),
+            ("create_or_update_pr", self.pr["url"]),
+        ):
+            stack.enter_context(patch.object(MODULE, name, return_value=value))
+        return stack
+
+    def publish_existing_pr(self) -> str:
+        self.git(self.source, "checkout", "-b", self.branch)
+        (self.source / "skills/demo/pr-only.txt").write_text("existing PR work\n")
+        self.git(self.source, "add", ".")
+        self.git(self.source, "commit", "-m", "existing PR work")
+        self.git(self.source, "push", str(self.remote), self.branch)
+        return self.git(self.source, "rev-parse", "HEAD")
+
+    def test_missing_existing_pr_work_is_rejected_without_push(self) -> None:
+        existing_sha = self.publish_existing_pr()
+        (self.local / "skills/demo/local.txt").write_text("local change\n")
+        with self.stubs(self.pr):
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不包含已有 PR"):
+                MODULE.run_release(self.config)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.branch), existing_sha)
+
+    def test_managed_update_preserves_existing_commit_and_content(self) -> None:
+        existing_sha = self.publish_existing_pr()
+        self.git(self.local, "fetch", "origin", self.branch)
+        self.git(self.local, "merge", "--ff-only", existing_sha)
+        (self.local / "skills/demo/local.txt").write_text("local change\n")
+        with self.stubs(self.pr):
+            result = MODULE.run_release(self.config)
+        new_sha = self.git(self.remote, "rev-parse", self.branch)
+        self.assertEqual(new_sha, result["commit"])
+        self.assertEqual(self.git(self.remote, "rev-parse", f"{new_sha}^"), existing_sha)
+        self.assertEqual(self.git(self.remote, "show", f"{new_sha}:skills/demo/pr-only.txt"), "existing PR work")
+        self.assertEqual(self.git(self.remote, "show", f"{new_sha}:skills/demo/local.txt"), "local change")
+
+    def create_orphan(self) -> str:
+        (self.local / "skills/demo/local.txt").write_text("local change\n")
+        with self.stubs():
+            with patch.object(MODULE, "create_or_update_pr", side_effect=MODULE.ReleaseError("PR API timeout")):
+                with self.assertRaisesRegex(MODULE.ReleaseError, "PR API timeout"):
+                    MODULE.run_release(self.config)
+        return self.git(self.remote, "rev-parse", self.branch)
+
+    def test_pr_api_failure_after_push_can_retry_without_another_push(self) -> None:
+        orphan_sha = self.create_orphan()
+        with self.stubs():
+            with patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run:
+                result = MODULE.run_release(self.config)
+        self.assertEqual(result["commit"], orphan_sha)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.branch), orphan_sha)
+        self.assertFalse(any(item.args[0][:2] == ["git", "push"] for item in run.call_args_list))
+
+    def test_orphan_retry_with_changed_submission_is_rejected(self) -> None:
+        orphan_sha = self.create_orphan()
+        (self.local / "skills/demo/local.txt").write_text("different change\n")
+        with self.stubs():
+            with self.assertRaisesRegex(MODULE.ReleaseError, "不精确匹配"):
+                MODULE.run_release(self.config)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.branch), orphan_sha)
 
 
 class ReleaseTestDiscoveryTests(unittest.TestCase):
