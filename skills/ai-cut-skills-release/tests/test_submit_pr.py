@@ -369,6 +369,13 @@ class SubmitPrHelpersTests(unittest.TestCase):
                 )
         run.assert_not_called()
 
+    def test_remote_urls_require_secure_transport(self) -> None:
+        for scheme in ("http", "git", "ftp", "file"):
+            with self.subTest(scheme=scheme), self.assertRaises(MODULE.ReleaseError):
+                MODULE.repository_from_url(f"{scheme}://github.com/owner/repo.git")
+        for url in ("https://github.com/owner/repo.git", "ssh://git@github.com/owner/repo.git", "git@github.com:owner/repo.git"):
+            self.assertEqual(MODULE.repository_from_url(url), "owner/repo")
+
     def test_auto_fork_is_enabled_by_default_and_can_be_disabled(self) -> None:
         config = MODULE.parse_args(
             [
@@ -489,6 +496,22 @@ class ReleaseBaselineTests(unittest.TestCase):
         fork.assert_not_called()
         self.assertEqual(self.git(self.local, "rev-parse", "HEAD"), self.old_sha)
         self.assertEqual((self.local / "skills/demo/SKILL.md").read_text(), "demo\n")
+
+    def test_include_metacharacters_are_literal_in_collection_and_staging(self) -> None:
+        literal = self.local / "notes[1].txt"
+        expanded = self.local / "notes1.txt"
+        literal.write_text("included\n")
+        expanded.write_text("must stay outside\n")
+        tracked, untracked = MODULE.list_changed_paths(self.local, None, [literal.name])
+        self.assertEqual(tracked, [])
+        self.assertEqual(untracked, [literal.name])
+        staged = MODULE.ensure_staged_scope(self.local, [literal.name])
+        self.assertEqual(staged, [literal.name])
+        patch_bytes = MODULE.run_bytes([
+            "git", "--literal-pathspecs", "diff", "--binary", "HEAD", "--", literal.name,
+        ], self.local)
+        self.assertIn(b"notes[1].txt", patch_bytes)
+        self.assertNotIn(b"notes1.txt", patch_bytes)
 
 
 class ReleaseExecutionTests(unittest.TestCase):
@@ -620,7 +643,31 @@ class ReleaseTestDiscoveryTests(unittest.TestCase):
         )
 
     def check_results(self, *extra: str) -> dict:
-        return MODULE.run_checks(self.root, release_config(self.root, *extra), changed_paths=[])
+        options = extra if "--skip-tests" in extra else ("--run-tests", *extra)
+        return MODULE.run_checks(self.root, release_config(self.root, *options), changed_paths=[])
+
+    def test_default_plan_does_not_execute_repository_code_or_checkout_hooks(self) -> None:
+        marker = self.root / "executed.txt"
+        malicious_code = f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+        tests = self.root / "tests"
+        tests.mkdir()
+        (tests / "test_untrusted.py").write_text(malicious_code)
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        (scripts / "sync_skills.py").write_text(malicious_code)
+        # Static plan must not create a worktree or fetch anything.
+        with (
+            patch.object(MODULE, "create_check_worktree") as create,
+            patch.object(MODULE, "fetch_base_commit") as fetch,
+            patch.object(MODULE, "run_command", wraps=MODULE.run_command) as run,
+        ):
+            result = MODULE.run_release(release_config(self.root))
+        self.assertEqual(result["status"], "planned")
+        self.assertTrue(result["checks"]["ok"])
+        self.assertFalse(marker.exists())
+        create.assert_not_called()
+        fetch.assert_not_called()
+        self.assertFalse(any("unittest" in item.args[0] for item in run.call_args_list))
 
     def test_root_pass_does_not_hide_selected_skill_failure_with_same_module_name(self) -> None:
         self.write_test("tests", passing=True)

@@ -65,6 +65,7 @@ class ReleaseConfig:
     skip_tests: bool
     keep_worktree: bool
     auto_fork: bool
+    run_tests: bool = False
 
 
 def run_command(
@@ -148,7 +149,7 @@ def validate_skill_paths(repo_root: Path, skills: tuple[str, ...]) -> None:
 
 
 def list_changed_paths(repo_root: Path, base_ref: str | None, pathspecs: list[str]) -> tuple[list[str], list[str]]:
-    diff_args = ["git", "diff", "--name-only"]
+    diff_args = ["git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--name-only"]
     if base_ref:
         diff_args.append(base_ref)
     else:
@@ -161,12 +162,12 @@ def list_changed_paths(repo_root: Path, base_ref: str | None, pathspecs: list[st
         if base_ref:
             raise
         # Repositories without a first commit cannot diff against HEAD yet.
-        tracked_output = run_command(["git", "diff", "--name-only", "--", *pathspecs], repo_root)
+        tracked_output = run_command(["git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--name-only", "--", *pathspecs], repo_root)
     tracked = [line for line in tracked_output.splitlines() if line]
     untracked = [
         line
         for line in run_command(
-            ["git", "ls-files", "--others", "--exclude-standard", "--", *pathspecs],
+            ["git", "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "--", *pathspecs],
             repo_root,
         ).splitlines()
         if line
@@ -201,8 +202,11 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
             checks.append({"name": f"quick_validate:{skill}", "ok": False, "output": "找不到 quick_validate.py"})
 
     sync_script = repo_root / "scripts" / "sync_skills.py"
-    if sync_script.is_file():
+    allow_repo_code = config.execute or config.run_tests
+    if sync_script.is_file() and allow_repo_code:
         check("catalog", [sys.executable, "-X", "utf8", str(sync_script), "--check"])
+    elif sync_script.is_file():
+        checks.append({"name": "catalog", "ok": True, "output": "not run: repository code requires --run-tests or --execute"})
 
     python_files = []
     for skill in config.skills:
@@ -216,11 +220,13 @@ def run_checks(repo_root: Path, config: ReleaseConfig, *, changed_paths: list[st
         except (OSError, SyntaxError, UnicodeError) as exc:
             checks.append({"name": "python_syntax", "ok": False, "output": str(exc)[-2000:]})
 
-    check("diff_check", ["git", "diff", "--check"])
-    check("cached_diff_check", ["git", "diff", "--cached", "--check"])
+    check("diff_check", ["git", "diff", "--no-ext-diff", "--no-textconv", "--check"])
+    check("cached_diff_check", ["git", "diff", "--no-ext-diff", "--no-textconv", "--cached", "--check"])
 
     if config.skip_tests:
         checks.append({"name": "tests", "ok": True, "output": "skipped by --skip-tests"})
+    elif not allow_repo_code:
+        checks.append({"name": "tests", "ok": True, "output": "not run: repository code requires --run-tests or --execute"})
     else:
         test_roots = [("tests", Path("tests"))]
         test_roots.extend(
@@ -258,6 +264,8 @@ def repository_from_url(url: str) -> str:
             parsed = urlparse(url)
         except ValueError as exc:
             raise ReleaseError("远端 URL 格式无效") from exc
+        if parsed.scheme not in {"https", "ssh"}:
+            raise ReleaseError("远端 URL 仅允许 HTTPS 或 SSH 安全传输")
         if parsed.hostname != "github.com":
             raise ReleaseError("远端不是 GitHub 仓库")
         if (parsed.password or parsed.query or parsed.fragment or
@@ -531,7 +539,7 @@ def remove_temporary_file(path: Path) -> None:
 
 
 def apply_source_changes(repo_root: Path, worktree: Path, base_ref: str, pathspecs: list[str], untracked: list[str]) -> None:
-    patch = run_bytes(["git", "diff", "--binary", base_ref, "--", *pathspecs], repo_root)
+    patch = run_bytes(["git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--binary", base_ref, "--", *pathspecs], repo_root)
     if patch:
         patch_path = worktree.parent / "source-changes.patch"
         patch_path.write_bytes(patch)
@@ -594,7 +602,7 @@ def remove_worktree(repo_root: Path, worktree: Path, parent: Path, branch: str |
 
 
 def ensure_staged_scope(worktree: Path, pathspecs: list[str]) -> list[str]:
-    run_command(["git", "add", "--all", "--", *pathspecs], worktree)
+    run_command(["git", "--literal-pathspecs", "add", "--all", "--", *pathspecs], worktree)
     staged = [line for line in run_command(["git", "diff", "--cached", "--name-only"], worktree).splitlines() if line]
     outside = [path for path in staged if not path_is_allowed(path, pathspecs)]
     if outside:
@@ -695,7 +703,9 @@ def parse_args(argv: list[str] | None = None) -> ReleaseConfig:
         help="不自动创建或校验当前账户 fork（保留已有远端工作方式）",
     )
     parser.add_argument("--execute", action="store_true", help="执行创建分支、commit、push 和 PR")
-    parser.add_argument("--skip-tests", action="store_true")
+    test_mode = parser.add_mutually_exclusive_group()
+    test_mode.add_argument("--skip-tests", action="store_true")
+    test_mode.add_argument("--run-tests", action="store_true", help="预检时允许运行仓库脚本和测试；这些代码可产生外部副作用")
     parser.add_argument("--keep-worktree", action="store_true")
     args = parser.parse_args(argv)
 
@@ -720,6 +730,7 @@ def parse_args(argv: list[str] | None = None) -> ReleaseConfig:
         skip_tests=args.skip_tests,
         keep_worktree=args.keep_worktree,
         auto_fork=args.auto_fork,
+        run_tests=args.run_tests,
     )
 
 
@@ -760,11 +771,16 @@ def run_release(config: ReleaseConfig) -> dict[str, object]:
     if not config.execute:
         tracked, untracked = list_changed_paths(repo_root, None, pathspecs)
         validate_no_symlink_paths(repo_root, tracked + untracked)
-        check_parent, check_worktree = create_check_worktree(repo_root, "HEAD", pathspecs, untracked)
-        try:
-            checks = run_checks(check_worktree, config, changed_paths=tracked + untracked)
-        finally:
-            remove_worktree(repo_root, check_worktree, check_parent)
+        if config.run_tests:
+            check_parent, check_worktree = create_check_worktree(repo_root, "HEAD", pathspecs, untracked)
+            try:
+                checks = run_checks(check_worktree, config, changed_paths=tracked + untracked)
+            finally:
+                remove_worktree(repo_root, check_worktree, check_parent)
+        else:
+            # Static-only planning does not execute repository scripts/tests
+            # or create a worktree (which may invoke Git checkout hooks).
+            checks = run_checks(repo_root, config, changed_paths=tracked + untracked)
         return {
             "status": "planned",
             "branch": branch,

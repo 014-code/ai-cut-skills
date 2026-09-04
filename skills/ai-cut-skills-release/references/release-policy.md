@@ -14,6 +14,8 @@
 
 目标 Skill 通过重复的 `--skill` 指定，额外测试或清单文件必须通过 `--include` 明确指定。脚本会从最新基线重建临时 worktree，再把这些路径的已提交、已暂存和未暂存差异应用到新分支，避免把当前工作区的其他改动带入 PR。
 
+路径收集、diff 生成和暂存均使用 Git 的字面路径模式；`--include` 中的 `*`、`?`、`[` 等字符是文件名的一部分，不会扩大选择范围。
+
 执行模式使用显式的 `refs/heads/<base>:refs/remotes/<remote>/<base>` 抓取映射，不依赖本地 remote 的默认 fetch 配置。抓取成功后解析并固定 commit SHA，差异比较和 worktree 都使用该 SHA；抓取失败则停止，不能退回陈旧的远端跟踪引用。
 
 当前 `HEAD` 必须包含最新基线，否则停止并要求先同步上游，避免将缺失的上游改动反向带入提交。更新已有 PR 时还要求 PR 头包含该基线，当前 `HEAD` 包含 PR 头；差异比较和 worktree 改用同一个已抓取的 PR 头 SHA，从而追加提交并保留 PR 历史。PR 落后上游时，应先更新 PR 分支并同步本地，再提交增量。
@@ -35,6 +37,8 @@
 
 任何失败都会阻止 commit 和 push。校验结果会写入 PR 描述，不写入凭据。
 
+默认计划模式仅用可信的 Skill 校验器、Python 静态语法检查和 Git 空白检查，不运行仓库清单脚本或测试，也不创建 worktree。`--run-tests` 显式允许计划模式运行仓库代码，`--execute` 的提交检查默认运行这些代码；`--skip-tests` 仅跳过 unittest。检查 worktree 不是沙箱，仓库代码仍有当前进程的文件和网络权限。
+
 ## GitHub Fork 与 PR
 
 仓库当前以 `upstream` 作为 PR 基线，以 `origin` 作为推送远端。脚本从 upstream remote 解析唯一目标仓库，使用 GitHub CLI 当前登录账户作为 head owner；`--github-account` 仅用于账户一致性校验。`--target-repository` 如果提供，必须与 upstream 解析出的仓库完全一致，否则停止，禁止跨仓库写入。
@@ -46,7 +50,7 @@
 3. 不存在（404）时执行 `gh repo fork <upstream> --clone=false`，再轮询 GitHub API 直到 fork 可用；其他 API 错误不会被当作“需要创建 fork”。
 4. 推送远端不存在时添加当前账户 fork URL；已有远端若指向其他仓库，停止且不改写。
 
-计划模式是只读的，不会创建或修改 fork；会在临时 detached worktree 中运行可能产生文件的检查，结束后清理。需要跳过 GitHub fork 创建和 parent 校验时可使用 `--no-auto-fork`，但仍必须确认 fetch URL 以及所有有效 push URL 都指向当前账户 fork，并遵守远端分支和 PR 的安全校验。
+默认计划模式是静态只读的，不会创建或修改 fork。显式 `--run-tests` 的检查在临时 detached worktree 中运行，结束后清理。需要跳过 GitHub fork 创建和 parent 校验时可使用 `--no-auto-fork`，但仍必须确认 fetch URL 以及所有有效 push URL 都指向当前账户 fork，并遵守远端分支和 PR 的安全校验。
 
 同一 head 分支已有打开的 PR 时更新标题和正文，不重复创建。只有在 PR 编号、URL、head 分支、head owner 和 base 分支字段全部存在且精确匹配时才允许复用；字段缺失时按不可复用处理。执行前会先检查远端是否已有同名分支；临时 worktree 结束后会清理脚本创建的本地分支引用：
 
@@ -60,7 +64,7 @@
 
 推送前会分别读取 remote 的 fetch URL 和 `remote.<name>.pushurl` 展开的所有有效 push URL。任何 URL 不是当前账户 fork 都会停止；不能只依赖 fetch URL 判断推送目标。
 
-远端 URL 不得携带 HTTPS 用户信息或查询参数；错误信息统一隐藏 URL 和可识别的凭据，避免 Git 诊断回显认证信息。
+远端只接受 HTTPS、SSH 或 `git@github.com:owner/repo.git`，拒绝 HTTP、git 明文协议等其他传输。URL 不得携带 HTTPS 用户信息或查询参数；错误信息统一隐藏 URL 和可识别的凭据，避免 Git 诊断回显认证信息。
 
 PR 创建和更新都要求 GitHub CLI 已登录并具备目标仓库权限。PR 的 head owner、head branch 和 base branch 必须与本次执行一致。
 
